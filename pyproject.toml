@@ -7,7 +7,7 @@ name = "mactrim"
 version = "0.1.0"
 description = "Evidence-led, reversible Mac cleanup"
 requires-python = ">=3.9"
-dependencies = []
+dependencies = ["textual==8.2.8", "rich>=14,<15"]
 
 [project.scripts]
 mactrim = "mactrim.cli:main"
