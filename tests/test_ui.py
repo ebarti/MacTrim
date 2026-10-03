@@ -107,6 +107,49 @@ class NativeUITests(unittest.IsolatedAsyncioTestCase):
             await self.wait_for(pilot, lambda: not app.storage_measuring)
             self.assertTrue(app.storage_node.recent['modified_7d'])
 
+    async def test_growth_detail_proven_absence_overlap_and_unknown_are_presentation_only(self):
+        removed = self.data / 'removed'
+        removed.mkdir()
+        (removed / 'file.txt').write_bytes(b'x' * 20)
+        app = self.app(initial_tab='history')
+        async with app.run_test(size=(140, 44)) as pilot:
+            await self.wait_for(pilot, lambda: app.history_catalog is not None and len(app.history_catalog['snapshots']) == 1)
+            self.assertNotIn('380', str(app.query_one('#history-summary', Static).content))
+            (removed / 'file.txt').unlink()
+            removed.rmdir()
+            added = self.data / 'added'
+            added.mkdir()
+            (added / 'file.txt').write_bytes(b'x' * 30)
+            app.start_storage(self.data)
+            await self.wait_for(pilot, lambda: not app.storage_measuring)
+            app.capture_current()
+            await self.wait_for(pilot, lambda: len(app.history_catalog['snapshots']) == 2)
+            rows = {row['path']: row for row in app.history_rows}
+            self.assertEqual(rows[str(removed)]['status'], 'removed-directory')
+            self.assertIsNone(rows[str(removed)]['after'])
+            app.history_detail(str(removed))
+            text = str(app.query_one('#history-detail', Static).content)
+            self.assertIn('after 0 B (absent)', text)
+            self.assertIn('Included in parent totals', text)
+            self.assertNotIn('True', text)
+            self.assertEqual(rows[str(added)]['status'], 'new-directory')
+            self.assertIsNone(rows[str(added)]['before'])
+            app.history_detail(str(added))
+            self.assertIn('before 0 B (absent)', str(app.query_one('#history-detail', Static).content))
+            app.history_detail(str(self.data))
+            self.assertNotIn('Included in parent totals', str(app.query_one('#history-detail', Static).content))
+            self.assertNotIn('False', str(app.query_one('#history-detail', Static).content))
+            # Uncertain/partial observations retain their API values but the
+            # detail must not turn missing evidence into proven zero bytes.
+            for status in ('unknown', 'newly-observed'):
+                row = dict(rows[str(added)], status=status, before=17, after=39)
+                app.history_rows = [row]
+                app.history_detail(row['path'])
+                text = str(app.query_one('#history-detail', Static).content)
+                self.assertIn('before unknown · after unknown', text)
+                self.assertNotIn('(absent)', text)
+                self.assertEqual((row['before'], row['after']), (17, 39))
+
     async def test_deeper_capture_changes_bounded_policy_and_preserves_cleanup_plan(self):
         app = self.app(initial_tab='storage')
         original_budget = self.plan['config']['storage_max_files']

@@ -262,7 +262,7 @@ class History:
             rows, issues = self.inventory(strict=False)
             return {'snapshots': [{'id': row['body']['id'], 'created_at': row['body']['created_at'], 'scope': row['body']['scope'], 'status': row['body']['coverage']['status'], 'directories': len(row['body']['directories']), 'temporary': row['temporary'], 'recent': row['body']['directories'][0]['recent'], 'capacity': row['body']['capacity']} for row in rows],
                     'issues': issues, 'allocated_bytes': self.footprint(), 'limit_bytes': self.limit,
-                    'note': 'Earlier reported 380 GB directory breakdown is unknown. Recent activity bytes are clues, not measured growth.'}
+                    'note': 'Directory growth requires comparable measured baselines. Recent activity bytes are clues, not measured growth.'}
 
     def clear(self):
         with self.state.lock():
@@ -291,7 +291,7 @@ class History:
             candidates = [row for row in committed if row['id'] != latest['id'] and row['created_at'] < latest['created_at'] and row['policy'] == latest['policy']]
             first = select(earlier, candidates[-1] if candidates else None)
             if first is None:
-                return {'baseline': latest['id'], 'scope': latest['scope'], 'rows': [], 'capacity': [], 'issues': issues, 'note': 'First measured baseline: earlier 380 GB breakdown is unknown; another comparable observation is needed.'}
+                return {'baseline': latest['id'], 'scope': latest['scope'], 'rows': [], 'capacity': [], 'issues': issues, 'note': 'First measured baseline: another comparable observation is needed to measure growth.'}
             return compare(first, latest, metric, issues)
 
 

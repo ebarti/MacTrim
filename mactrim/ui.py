@@ -199,7 +199,7 @@ class MacTrimApp(App):
                 yield Static('The graph and list share the same measured nodes. Protected/system data stays read-only.', id='storage-detail')
                 yield Static('Waiting for measurement', id='storage-status')
             with TabPane('History / Growth', id='history'):
-                yield Static('Directory baselines reveal comparable changes over time. Earlier reported 380 GB breakdown is unknown.', id='history-summary')
+                yield Static('Directory baselines reveal changes between comparable observations.', id='history-summary')
                 with Horizontal(classes='toolbar'):
                     yield Button('Refresh', id='history-refresh', variant='primary')
                     yield Button('Capture current', id='history-capture')
@@ -635,7 +635,7 @@ class MacTrimApp(App):
         try:
             history = History(self.state, self.config)
             catalog = history.list()
-            comparison = history.compare(earlier, later, metric) if catalog['snapshots'] else {'rows': [], 'capacity': [], 'note': 'No baseline yet. A completed Storage measurement is captured locally; earlier 380 GB breakdown is unknown.'}
+            comparison = history.compare(earlier, later, metric) if catalog['snapshots'] else {'rows': [], 'capacity': [], 'note': 'No baseline yet. A completed Storage measurement establishes a local baseline; another comparable observation is needed to measure growth.'}
             self.call_from_thread(self.history_loaded, catalog, comparison, None, generation)
         except Exception as exc:
             self.call_from_thread(self.history_loaded, None, None, clean(exc), generation)
@@ -683,7 +683,7 @@ class MacTrimApp(App):
         if result.get('earlier_at'):
             times = datetime.fromtimestamp(result['earlier_at']).strftime('%Y-%m-%d %H:%M') + ' → ' + datetime.fromtimestamp(result['later_at']).strftime('%Y-%m-%d %H:%M')
         capacity = ' · '.join(clean(row['label']) + ': used ' + ('+' if row['used_delta'] > 0 else '') + human(row['used_delta']) + (' (shared/alias; not additive)' if row['shared_observation_alias'] else '') for row in result.get('capacity', []))
-        self.query_one('#history-summary', Static).update(Text('%s\n%s\nHistory %s / %s allocated · %s snapshots · %s directory estimates' % (times or 'First measured baseline / no comparable pair', capacity or 'Capacity attribution requires two observations; the earlier reported 380 GB breakdown is unknown.', human(catalog['allocated_bytes']), human(catalog['limit_bytes']), len(catalog['snapshots']), self.history_metric)))
+        self.query_one('#history-summary', Static).update(Text('%s\n%s\nHistory %s / %s allocated · %s snapshots · %s directory estimates' % (times or 'First measured baseline / no comparable pair', capacity or 'Capacity trends require two observations; directory growth requires comparable measured baselines.', human(catalog['allocated_bytes']), human(catalog['limit_bytes']), len(catalog['snapshots']), self.history_metric)))
         self.query_one('#history-status', Static).update(Text(result.get('note', '') + (' · ' + '; '.join(catalog['issues'] + result.get('issues', [])) if catalog['issues'] or result.get('issues') else '')))
 
     @on(Select.Changed, '#history-before')
@@ -729,7 +729,15 @@ class MacTrimApp(App):
         row = next((row for row in self.history_rows if row['path'] == path), None)
         if row:
             recent = row['recent']
-            self.query_one('#history-detail', Static).update(Text('%s\n%s · before %s · after %s · overlap with parent: %s\nCurrent recently modified allocated bytes: 7d %s / 30d %s; recently created 7d %s — activity clues, NOT measured growth.\nEnter opens this directory in Storage; missing/partial observations remain unknown.' % (clean(path), row['status'], human(row['before']) if row['before'] is not None else 'unknown', human(row['after']) if row['after'] is not None else 'unknown', row['overlaps_parent'], human(recent.get('modified_7d', 0)), human(recent.get('modified_30d', 0)), human(recent.get('created_7d', 0)))))
+            proven = row['status'] in {'comparable', 'new-directory', 'removed-directory'}
+            before = human(row['before']) if proven and row['before'] is not None else 'unknown'
+            after = human(row['after']) if proven and row['after'] is not None else 'unknown'
+            if row['status'] == 'new-directory':
+                before = '0 B (absent)'
+            elif row['status'] == 'removed-directory':
+                after = '0 B (absent)'
+            overlap = ' · Included in parent totals' if row['overlaps_parent'] else ''
+            self.query_one('#history-detail', Static).update(Text('%s\n%s · before %s · after %s%s\nCurrent recently modified allocated bytes: 7d %s / 30d %s; recently created 7d %s — activity clues, NOT measured growth.\nEnter opens this directory in Storage; missing/partial observations remain unknown.' % (clean(path), row['status'], before, after, overlap, human(recent.get('modified_7d', 0)), human(recent.get('modified_30d', 0)), human(recent.get('created_7d', 0)))))
 
     @on(DataTable.RowHighlighted, '#history-table')
     def history_highlight(self, event):
