@@ -66,7 +66,7 @@ PROTECTED_SUFFIXES = (".app", ".photoslibrary", ".photolibrary", ".backupbundle"
                       ".keychain-db", ".pem", ".key", ".p12", ".pfx", ".kdbx")
 
 
-def protected(path, state=None):
+def protected(path, state=None, allow_app_data=False):
     path = canonical(path)
     if state is not None and overlap(path, state):
         return "MacTrim state is protected"
@@ -82,7 +82,7 @@ def protected(path, state=None):
             return "Cloud-managed scope is protected"
     if path == Path.home() or path == Path("/"):
         return "Home and filesystem roots are protected"
-    if "Library" in path.parts and any(part in path.parts for part in ("Preferences", "Application Support", "Containers", "Group Containers", "Photos", "Mail", "Messages")):
+    if not allow_app_data and "Library" in path.parts and any(part in path.parts for part in ("Preferences", "Application Support", "Containers", "Group Containers", "Photos", "Mail", "Messages")):
         return "Unique application data is report-only"
     return None
 
@@ -134,18 +134,21 @@ def stat_record(st, root=False):
 
 
 class Budget:
-    def __init__(self, maximum=100000, depth=24):
+    def __init__(self, maximum=100000, depth=24, cancel=None):
+        self.cancel = cancel
         self.maximum = maximum
         self.depth = depth
         self.used = 0
 
     def consume(self, depth):
+        if self.cancel is not None and self.cancel.is_set():
+            raise SafetyError("Traversal cancelled")
         self.used += 1
         if self.used > self.maximum or depth > self.depth:
             raise SafetyError("Traversal budget exhausted (files=%s; depth=%s)" % (self.maximum, self.depth))
 
 
-def fingerprint(path, budget=None, inspect_protected=True, state=None):
+def fingerprint(path, budget=None, inspect_protected=True, state=None, exclude_top=(), normalize_root=False, allow_app_data=False):
     """Stable no-follow descendant inventory and identity; inaccessible entries block."""
     path = canonical(path)
     budget = budget or Budget()
@@ -166,10 +169,12 @@ def fingerprint(path, budget=None, inspect_protected=True, state=None):
             if getattr(st, "st_flags", 0) & 0x40000000:  # SF_DATALESS: do not hydrate placeholders.
                 raise SafetyError("Cloud placeholder is protected")
             absolute = path / relative if relative else path
-            if inspect_protected and protected(absolute, state):
-                raise SafetyError(protected(absolute, state))
+            if inspect_protected and protected(absolute, state, allow_app_data):
+                raise SafetyError(protected(absolute, state, allow_app_data))
             newest_ns = max(newest_ns, st.st_mtime_ns)
             record = [relative, stat_record(st, root=not relative)]
+            if normalize_root and not relative and stat.S_ISDIR(st.st_mode):
+                record[1][7] = 0  # Git may rewrite its pointer; root identity still binds.
             if stat.S_ISLNK(st.st_mode):
                 record.append(os.readlink(name, dir_fd=fd))
             elif stat.S_ISDIR(st.st_mode):
@@ -183,6 +188,8 @@ def fingerprint(path, budget=None, inspect_protected=True, state=None):
                     names = sorted(os.listdir(child_fd))
                     records.append(record)
                     for child in names:
+                        if not relative and child in exclude_top:
+                            continue
                         visit(child_fd, child, str(Path(relative) / child), level + 1)
                     if stat_record(os.fstat(child_fd)) != stat_record(st):
                         raise SafetyError("Directory changed during enumeration")

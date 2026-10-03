@@ -58,6 +58,41 @@ class MeasurementTests(unittest.TestCase):
                 self.assertEqual(virtual.status, 'skipped')
             os.close(fd.return_value.__enter__.return_value)
 
+    def test_budget_does_not_allocate_unbounded_unmeasured_children(self):
+        for index in range(200):
+            (self.root / str(index)).write_bytes(b"x")
+        node = measure(self.root, max_entries=1)
+        self.assertEqual(node.status, "partial")
+        self.assertLessEqual(len(node.children), 1)
+        self.assertEqual(node.logical, 0)
+
+    def test_root_user_front_door_changes_subtree_device_context(self):
+        from contextlib import contextmanager
+        from types import SimpleNamespace
+        users = self.root / "Users"
+        users.mkdir()
+        (users / "person").mkdir()
+        (users / "person" / "a").write_bytes(b"x" * 23)
+        real_stat, real_fstat, real_lstat = os.stat, os.fstat, os.lstat
+        root_ino = self.root.stat().st_ino
+        def adjusted(value):
+            fields = {name: getattr(value, name) for name in dir(value) if name.startswith("st_")}
+            fields["st_dev"] = 1 if value.st_ino == root_ino else 2
+            return SimpleNamespace(**fields)
+        @contextmanager
+        def root_fd(path):
+            fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                yield fd
+            finally:
+                os.close(fd)
+        def lstat(path):
+            return adjusted(real_lstat(self.root)) if str(path) == "/" else adjusted(real_lstat(path))
+        with patch("mactrim.measurement.directory_fd", root_fd), patch("mactrim.measurement.ancestor_identity"), patch("mactrim.measurement.os.lstat", side_effect=lstat), patch("mactrim.measurement.os.fstat", side_effect=lambda fd: adjusted(real_fstat(fd))), patch("mactrim.measurement.os.stat", side_effect=lambda *args, **kwargs: adjusted(real_stat(*args, **kwargs))):
+            node = measure("/", storage=True, independent_children=True)
+        self.assertEqual(node.logical, 23)
+        self.assertEqual(node.children[0].children[0].logical, 23)
+
     def test_capacity_root_exposes_data_separately(self):
         with patch('mactrim.measurement.Path.exists', return_value=True):
             items = capacities('/')

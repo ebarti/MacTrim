@@ -65,7 +65,7 @@ def create(destination):
                 os.utime(path, (old, old), follow_symlinks=False)
         os.utime(parent, (old, old), follow_symlinks=False)
     config = defaults()
-    config.update(repo_roots=[str(root / "projects")], duplicate_roots=[str(duplicates)], cache_roots=[str(caches)],
+    config.update(worktree_roots=[], repo_roots=[str(root / "projects")], duplicate_roots=[str(duplicates)], cache_roots=[str(caches)],
                   app_roots=[str(apps)], app_data_roots=[str(caches), str(preferences)], system_reports=False)
     config_path = root / "config.json"
     config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")

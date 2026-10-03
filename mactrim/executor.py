@@ -38,8 +38,11 @@ def selection(plan, identifiers):
     return items
 
 
-def _fp(path, state, config, quarantine=False):
-    return fingerprint(path, Budget(config["max_files"], config["max_depth"]),
+def _fp(path, state, config, quarantine=False, algorithm=None, allow_app_data=False):
+    if algorithm == "git-worktree.v1":
+        from .worktrees import worktree_fingerprint
+        return worktree_fingerprint(path, config, quarantine)
+    return fingerprint(path, Budget(config["max_files"], config["max_depth"]), allow_app_data=allow_app_data,
                        inspect_protected=not quarantine, state=None if quarantine else state.path)
 
 
@@ -49,7 +52,7 @@ def _free(path):
 
 
 def _matches(path, expected, state, config, quarantine=False):
-    return _fp(path, state, config, quarantine)["digest"] == expected["digest"]
+    return _fp(path, state, config, quarantine, expected.get("algorithm"), expected.get("allow_app_data", False))["digest"] == expected["digest"]
 
 
 class Executor:
@@ -70,7 +73,7 @@ class Executor:
 
     def _validate(self, plan, item, process):
         self.state.verify()
-        if plan.get("issues") or not plan["activity"]["complete"]:
+        if plan.get("cancelled") or not plan["activity"]["complete"]:
             raise SafetyError("Original plan has incomplete scan or activity evidence; rescan")
         if time.time() - plan["created_at"] > 86400 or plan["created_at"] > time.time() + 5:
             raise SafetyError("Plan is stale or from the future; scan again (maximum age 24 hours)")
@@ -135,13 +138,17 @@ class Executor:
                     self.state.write_journal(record)  # durable intent BEFORE rename
                     self._hook("before_move", record)
                     path = canonical(item["path"])
-                    with directory_fd(path.parent) as source_fd, directory_fd(self.state.path / "quarantine") as target_fd:
-                        if ancestor_identity(path.parent) != ancestors:
-                            raise SafetyError("Ancestor changed before move")
-                        # Independent recheck with held source parent, then atomic exclusive move.
-                        if _fp(path, self.state, plan["config"])["digest"] != current["digest"]:
-                            raise SafetyError("Candidate changed immediately before move")
-                        rename_exclusive(source_fd, path.name, target_fd, identifier)
+                    if item["kind"] == "git-worktree":
+                        from .worktrees import move
+                        move(record, self.state, process=process)
+                    else:
+                        with directory_fd(path.parent) as source_fd, directory_fd(self.state.path / "quarantine") as target_fd:
+                            if ancestor_identity(path.parent) != ancestors:
+                                raise SafetyError("Ancestor changed before move")
+                            # Independent recheck with held source parent, then atomic exclusive move.
+                            if _fp(path, self.state, plan["config"], algorithm=current.get("algorithm"), allow_app_data=item["kind"] == "retired-app-data")["digest"] != current["digest"]:
+                                raise SafetyError("Candidate changed immediately before move")
+                            rename_exclusive(source_fd, path.name, target_fd, identifier)
                     self._hook("after_move", record)
                     if not _matches(record["quarantine"], current, self.state, plan["config"], True):
                         record["status"] = "conflicted"
@@ -175,7 +182,7 @@ class Executor:
         record = matches[0]
         if record["quarantine"] != str(self.state.path / "quarantine" / identifier):
             raise SafetyError("Journal target is outside its owned quarantine slot")
-        if protected(record["original"], self.state.path):
+        if protected(record["original"], self.state.path, allow_app_data=record["candidate"]["kind"] == "retired-app-data"):
             raise SafetyError("Journal original path is protected")
         return record
 
@@ -185,6 +192,16 @@ class Executor:
         records = self.state.journals()
         for record in records:
             if record["status"] not in {"pending", "restoring", "purging"}:
+                continue
+            if record["candidate"]["kind"] == "git-worktree":
+                try:
+                    from .worktrees import reconcile
+                    reconcile(record, self.state, self._activity())
+                except (OSError, SafetyError) as exc:
+                    record["status"] = "conflicted"
+                    record["outcomes"].append("Git lifecycle needs manual inspection: " + clean(exc))
+                record["updated_at"] = time.time()
+                self.state.write_journal(record)
                 continue
             identifier = record["id"]
             if record["quarantine"] != str(self.state.path / "quarantine" / identifier):
@@ -232,6 +249,11 @@ class Executor:
             process = self._activity()
             root = record["candidate"]["context"].get("repo", original)
             blockers = process.blockers(root) + process.blockers(record["quarantine"])
+            if record["candidate"]["kind"] == "git-worktree":
+                from .worktrees import bound_common
+                context = record["candidate"]["context"]
+                bound_common(context)
+                blockers += process.blockers(context["admin_dir"]) + process.blockers(context["common_dir"])
             if blockers:
                 raise SafetyError("; ".join(blockers))
             if not _matches(record["quarantine"], record["fingerprint"], self.state, record["config"], True):
@@ -242,10 +264,14 @@ class Executor:
             record["updated_at"] = time.time()
             self.state.write_journal(record)
             self._hook("before_restore", record)
-            with directory_fd(self.state.path / "quarantine") as source_fd, directory_fd(original.parent) as target_fd:
-                if ancestor_identity(original.parent) != ancestors:
-                    raise SafetyError("Restore ancestor changed")
-                rename_exclusive(source_fd, identifier, target_fd, original.name)
+            if record["candidate"]["kind"] == "git-worktree":
+                from .worktrees import move
+                move(record, self.state, restore=True, process=process)
+            else:
+                with directory_fd(self.state.path / "quarantine") as source_fd, directory_fd(original.parent) as target_fd:
+                    if ancestor_identity(original.parent) != ancestors:
+                        raise SafetyError("Restore ancestor changed")
+                    rename_exclusive(source_fd, identifier, target_fd, original.name)
             self._hook("after_restore", record)
             if not _matches(original, record["fingerprint"], self.state, record["config"]):
                 record["status"] = "conflicted"
@@ -261,7 +287,7 @@ class Executor:
         return "PURGE %s %s" % (record["id"], record["fingerprint"]["digest"][:12])
 
     def _purge_residual(self, record):
-        current = _fp(record["quarantine"], self.state, record["config"], True)
+        current = _fp(record["quarantine"], self.state, record["config"], True, record["fingerprint"].get("algorithm"))
         if record["status"] == "quarantined":
             if current["digest"] != record["fingerprint"]["digest"]:
                 raise SafetyError("Quarantine changed; purge refused")
@@ -305,6 +331,9 @@ class Executor:
                     raise SafetyError("Quarantined duplicate content changed; purge refused")
                 if file_hash(keeper) != context["sha256"] or not _matches(keeper, context["keeper_fingerprint"], self.state, record["config"]):
                     raise SafetyError("Duplicate keeper changed; purge refused")
+            if record["candidate"]["kind"] == "retired-app-data":
+                from .apps import confirmed_owner
+                confirmed_owner(original, record["candidate"]["context"]["bundle_id"], record["config"], self.state.path, process)
             self._purge_residual(record)
             before = _free(self.state.path)
             record["status"] = "purging"
@@ -312,10 +341,14 @@ class Executor:
             record["updated_at"] = time.time()
             self.state.write_journal(record)
             self._hook("before_purge", record)
-            with directory_fd(self.state.path / "quarantine") as fd:
-                # Revalidate again after the durable intent, including root identity.
-                self._purge_residual(record)
-                remove_tree_fd(fd, identifier, record["fingerprint"]["records"])
+            if record["candidate"]["kind"] == "git-worktree":
+                from .worktrees import purge
+                purge(record, self.state, process)
+            else:
+                with directory_fd(self.state.path / "quarantine") as fd:
+                    # Revalidate again after the durable intent, including root identity.
+                    self._purge_residual(record)
+                    remove_tree_fd(fd, identifier, record["fingerprint"]["records"])
             self._hook("after_purge", record)
             record["status"] = "purged"
             record["updated_at"] = time.time()

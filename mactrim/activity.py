@@ -12,7 +12,7 @@ from .safety import canonical, clean, within
 def _own_scanner_invocation():
     entry = Path(sys.argv[0])
     is_cli = entry.name == "mactrim" or (entry.parent.name == "mactrim" and entry.name in {"__main__.py", "cli.py"})
-    root_flags = ("--repo-root", "--duplicate-root", "--cache-root")
+    root_flags = ("--repo-root", "--duplicate-root", "--cache-root", "--worktree-root")
     has_root_flag = any(argument == flag or argument.startswith(flag + "=") for argument in sys.argv[1:] for flag in root_flags)
     return is_cli and "scan" in sys.argv[1:] and has_root_flag
 
@@ -24,6 +24,7 @@ class Activity:
     issues: list = field(default_factory=list)
     captured_at: float = field(default_factory=time.time)
     commands: dict = field(default_factory=dict, repr=False)
+    attempts: int = 1
 
     def blockers(self, root):
         blockers = list(self.issues) if not self.complete else []
@@ -47,7 +48,7 @@ class Activity:
 
     def summary(self):
         return {"complete": self.complete, "issues": self.issues, "observed_paths": len(self.paths),
-                "captured_at": self.captured_at, "provider": "macOS lsof + ps", "scope": "current UID, non-zombie cwd/open/executable paths + ps argv references; other UIDs unobserved"}
+                "captured_at": self.captured_at, "attempts": self.attempts, "provider": "macOS lsof + ps", "scope": "current UID, non-zombie cwd/open/executable paths + ps argv references; other UIDs unobserved"}
 
 
 def _pids():
@@ -147,18 +148,33 @@ def parse_lsof(data, expected, stderr=b"", returncode=0):
 def snapshot():
     if sys.platform != "darwin":
         return Activity(False, issues=["Mutation requires complete macOS lsof activity evidence"])
+    # Reconcile short-lived processes within three bounded attempts. A second
+    # post-lsof inventory only drops confirmed exits; surviving newborns must
+    # be covered on a retry. Descriptor uncertainty is never erased by retries.
+    paths, persistent = [], set()
+    observed = Activity(False)
     try:
-        before = _pids()
-        result = subprocess.run(["/usr/sbin/lsof", "-nP", "-a", "-u", str(os.getuid()), "-F0pcftn"], capture_output=True, timeout=25)
-        after = _pids()
-        if len(result.stdout) > 32 * 1024 * 1024:
-            return Activity(False, issues=["lsof output exceeded the 32 MiB bound"])
-        # Include newly born live processes: missing children fail closed rather
-        # than disappearing from a stable-intersection inventory.
-        observed = parse_lsof(result.stdout, set(after), result.stderr, result.returncode)
-        if isinstance(after, dict):
-            observed.commands = after
-        observed.issues = sorted(set(observed.issues))
+        for attempt in range(1, 4):
+            before = _pids()
+            result = subprocess.run(["/usr/sbin/lsof", "-nP", "-a", "-u", str(os.getuid()), "-F0pcftn"], capture_output=True, timeout=25)
+            after = _pids()
+            surviving = _pids()
+            if len(result.stdout) > 32 * 1024 * 1024:
+                return Activity(False, issues=["lsof output exceeded the 32 MiB bound"], attempts=attempt)
+            expected = set(surviving)
+            observed = parse_lsof(result.stdout, expected, result.stderr, result.returncode)
+            paths.extend(observed.paths)
+            persistent.update(issue for issue in observed.issues if not issue.startswith(("lsof missed ", "lsof could not establish cwd for ")))
+            born = expected - set(before)
+            if born:
+                observed.issues.append("Surviving newly born processes require lsof reconciliation")
+            observed.issues = sorted(set(observed.issues) | persistent)
+            observed.complete = not observed.issues
+            observed.attempts = attempt
+            observed.paths = list(dict.fromkeys(paths))
+            observed.commands = surviving if isinstance(surviving, dict) else {}
+            if observed.complete:
+                return observed
         return observed
     except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
-        return Activity(False, issues=["Activity snapshot failed: %s" % clean(exc)])
+        return Activity(False, paths=paths, issues=sorted(persistent | {"Activity snapshot failed: %s" % clean(exc)}))

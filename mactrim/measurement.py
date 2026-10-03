@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import stat
 import threading
+import time
 
 from .safety import SafetyError, ancestor_identity, canonical, clean, directory_fd, protected
 
@@ -24,14 +25,15 @@ class Node:
     issues: list = field(default_factory=list)
     children: list = field(default_factory=list)
     alias_of: str = ""
-    kind: str = "directory"
+    kind: str = "unknown"
     protected: bool = False
+    recent: dict = field(default_factory=lambda: {"modified_7d": 0, "modified_30d": 0, "created_7d": 0})
 
     def summary(self):
         return {"logical": self.logical, "allocated": self.allocated, "entries": self.entries,
                 "newest_ns": self.newest_ns, "identity": list(self.identity), "status": self.status,
                 "issues": self.issues, "alias_of": self.alias_of, "kind": self.kind,
-                "digest": None, "measurement_only": True}
+                "digest": None, "measurement_only": True, "recent": self.recent}
 
     def export(self):
         return dict(self.summary(), path=self.path, name=self.name, protected=self.protected,
@@ -60,6 +62,7 @@ def measure(path, max_entries=20000, max_depth=16, cancel=None, progress=None,
     cancel = cancel or threading.Event()
     seen = seen if seen is not None else {}
     budget = Counter(max_entries, max_depth)
+    now = time.time()
     root = Node(str(path), path.name or "/", protected=bool(protected(path)))
     try:
         root_st = os.lstat(path)
@@ -70,7 +73,7 @@ def measure(path, max_entries=20000, max_depth=16, cancel=None, progress=None,
         root.issues = [clean(exc)]
         return root
 
-    def walk(parent_fd, name, node, level, counter, expected=None):
+    def walk(parent_fd, name, node, level, counter, expected=None, device=None):
         if cancel.is_set():
             node.status = "cancelled"
             node.issues.append("Measurement cancelled; totals are lower bounds")
@@ -78,6 +81,7 @@ def measure(path, max_entries=20000, max_depth=16, cancel=None, progress=None,
         try:
             counter.take(level)
             st = os.stat(name, dir_fd=parent_fd, follow_symlinks=False) if name else os.fstat(parent_fd)
+            node.kind = 'directory' if stat.S_ISDIR(st.st_mode) else 'file' if stat.S_ISREG(st.st_mode) else 'symlink' if stat.S_ISLNK(st.st_mode) else 'special'
             node.identity = (st.st_dev, st.st_ino)
             node.newest_ns = st.st_mtime_ns
             node.entries = 1
@@ -98,10 +102,11 @@ def measure(path, max_entries=20000, max_depth=16, cancel=None, progress=None,
                 node.status = "skipped"
                 node.issues.append("Cloud placeholder; never hydrate")
                 return
-            if st.st_dev != root_device:
+            device = root_device if device is None else device
+            if st.st_dev != device:
                 # User-selected root owns its device. At /, preserve the useful
                 # macOS firmlink front doors, but do not recursively visit mounts.
-                allow_front = storage and path == Path("/") and absolute in {"/Users", "/Applications"}
+                allow_front = storage and path == Path("/") and level == 1 and absolute in {"/Users", "/Applications"}
                 if not allow_front:
                     node.status = "skipped"
                     node.issues.append("Mount boundary")
@@ -116,6 +121,11 @@ def measure(path, max_entries=20000, max_depth=16, cancel=None, progress=None,
             if stat.S_ISREG(st.st_mode):
                 node.kind = "file"
                 node.logical, node.allocated = st.st_size, getattr(st, "st_blocks", 0) * 512
+                for days in (7, 30):
+                    if st.st_mtime >= now - days * 86400:
+                        node.recent["modified_%sd" % days] = node.allocated
+                if getattr(st, "st_birthtime", 0) >= now - 7 * 86400:
+                    node.recent["created_7d"] = node.allocated
                 node.status = "measured"
                 return
             if not stat.S_ISDIR(st.st_mode):
@@ -132,8 +142,28 @@ def measure(path, max_entries=20000, max_depth=16, cancel=None, progress=None,
                 node.status = "measured"
                 # listdir does not read file content. Its entry count is separately
                 # bounded; directory populations beyond the budget are partial.
-                names = sorted(os.listdir(fd))
+                names = []
+                truncated = False
+                maximum_names = max(1, max_entries if independent_children and level == 0 else counter.limit - counter.used)
+                with os.scandir(fd) as stream:
+                    for entry in stream:
+                        if cancel.is_set():
+                            node.status = "cancelled"
+                            node.issues.append("Enumeration cancelled; remaining names unknown")
+                            break
+                        if len(names) >= maximum_names:
+                            truncated = True
+                            break
+                        names.append(entry.name)
+                names.sort()
+                if truncated:
+                    node.status = "partial"
+                    node.issues.append("Directory enumeration budget exhausted; additional entries are unknown")
                 for child_name in names:
+                    if not (independent_children and level == 0) and counter.used >= counter.limit:
+                        node.status = "partial"
+                        node.issues.append("Remaining entries unmeasured after subtree budget exhaustion")
+                        break
                     child_path = str(Path(absolute) / child_name)
                     child = Node(child_path, child_name, protected=bool(protected(child_path)))
                     node.children.append(child)
@@ -142,15 +172,17 @@ def measure(path, max_entries=20000, max_depth=16, cancel=None, progress=None,
                         child.status = "partial"
                         child.issues.append("Metadata budget exhausted before this entry")
                     else:
-                        walk(fd, child_name, child, level + 1, child_counter)
+                        walk(fd, child_name, child, level + 1, child_counter, device=st.st_dev)
                     node.logical += child.logical
                     node.allocated += child.allocated
                     node.entries += child.entries
+                    for bucket in node.recent:
+                        node.recent[bucket] += child.recent[bucket]
                     node.newest_ns = max(node.newest_ns, child.newest_ns)
                     if child.status != "measured":
                         node.status = "partial" if child.status != "cancelled" else "cancelled"
                     if progress:
-                        progress(node, child)
+                        progress(root, child)
                     if cancel.is_set():
                         node.status = "cancelled"
                         node.issues.append("Remaining entries unmeasured")

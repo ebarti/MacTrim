@@ -110,7 +110,7 @@ class State:
 
     def journal_payload(self, record):
         payload = json_bytes(self.sign(record))
-        reserve = JOURNAL_COMPLETION_RESERVE if record.get("status") == "pending" else 0
+        reserve = JOURNAL_COMPLETION_RESERVE if record.get("status") in {"pending", "restoring", "purging"} else 0
         if len(payload) + reserve > MAX_JOURNAL_BYTES:
             raise SafetyError("Journal exceeds recoverable size bound; no move is authorized")
         return payload

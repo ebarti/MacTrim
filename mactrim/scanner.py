@@ -10,6 +10,8 @@ import time
 
 from . import activity
 from .config import validate
+from .git_runtime import environment as git_environment, prefix as git_prefix
+from .measurement import measure, Node
 from .safety import (Budget, SafetyError, ancestor_identity, canonical, clean, digest,
                      file_hash, fingerprint, overlap, protected, within)
 from .state import SCHEMA
@@ -22,13 +24,7 @@ REPORT_NAMES = {"reports", "screenshots", "logs", "test-results", "coverage", ".
 
 
 def git(repo, *arguments):
-    env = os.environ.copy()
-    env.update({"GIT_OPTIONAL_LOCKS": "0", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
-                "GIT_TERMINAL_PROMPT": "0"})
-    # Disable project fsmonitor commands. Built-in reads only; no project scripts.
-    result = subprocess.run(["/usr/bin/git", "--no-optional-locks", "-c", "core.fsmonitor=false",
-                             "-c", "core.untrackedCache=false", "-C", str(repo)] + list(arguments),
-                            capture_output=True, env=env, timeout=20)
+    result = subprocess.run(git_prefix(repo) + list(arguments), capture_output=True, env=git_environment(), timeout=20)
     if result.returncode or len(result.stdout) > 16 * 1024 * 1024 or result.stderr:
         raise SafetyError("Git evidence unavailable: %s" % clean(result.stderr.decode(errors="replace")[:300]))
     return result.stdout
@@ -42,9 +38,7 @@ def git_evidence(repo, path):
     if tracked:
         raise SafetyError("Artifact contains tracked data")
     # check-ignore status 1 is meaningful and is handled without git()'s status requirement.
-    result = subprocess.run(["/usr/bin/git", "--no-optional-locks", "-c", "core.fsmonitor=false", "-C", str(repo),
-                             "check-ignore", "-q", "--", relative], capture_output=True, timeout=15,
-                            env=dict(os.environ, GIT_OPTIONAL_LOCKS="0", GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull))
+    result = subprocess.run(git_prefix(repo) + ["check-ignore", "-q", "--", relative], capture_output=True, timeout=15, env=git_environment())
     if result.returncode != 0 or result.stderr:
         raise SafetyError("Artifact is not proven Git-ignored")
     top = git(repo, "rev-parse", "--show-toplevel").decode(errors="surrogateescape").strip()
@@ -144,12 +138,16 @@ def repo_policy(path, repo, config, state, process, budget=None):
 
 def cache_policy(path, config, state, process, budget=None):
     path = canonical(path)
-    if path.name not in USER_CACHES or str(path.parent) not in config["cache_roots"]:
+    npm_content = path.name == "_cacache" and path.parent.name in {"npm", ".npm"} and (str(path.parent) in config["cache_roots"] or str(path.parent.parent) in config["cache_roots"])
+    if not npm_content and (path.name not in USER_CACHES or str(path.parent) not in config["cache_roots"]):
         raise SafetyError("Unrecognized user cache provenance")
     if (path.parent / path.name).is_symlink():
         raise SafetyError("Cache root is a symlink")
     layout = {child.name for child, _ in entries(path, budget or Budget(config["max_files"], config["max_depth"]))}
-    if path.name == "pip":
+    if npm_content:
+        if not layout or not layout <= {"content-v2", "index-v5", "tmp"}:
+            raise SafetyError("npm content-addressed cache layout is unproven")
+    elif path.name == "pip":
         if not layout or not layout <= {"http", "http-v2", "wheels", "selfcheck"}:
             raise SafetyError("Pip cache layout is unproven or contains unexpected unique data")
     elif path.name == "uv":
@@ -176,7 +174,7 @@ def cache_policy(path, config, state, process, budget=None):
     if fp["newest_ns"] / 1e9 > time.time() - config["cache_days"] * 86400:
         raise SafetyError("Cache activity is recent")
     return fp, ["Recognized %s download cache layout" % path.name, "%s-day inactivity proxy" % config["cache_days"],
-                "No observed process use", "Package downloads regenerate this cache"], USER_CACHES[path.name]
+                "No observed process use", "Package downloads regenerate this cache"], USER_CACHES["npm" if npm_content else path.name]
 
 
 def xcode_policy(path, config, state, process, budget=None):
@@ -276,25 +274,44 @@ def apps_inventory(config, budget):
     return inventory, issues
 
 
+class ObservableItems(list):
+    def __init__(self, callback):
+        super().__init__()
+        self.callback = callback
+
+    def append(self, item):
+        super().append(item)
+        if self.callback:
+            self.callback("candidate", item)
+
+
 class Scanner:
-    def __init__(self, config, state, process=None):
+    def __init__(self, config, state, process=None, progress=None, cancel=None):
         self.config = validate(dict(config), state.path)
         self.state = state
         self.process = process if process is not None else activity.snapshot()
-        self.budget = Budget(config["max_files"], config["max_depth"])
-        self.items = []
+        self.cancel = cancel
+        self.progress = progress
+        self.budget = Budget(config["max_files"], config["max_depth"], cancel)
+        self.items = ObservableItems(progress)
         self.issues = []
         self.repositories = set()
         self.coverage = []
+        self.duplicate_sizes = {}
+        self.duplicate_budgets = {}
 
     def report(self, path, kind, reason, context=None, evidence=None, hint=""):
-        fp = None
-        try:
-            fp = fingerprint(path, self.budget, inspect_protected=False)
-            fp.pop("records", None)
-        except (OSError, SafetyError) as exc:
-            self.issues.append("Cannot fully inspect %s: %s" % (clean(path), clean(exc)))
-            reason += "; descendant inspection incomplete"
+        remaining = self.budget.maximum - self.budget.used
+        if remaining <= 0:
+            measured = Node(str(path), Path(path).name, status="partial", issues=["Metadata budget exhausted"])
+        else:
+            measured = measure(path, remaining, self.config["max_depth"], cancel=self.cancel)
+            self.budget.used += measured.entries
+        if measured.status in {"denied", "partial", "cancelled"}:
+            self.issues.append("Report inventory incomplete %s: %s" % (clean(path), '; '.join(measured.issues)))
+        fp = measured.summary()
+        if measured.status in {"denied", "partial", "cancelled"}:
+            reason += "; metadata inventory " + measured.status
         self.items.append(candidate(path, kind, context or {}, fp, evidence, [reason], hint))
 
     def repo(self, repo):
@@ -302,10 +319,15 @@ class Scanner:
         if str(repo) in self.repositories:
             return
         self.repositories.add(str(repo))
+        previous_budget = self.budget
+        self.budget = Budget(min(self.config["max_files"], self.config["budgets"]["repositories"]), self.config["max_depth"], self.cancel)
+        start_count = len(self.items)
         try:
             _, artifacts, reviews = source_activity(repo, self.config, self.budget)
         except (OSError, SafetyError) as exc:
             self.issues.append("Repository inspection incomplete %s: %s" % (clean(repo), clean(exc)))
+            self.coverage.append({"category": "repositories", "root": str(repo), "status": "partial", "issues": [clean(exc)], "entries": self.budget.used})
+            self.budget = previous_budget
             return
         for path in artifacts:
             try:
@@ -315,6 +337,9 @@ class Scanner:
                 self.report(path, "repo-artifact", clean(exc), {"repo": str(repo)}, hint="Retain unless repository provenance, regeneration and inactivity are established")
         for path in reviews:
             self.report(path, "unique-artifact", "Potential unique source, data, log, screenshot or report; age is insufficient", {"repo": str(repo)}, hint="Inspect/export any unique evidence manually")
+
+        self.coverage.append({"category": "repositories", "root": str(repo), "status": "partial" if self.budget.used > self.budget.maximum else "measured", "entries": self.budget.used, "limit": self.budget.maximum, "candidates": len(self.items) - start_count})
+        self.budget = previous_budget
 
     def discover_repos(self):
         for root in self.config["repo_roots"]:
@@ -356,12 +381,13 @@ class Scanner:
                         continue
                     if not stat.S_ISDIR(st.st_mode):
                         continue
-                    if path.name in USER_CACHES:
+                    npm_content = path.name == "_cacache" and root.name in {"npm", ".npm"}
+                    if path.name in USER_CACHES or npm_content:
                         try:
                             fp, evidence, hint = cache_policy(path, self.config, self.state.path, self.process, self.budget)
                             self.items.append(candidate(path, "user-cache", {}, fp, evidence, [], hint))
                         except (OSError, SafetyError) as exc:
-                            self.report(path, "user-cache", clean(exc), hint=USER_CACHES[path.name])
+                            self.report(path, "user-cache", clean(exc), hint=USER_CACHES["npm" if npm_content else path.name])
                     elif root.name == "DerivedData" and root.parent.name == "Xcode":
                         try:
                             fp, evidence, hint = xcode_policy(path, self.config, self.state.path, self.process, self.budget)
@@ -375,7 +401,7 @@ class Scanner:
                 self.issues.append("Cache root incomplete %s: %s" % (clean(root), clean(exc)))
 
     def duplicates(self):
-        sizes = {}
+        sizes = self.duplicate_sizes
         device_by_root = {}
         for root in self.config["duplicate_roots"]:
             root = canonical(root)
@@ -398,15 +424,20 @@ class Scanner:
                 walk(root, 0)
             except (OSError, SafetyError) as exc:
                 self.issues.append("Duplicate root incomplete %s: %s" % (clean(root), clean(exc)))
-        for paths in sizes.values():
+            self.duplicate_budgets[str(root)] = self.budget
+
+    def duplicates_finish(self):
+        for paths in self.duplicate_sizes.values():
             if len(paths) < 2:
                 continue
             hashes = {}
             for path, root in paths:
                 try:
                     duplicate_git_guard(path)
+                    budget = self.duplicate_budgets[str(root)]
+                    budget.consume(0)  # account each content read before hashing
                     hashed = file_hash(path)
-                    fp = fingerprint(path, self.budget, state=self.state.path)
+                    fp = fingerprint(path, budget, state=self.state.path)
                     hashes.setdefault(hashed, []).append((path, root, fp))
                 except (OSError, SafetyError) as exc:
                     self.issues.append("Duplicate hash incomplete %s: %s" % (clean(path), clean(exc)))
@@ -450,15 +481,52 @@ class Scanner:
                 self.issues.append("App data inventory incomplete: " + clean(exc))
         return inventory
 
+    def _category(self, category, key, method):
+        original = self.config
+        roots = list(original[key])
+        for root in roots:
+            if self.cancel is not None and self.cancel.is_set():
+                self.coverage.append({"category": category, "root": root, "status": "cancelled", "issues": ["Scan cancelled"]})
+                break
+            self.config = dict(original, **{key: [root]})
+            self.budget = Budget(min(original["max_files"], original["budgets"][category]), original["max_depth"], self.cancel)
+            before_issues, before_items = len(self.issues), len(self.items)
+            if self.progress:
+                self.progress("category", {"category": category, "root": root, "status": "scanning"})
+            method()
+            issues = self.issues[before_issues:]
+            self.coverage.append({"category": category, "root": root, "status": "partial" if issues else "measured" if Path(root).exists() else "absent", "entries": self.budget.used, "limit": self.budget.maximum, "issues": issues, "candidates": len(self.items) - before_items})
+        self.config = original
+
     def run(self):
-        self.discover_repos()
-        self.caches()
-        self.duplicates()
-        inventory = self.apps()
+        from . import apps, worktrees
+        self._category("repositories", "repo_roots", self.discover_repos)
+        self._category("caches", "cache_roots", self.caches)
+        self._category("duplicates", "duplicate_roots", self.duplicates)
+        self.duplicates_finish()
+        for row in self.coverage:
+            if row.get("category") == "duplicates" and row.get("root") in self.duplicate_budgets:
+                budget = self.duplicate_budgets[row["root"]]
+                row["entries"] = budget.used
+                if budget.used > budget.maximum:
+                    row["status"] = "partial"
+                    row["issues"].append("Duplicate content/fingerprint budget exhausted")
+        if self.progress:
+            self.progress("category", {"category": "worktrees", "root": "configured Git registrations", "status": "scanning"})
+        wt_items, wt_coverage = worktrees.discover(self.config["worktree_roots"] + self.config["repo_roots"], self.config, self.state.path, self.process, progress=self.items.append, cancel=self.cancel)
+        self.coverage.extend(wt_coverage)
+        if self.progress:
+            self.progress("category", {"category": "apps", "root": "configured app/helper/service and data inventories", "status": "scanning"})
+        app_items, owners, app_coverage = apps.detect(self.config, self.state.path, self.process, self.cancel, progress=self.items.append)
+        self.coverage.extend(app_coverage)
+        inventory = owners["bundles"]
+        self.issues.extend("App ownership inventory: " + issue for issue in owners["issues"])
         if self.config["system_reports"]:
+            self.budget = Budget(min(self.config["max_files"], self.config["budgets"]["system"]), self.config["max_depth"], self.cancel)
             for path in ("/Library/Updates", "/Library/Application Support/Apple/AssetCache"):
                 if Path(path).exists():
                     self.report(path, "macos-managed", "macOS update staging / Content Caching is report-only", hint="Use System Settings → General → Storage / Sharing → Content Caching; never remove staging manually")
+        cancelled = self.cancel is not None and self.cancel.is_set()
         # Avoid overlapping claims and totals. Most specific action is withheld.
         by_path = {}
         for item in self.items:
@@ -469,15 +537,13 @@ class Scanner:
         for index, item in enumerate(self.items):
             for other in self.items[:index]:
                 if overlap(item["path"], other["path"]) and item["path"] != other["path"]:
-                    item["blockers"].append("Overlaps another displayed candidate")
-                    other["blockers"].append("Overlaps another displayed candidate")
-                    item["eligible"] = other["eligible"] = False
-        # An incomplete traversal can hide process/provenance evidence: fail closed globally.
-        if self.issues:
+                    if item["eligible"] and other["eligible"]:
+                        item["evidence"].append("Nested actionable scope; select only one overlapping item")
+                        other["evidence"].append("Nested actionable scope; select only one overlapping item")
+        if cancelled:
             for item in self.items:
-                if item["eligible"]:
-                    item["eligible"] = False
-                    item["blockers"].append("Scan coverage is incomplete; resolve listed scan issues")
+                item["eligible"] = False
+                item["blockers"].append("Cancelled discovery is review-only; finish a fresh scan before actions")
         counted = []
         logical = allocated = 0
         inode_seen = set()
@@ -498,7 +564,7 @@ class Scanner:
                 allocated += item["fingerprint"]["allocated"]
             counted.append(item["path"])
         return {"schema": SCHEMA, "created_at": time.time(), "state": str(self.state.path), "config": self.config,
-                "activity": self.process.summary(), "coverage": self.coverage, "issues": self.issues,
+                "activity": self.process.summary(), "coverage": self.coverage, "issues": self.issues, "cancelled": cancelled,
                 "apps": inventory, "candidates": self.items,
                 "totals": {"logical": logical, "allocated": allocated, "quarantine_frees_bytes": 0,
                            "note": "Estimates only; APFS clones/compression/snapshots affect physical reclamation"}}
@@ -507,6 +573,12 @@ class Scanner:
 def validate_policy(item, config, state, process):
     """Re-derive eligibility, never accept manifest labels as authorization."""
     validate(dict(config), state)
+    if item["kind"] == "git-worktree":
+        from .worktrees import policy
+        return policy(item["path"], config, state, process, item["context"])[0]
+    if item["kind"] == "retired-app-data":
+        from .apps import policy
+        return policy(item["path"], item["context"]["bundle_id"], config, state, process)
     reason = protected(item["path"], state)
     if reason:
         raise SafetyError(reason)
