@@ -20,6 +20,7 @@ class Node:
     allocated: int = 0
     status: str = "unknown"
     entries: int = 0
+    metadata_visits: int = 0
     newest_ns: int = 0
     identity: tuple = ()
     issues: list = field(default_factory=list)
@@ -27,11 +28,13 @@ class Node:
     alias_of: str = ""
     kind: str = "unknown"
     protected: bool = False
+    budget_limited: bool = False
     recent: dict = field(default_factory=lambda: {"modified_7d": 0, "modified_30d": 0, "created_7d": 0})
 
     def summary(self):
         return {"logical": self.logical, "allocated": self.allocated, "entries": self.entries,
                 "newest_ns": self.newest_ns, "identity": list(self.identity), "status": self.status,
+                "metadata_visits": self.metadata_visits,
                 "issues": self.issues, "alias_of": self.alias_of, "kind": self.kind,
                 "digest": None, "measurement_only": True, "recent": self.recent}
 
@@ -41,13 +44,42 @@ class Node:
 
 
 class Counter:
-    def __init__(self, limit, depth):
-        self.limit, self.depth, self.used = limit, depth, 0
+    def __init__(self, limit, depth, parent=None):
+        self.limit, self.depth, self.used, self.parent = limit, depth, 0, parent
+
+    @property
+    def remaining(self):
+        own = max(0, self.limit - self.used)
+        return min(own, self.parent.remaining) if self.parent else own
 
     def take(self, level):
+        if level > self.depth:
+            raise SafetyError("Metadata depth exhausted")
+        if self.remaining == 0:
+            raise SafetyError("Metadata budget exhausted")
+        if self.parent:
+            self.parent.take(level)
         self.used += 1
-        if self.used > self.limit or level > self.depth:
-            raise SafetyError("Metadata budget/depth exhausted")
+
+
+def fair_frontier(path, level):
+    """Partition useful storage front doors without multiplying their budget."""
+    if level <= 2:
+        return True
+    parts = Path(path).parts
+    home = Path.home()
+    try:
+        if len(Path(path).relative_to(home).parts) <= 2:
+            return True
+    except ValueError:
+        pass
+    # Other user homes must receive the same treatment when exploring /.
+    if len(parts) >= 3 and parts[1] == 'Users' and len(parts) <= 5:
+        return True
+    for collection in ('Github', 'Projects', 'Developer', 'src', 'tmp', 'folders', 'worktrees'):
+        if collection in parts and len(parts) - parts.index(collection) <= 3:
+            return True
+    return False
 
 
 def measure(path, max_entries=20000, max_depth=16, cancel=None, progress=None,
@@ -55,6 +87,9 @@ def measure(path, max_entries=20000, max_depth=16, cancel=None, progress=None,
     """No-follow, inode-aware lower bounds; inspect system ownership read-only.
 
     Storage / uses independent child budgets so /System cannot starve /Users.
+    At useful home/project/temp frontiers, files are measured first and directory
+    siblings share the remaining quota; an early large directory cannot consume
+    later siblings' share. All child quotas debit their parent's fixed bound.
     Data's firmlink aliases and virtual trees are explicitly skipped even when
     their st_dev matches /. A drill-down starts its own independent inventory.
     """
@@ -78,6 +113,7 @@ def measure(path, max_entries=20000, max_depth=16, cancel=None, progress=None,
             node.status = "cancelled"
             node.issues.append("Measurement cancelled; totals are lower bounds")
             return
+        visits_start = counter.used
         try:
             counter.take(level)
             st = os.stat(name, dir_fd=parent_fd, follow_symlinks=False) if name else os.fstat(parent_fd)
@@ -140,11 +176,15 @@ def measure(path, max_entries=20000, max_depth=16, cancel=None, progress=None,
                 if (os.fstat(fd).st_dev, os.fstat(fd).st_ino) != identity:
                     raise SafetyError("Directory changed before enumeration")
                 node.status = "measured"
+                if level >= max_depth:
+                    node.status = "partial"
+                    node.issues.append("Depth limit; directory contents remain unknown")
+                    return
                 # listdir does not read file content. Its entry count is separately
                 # bounded; directory populations beyond the budget are partial.
                 names = []
-                truncated = False
-                maximum_names = max(1, max_entries if independent_children and level == 0 else counter.limit - counter.used)
+                truncated = unvisited = False
+                maximum_names = max(1, min(64, max_entries) if independent_children and level == 0 else counter.remaining)
                 with os.scandir(fd) as stream:
                     for entry in stream:
                         if cancel.is_set():
@@ -154,25 +194,45 @@ def measure(path, max_entries=20000, max_depth=16, cancel=None, progress=None,
                         if len(names) >= maximum_names:
                             truncated = True
                             break
-                        names.append(entry.name)
-                names.sort()
+                        # Type is an ordering hint only; walk revalidates lstat
+                        # and opened directory identity before trusting it.
+                        try:
+                            directory_hint = entry.is_dir(follow_symlinks=False)
+                        except OSError:
+                            directory_hint = True
+                        names.append((entry.name, directory_hint))
+                fair = storage and fair_frontier(absolute, level)
+                names.sort(key=lambda row: (row[1] if fair else False, row[0]))
+                directories_left = sum(hint for _, hint in names)
                 if truncated:
+                    node.budget_limited = True
                     node.status = "partial"
                     node.issues.append("Directory enumeration budget exhausted; additional entries are unknown")
-                for child_name in names:
-                    if not (independent_children and level == 0) and counter.used >= counter.limit:
+                for child_name, directory_hint in names:
+                    if not (independent_children and level == 0) and counter.remaining == 0:
+                        unvisited = True
+                        node.budget_limited = True
                         node.status = "partial"
                         node.issues.append("Remaining entries unmeasured after subtree budget exhaustion")
                         break
                     child_path = str(Path(absolute) / child_name)
                     child = Node(child_path, child_name, protected=bool(protected(child_path)))
                     node.children.append(child)
-                    child_counter = Counter(max_entries, max_depth) if independent_children and level == 0 else counter
-                    if child_counter.used >= child_counter.limit:
+                    if independent_children and level == 0:
+                        child_counter = Counter(max_entries, max_depth)
+                    elif fair and directory_hint:
+                        quota = max(1, counter.remaining // max(1, directories_left))
+                        child_counter = Counter(quota, max_depth, parent=counter)
+                    else:
+                        child_counter = counter
+                    if directory_hint:
+                        directories_left -= 1
+                    if child_counter.remaining == 0:
                         child.status = "partial"
                         child.issues.append("Metadata budget exhausted before this entry")
                     else:
                         walk(fd, child_name, child, level + 1, child_counter, device=st.st_dev)
+                    node.budget_limited |= child.budget_limited
                     node.logical += child.logical
                     node.allocated += child.allocated
                     node.entries += child.entries
@@ -187,6 +247,35 @@ def measure(path, max_entries=20000, max_depth=16, cancel=None, progress=None,
                         node.status = "cancelled"
                         node.issues.append("Remaining entries unmeasured")
                         break
+                # Once every sibling received a share, spend unused quota on
+                # the largest partial regions. This continues the same bounded
+                # collector; History never initiates another walk. Each repeated
+                # metadata visit also debits the shared budget. Exact inode
+                # accounting is removed only for the replaced region.
+                if fair and not (independent_children and level == 0) and not cancel.is_set():
+                    partials = sorted((child for child in node.children if child.kind == 'directory' and child.budget_limited), key=lambda child: (-child.allocated, child.name))
+                    for old in partials:
+                        if counter.remaining < max(32, old.entries * 2) or cancel.is_set():
+                            break
+                        def forget(value):
+                            if seen.get(value.identity) == value.path:
+                                del seen[value.identity]
+                            for descendant in value.children:
+                                forget(descendant)
+                        forget(old)
+                        fresh = Node(old.path, old.name, protected=old.protected)
+                        walk(fd, old.name, fresh, level + 1, counter,
+                             expected=old.identity + (stat.S_IFDIR,), device=st.st_dev)
+                        node.children[node.children.index(old)] = fresh
+                    # Refinement replaces, never adds, a region's earlier total.
+                    node.logical = sum(child.logical for child in node.children)
+                    node.allocated = sum(child.allocated for child in node.children)
+                    node.entries = 1 + sum(child.entries for child in node.children)
+                    node.newest_ns = max([st.st_mtime_ns] + [child.newest_ns for child in node.children])
+                    node.recent = {key: sum(child.recent[key] for child in node.children) for key in node.recent}
+                    node.budget_limited = truncated or unvisited or any(child.budget_limited for child in node.children)
+                    if not (truncated or unvisited):
+                        node.status = 'cancelled' if cancel.is_set() else 'measured' if all(child.status == 'measured' for child in node.children) else 'partial'
                 final = os.fstat(fd)
                 if final.st_mtime_ns != st.st_mtime_ns or final.st_ctime_ns != st.st_ctime_ns:
                     node.status = "partial"
@@ -197,8 +286,13 @@ def measure(path, max_entries=20000, max_depth=16, cancel=None, progress=None,
             node.status = "denied"
             node.issues.append(clean(exc))
         except (OSError, SafetyError) as exc:
-            node.status = "partial" if "budget" in str(exc).lower() else "denied"
+            node.budget_limited = "budget" in str(exc).lower()
+            node.status = "partial" if any(word in str(exc).lower() for word in ("budget", "depth")) else "denied"
             node.issues.append(clean(exc))
+        finally:
+            node.metadata_visits = counter.used - visits_start
+            if independent_children and level == 0:
+                node.metadata_visits += sum(child.metadata_visits for child in node.children)
 
     try:
         if path == Path("/"):

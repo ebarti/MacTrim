@@ -128,7 +128,7 @@ class MacTrimApp(App):
                  initial_tab='cleanup', scanner_factory=Scanner, executor_factory=Executor):
         super().__init__()
         self.plan, self.state = plan, state
-        self.config = config or (plan['config'] if plan else defaults())
+        self.config = dict(config or (plan['config'] if plan else defaults()))
         self.output, self.initial_tab = output, initial_tab
         self.scanner_factory, self.executor_factory = scanner_factory, executor_factory
         self.items = list(plan['candidates']) if plan else []
@@ -186,6 +186,12 @@ class MacTrimApp(App):
                     yield Button('Cancel', id='cancel-storage')
                     yield Select([('Allocated', 'allocated'), ('Logical', 'logical')], value='allocated', allow_blank=False, id='metric')
                     yield Select([('Size ↓', 'size'), ('Name A–Z', 'name')], value='size', allow_blank=False, id='storage-sort')
+                with Horizontal(classes='toolbar'):
+                    entry_options = sorted({10000, 100000, 1000000, self.config['storage_max_files']})
+                    depth_options = sorted({16, 32, 64, self.config['storage_max_depth']})
+                    yield Select([('%s entries' % format(value, ','), value) for value in entry_options], value=self.config['storage_max_files'], allow_blank=False, id='storage-budget')
+                    yield Select([('Depth %s' % value, value) for value in depth_options], value=self.config['storage_max_depth'], allow_blank=False, id='storage-depth')
+                    yield Button('Deeper ×10', id='storage-deep', variant='primary')
                 yield Static('Metadata only · estimates are lower bounds when incomplete · Enter drills into a directory', id='storage-summary')
                 with Horizontal(id='storage-body'):
                     yield OptionList(id='chart')
@@ -432,10 +438,10 @@ class MacTrimApp(App):
         self.storage_measuring = True
         self.query_one('#breadcrumbs', Static).update(Text(self.storage_path, style='bold #67e8f9'))
         self.query_one('#storage-status', Static).update('Measuring metadata in background… totals are lower bounds')
-        self.storage_worker(self.storage_path, self.storage_cancel, self.storage_generation)
+        self.storage_worker(self.storage_path, self.storage_cancel, self.storage_generation, dict(self.config))
 
     @work(thread=True, group='storage', exclusive=True)
-    def storage_worker(self, path, cancel, generation):
+    def storage_worker(self, path, cancel, generation, config):
         last = [0.0]
         def progress(node, child):
             now = time.monotonic()
@@ -444,14 +450,14 @@ class MacTrimApp(App):
                 self.call_from_thread(self.storage_update, node, generation, False)
         try:
             capacity = capacities('/')
-            node = measure(path, self.config['storage_max_files'], self.config['storage_max_depth'],
+            node = measure(path, config['storage_max_files'], config['storage_max_depth'],
                            cancel=cancel, progress=progress, storage=True,
                            independent_children=path == '/')
             self.call_from_thread(self.capacity_update, capacity)
             self.call_from_thread(self.storage_update, node, generation, True)
             if self.state is not None and not cancel.is_set() and node.entries > 1:
                 try:
-                    result = History(self.state, self.config).capture(node, capacity, automatic=True)
+                    result = History(self.state, config).capture(node, capacity, automatic=True)
                     self.call_from_thread(self.history_captured, result, None)
                 except Exception as exc:
                     self.call_from_thread(self.history_captured, None, clean(exc))
@@ -481,7 +487,7 @@ class MacTrimApp(App):
         if done:
             self.storage_measuring = False
         self.refresh_storage()
-        self.query_one('#storage-status', Static).update(Text('%s · %s metadata entries · %s' % (node.status.upper(), node.entries, '; '.join(node.issues[:2]) if done else 'Measurement running; navigation and cancellation available'), style=STATUS_COLOR.get(node.status, '#fbbf24')))
+        self.query_one('#storage-status', Static).update(Text('%s · %s observed entries · %s' % (node.status.upper(), node.entries, '; '.join(node.issues[:2]) if done else 'Measurement running; navigation and cancellation available'), style=STATUS_COLOR.get(node.status, '#fbbf24')))
 
     def refresh_storage(self):
         if self.storage_node is None:
@@ -506,7 +512,7 @@ class MacTrimApp(App):
                 chart.add_option(Option(text, id=child.path))
         if self.storage_nodes:
             table.move_cursor(row=min(old_index, len(self.storage_nodes) - 1))
-        self.query_one('#storage-summary', Static).update(Text('%s %s · %s immediate nodes · %s · graph shows first 15 sorted nodes\nMetadata only; incomplete totals are lower bounds. Enter drills; system/protected data remains read-only.' % (human(getattr(node, metric)), metric, len(self.storage_nodes), node.status.upper())))
+        self.query_one('#storage-summary', Static).update(Text('%s %s · %s immediate nodes · %s · graph shows first 15 sorted nodes\nMetadata only; partial totals are lower bounds. Enter drills; Deeper ×10 expands the bounded capture.' % (human(getattr(node, metric)), metric, len(self.storage_nodes), node.status.upper())))
 
     @on(Select.Changed, '#metric')
     @on(Select.Changed, '#storage-sort')
@@ -514,6 +520,17 @@ class MacTrimApp(App):
         self.storage_metric = self.query_one('#metric', Select).value
         self.storage_sort = self.query_one('#storage-sort', Select).value
         self.refresh_storage()
+
+    @on(Select.Changed, '#storage-budget')
+    @on(Select.Changed, '#storage-depth')
+    def storage_budget_changed(self):
+        entries = self.query_one('#storage-budget', Select).value
+        depth = self.query_one('#storage-depth', Select).value
+        if entries == Select.BLANK or depth == Select.BLANK:
+            return
+        if (entries, depth) != (self.config['storage_max_files'], self.config['storage_max_depth']):
+            self.config['storage_max_files'], self.config['storage_max_depth'] = entries, depth
+            self.start_storage(self.storage_path)
 
     def storage_selected(self, path):
         node = next((node for node in self.storage_nodes if node.path == path), None)
@@ -590,6 +607,16 @@ class MacTrimApp(App):
             self.start_storage(self.storage_path)
         elif identifier == 'cancel-storage':
             self.storage_cancel.set()
+        elif identifier == 'storage-deep':
+            entries = min(1000000, self.config['storage_max_files'] * 10)
+            depth = max(32, self.config['storage_max_depth'])
+            self.config['storage_max_files'], self.config['storage_max_depth'] = entries, depth
+            budget_widget = self.query_one('#storage-budget', Select)
+            choices = sorted({10000, 100000, 1000000, entries})
+            budget_widget.set_options([('%s entries' % format(value, ','), value) for value in choices])
+            budget_widget.value = entries
+            self.query_one('#storage-depth', Select).value = depth
+            self.start_storage(self.storage_path)
         elif identifier == 'history-refresh':
             self.load_history()
         elif identifier == 'history-capture':

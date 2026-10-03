@@ -329,6 +329,38 @@ class WorktreeTests(unittest.TestCase):
         self.assertEqual(self.git(Path(recovered['quarantine']), 'status', '--porcelain'), '')
         self.executor.restore(recovered['id'])
 
+    def test_pointer_replay_refuses_replaced_admin_and_changed_head_before_write(self):
+        rename = worktrees.rename_exclusive
+        def crash(source_fd, source_name, target_fd, target_name):
+            rename(source_fd, source_name, target_fd, target_name)
+            if source_name == 'gitdir':
+                raise SystemExit('old pointer captured before journal advancement')
+        with patch('mactrim.worktrees.rename_exclusive', side_effect=crash):
+            with self.assertRaises(SystemExit):
+                self.move()
+        record = self.state.journals()[0]
+        admin = Path(record['candidate']['context']['admin_dir'])
+        original = self.root / 'displaced-captured-admin'
+        admin.rename(original)
+        shutil.copytree(original, admin)
+        (admin / 'unique-new-admin.txt').write_text('preserve replaced registry')
+        before = {str(path.relative_to(admin)): (path.read_bytes(), path.stat().st_ino) for path in admin.rglob('*') if path.is_file()}
+        self.assertEqual(self.executor.list()[0]['status'], 'conflicted')
+        after = {str(path.relative_to(admin)): (path.read_bytes(), path.stat().st_ino) for path in admin.rglob('*') if path.is_file()}
+        self.assertEqual(before, after)
+        self.assertFalse((admin / 'gitdir').exists())
+        # Return the captured inode, change HEAD to another branch at the same
+        # commit, then replay the original durable pending intent independently.
+        shutil.rmtree(admin)
+        original.rename(admin)
+        (admin / 'HEAD').write_text('ref: refs/heads/main\n')
+        changed = (admin / 'HEAD').read_bytes()
+        self.state.write_journal(record)
+        self.assertEqual(self.executor.list()[0]['status'], 'conflicted')
+        self.assertEqual((admin / 'HEAD').read_bytes(), changed)
+        self.assertFalse((admin / 'gitdir').exists())
+        self.assertTrue(Path(record['pointer_transition']['replacement']).exists())
+
     def test_raced_in_admin_pointer_is_preserved_with_both_recovery_files(self):
         rename = worktrees.rename_exclusive
         unique = b'gitdir raced-in unique administrative data\n'

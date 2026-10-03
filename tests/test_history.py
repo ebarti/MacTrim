@@ -95,6 +95,23 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(incompatible['rows'], [])
         self.assertTrue(incompatible['issues'])
 
+    def test_aggregate_limit_does_not_limit_measurement_and_old_policy_stays_readable(self):
+        for index in range(MAX_ENTRIES + 10):
+            (self.data / str(index)).mkdir()
+        node = measure(self.data, MAX_ENTRIES + 20, 16, storage=True)
+        self.assertEqual(node.status, 'measured')
+        self.assertEqual(node.entries, MAX_ENTRIES + 11)
+        self.config['storage_max_files'] = MAX_ENTRIES + 20
+        self.history.capture(node, CAPACITY)
+        body = self.bodies()[0]
+        self.assertLessEqual(len(body['directories']), MAX_ENTRIES)
+        self.assertFalse(next(row for row in body['directories'] if row['path'] == str(self.data))['children_complete'])
+        old = copy.deepcopy(body)
+        old['policy']['collector'] = 'metadata.v2'
+        self.history.validate(old, old['id'])
+        self.assertTrue(compare(old, body)['issues'])
+        self.assertEqual(compare(old, body)['rows'], [])
+
     def test_directory_only_caps_and_recent_clues_without_new_scan_or_hash(self):
         (self.data / 'child').mkdir()
         (self.data / 'child' / 'private-content.txt').write_bytes(b'x' * 1000)

@@ -93,6 +93,57 @@ class MeasurementTests(unittest.TestCase):
         self.assertEqual(node.logical, 23)
         self.assertEqual(node.children[0].children[0].logical, 23)
 
+    def test_large_early_subtree_cannot_starve_later_project_or_temp_sibling(self):
+        early = self.root / 'a-large-cache'
+        late = self.root / 'z-project'
+        early.mkdir()
+        late.mkdir()
+        for index in range(200):
+            (early / str(index)).write_bytes(b'x')
+        for index in range(6):
+            (late / str(index)).write_bytes(b'x' * 100)
+        node = measure(self.root, max_entries=31, storage=True)
+        rows = {child.name: child for child in node.children}
+        self.assertEqual(rows['z-project'].logical, 600)
+        self.assertEqual(rows['z-project'].status, 'measured')
+        self.assertEqual(rows['a-large-cache'].status, 'partial')
+        self.assertLessEqual(node.entries, 31)
+        self.assertLessEqual(node.metadata_visits, 31)
+        self.assertEqual(node.status, 'partial')
+
+    def test_unused_sibling_quota_refines_largest_partial_without_double_counting(self):
+        early = self.root / 'a-large-region'
+        early.mkdir()
+        for index in range(80):
+            (early / str(index)).write_bytes(b'x' * 100)
+        for index in range(10):
+            (self.root / ('z-empty-%s' % index)).mkdir()
+        node = measure(self.root, max_entries=140, storage=True)
+        self.assertEqual(node.status, 'measured')
+        self.assertEqual(node.logical, 8000)
+        self.assertEqual(node.entries, 92)
+        self.assertLessEqual(node.metadata_visits, 140)
+        self.assertGreater(node.metadata_visits, node.entries)
+        # A directory with names left outside the traversal budget must remain
+        # partial, even when all nodes that were reached are complete.
+        limited = measure(self.root, max_entries=13, storage=True)
+        self.assertEqual(limited.status, 'partial')
+
+    def test_shallow_large_file_measured_before_directory_budget_and_cancel_bounded(self):
+        early = self.root / 'a-large-cache'
+        early.mkdir()
+        for index in range(200):
+            (early / str(index)).write_bytes(b'x')
+        (self.root / 'z-visible-large-file').write_bytes(b'x' * 600)
+        node = measure(self.root, max_entries=10, storage=True)
+        self.assertGreaterEqual(node.logical, 600)
+        cancel = threading.Event()
+        def progress(root, child):
+            cancel.set()
+        stopped = measure(self.root, max_entries=10, storage=True, cancel=cancel, progress=progress)
+        self.assertEqual(stopped.status, 'cancelled')
+        self.assertLessEqual(stopped.entries, 10)
+
     def test_capacity_root_exposes_data_separately(self):
         with patch('mactrim.measurement.Path.exists', return_value=True):
             items = capacities('/')

@@ -42,7 +42,7 @@
     "apps": 10000,
     "system": 5000
   },
-  "storage_max_files": 10000,
+  "storage_max_files": 50000,
   "storage_max_depth": 16,
   "github_squash": true,
   "worktree_default_ref": "",

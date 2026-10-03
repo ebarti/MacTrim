@@ -210,6 +210,21 @@ def bound_common(context):
     return common
 
 
+def bound_admin(context, held_fd=None):
+    common = bound_common(context)
+    admin = canonical(context['admin_dir'])
+    if admin.parent != common / 'worktrees' or ancestor_identity(admin.parent) != context.get('admin_ancestors'):
+        raise SafetyError('Captured administrative registration ancestors changed')
+    st = os.lstat(admin)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or [st.st_dev, st.st_ino] != context['admin_identity']:
+        raise SafetyError('Captured administrative registration identity or owner changed')
+    if held_fd is not None:
+        held = os.fstat(held_fd)
+        if (held.st_dev, held.st_ino, held.st_uid, stat.S_IFMT(held.st_mode)) != (st.st_dev, st.st_ino, st.st_uid, stat.S_IFDIR):
+            raise SafetyError('Held administrative registration no longer names captured path')
+    return admin
+
+
 def policy(path, config, state, process, expected=None, relocated=False, cancel=None):
     path = canonical(path)
     if not relocated and not any(within(path, root) for root in config['worktree_roots']):
@@ -217,6 +232,7 @@ def policy(path, config, state, process, expected=None, relocated=False, cancel=
     common = canonical(expected['common_dir']) if expected else common_dir(path)
     if expected:
         bound_common(expected)
+        bound_admin(expected)
     rows = registrations(common)
     row = next((row for row in rows if canonical(row['worktree']) == path), None)
     if not row:
@@ -231,7 +247,7 @@ def policy(path, config, state, process, expected=None, relocated=False, cancel=
     if not isinstance(head, str) or not re.fullmatch(r'[0-9a-f]{40,64}', head):
         raise SafetyError('Worktree HEAD is unknown')
     admin = _admin(path, common, expected.get('admin_dir') if expected else None)
-    if expected and (head != expected['head'] or [os.lstat(admin).st_dev, os.lstat(admin).st_ino] != expected['admin_identity']):
+    if expected and (head != expected['head'] or row.get('branch', 'detached') != expected['branch'] or [os.lstat(admin).st_dev, os.lstat(admin).st_ino] != expected['admin_identity']):
         raise SafetyError('Worktree HEAD or registry identity changed')
     blockers = process.blockers(path) + process.blockers(common)
     if blockers:
@@ -243,7 +259,7 @@ def policy(path, config, state, process, expected=None, relocated=False, cancel=
         raise SafetyError('Resolved default target changed')
     fp = worktree_fingerprint(path, config, relocated, cancel)
     common_id, common_ancestors = common_identity(common)
-    context = dict(proof, common_dir=str(common), common_identity=common_id, common_ancestors=common_ancestors, admin_dir=str(admin), admin_identity=[os.lstat(admin).st_dev, os.lstat(admin).st_ino],
+    context = dict(proof, common_dir=str(common), common_identity=common_id, common_ancestors=common_ancestors, admin_dir=str(admin), admin_identity=[os.lstat(admin).st_dev, os.lstat(admin).st_ino], admin_ancestors=ancestor_identity(admin.parent),
                    primary=rows[0]['worktree'], repo=str(path), head=head, branch=row.get('branch', 'detached'),
                    gitfile_sha256=file_hash(path / '.git'))
     return fp, context
@@ -352,7 +368,7 @@ def _registry_at(record, location):
         scoped_repair(record, location)
         rows = registrations(common)
         row = next((row for row in rows if canonical(row['worktree']) == canonical(location)), None)
-    if not row or row.get('HEAD') != context['head'] or row.get('locked'):
+    if not row or row.get('HEAD') != context['head'] or row.get('branch', 'detached') != context['branch'] or row.get('locked'):
         raise SafetyError('Git registry cannot be safely reconciled')
     return common
 
@@ -477,17 +493,44 @@ def validate_move_admin(record):
         raise SafetyError('Administrative move back-pointer escaped signed paths')
 
 
-def scoped_repair(record, location):
-    """Exact pointer transition, never Git's common-registry repair traversal.
+def validate_pointer_admin(record):
+    """A resumed pointer write may change only gitdir, never adopt new metadata."""
+    saved = record.get('admin_snapshots', [])
+    if not saved:
+        raise SafetyError('Missing administrative pointer recovery snapshot')
+    saved = saved[-1]
+    admin = canonical(record['candidate']['context']['admin_dir'])
+    expected = {entry[0]: entry[1:] for entry in saved['original']['records'] if entry[0] != 'gitdir'}
+    current = fingerprint(admin, Budget(10000, 24), inspect_protected=False)
+    values = {entry[0]: entry[1:] for entry in current['records'] if entry[0] != 'gitdir'}
+    if set(values) != set(expected):
+        raise SafetyError('Administrative entries changed before pointer replay')
+    for relative, value in values.items():
+        metadata, *tail = value
+        before, *old_tail = expected[relative]
+        if not relative:
+            if metadata[:6] != before[:6]:
+                raise SafetyError('Administrative pointer directory changed')
+        elif metadata != before or tail != old_tail or relative in saved['sha256'] and file_hash(admin / relative) != saved['sha256'][relative]:
+            raise SafetyError('Administrative file or HEAD/branch changed before pointer replay')
 
-    An exclusive rename captures the displaced back-pointer in private state.
-    It is verified before a separately fsynced replacement enters the absent
-    slot. A raced-in replacement remains intact; both displaced bytes and the
-    prepared replacement remain available for manual recovery.
-    """
+
+def scoped_repair(record, location):
+    """Exclusive captured-pointer transition held to the approved admin inode."""
     context = record['candidate']['context']
-    common, admin = bound_common(context), canonical(context['admin_dir'])
+    common, admin = bound_common(context), bound_admin(context)
+    with directory_fd(admin) as admin_fd:
+        bound_admin(context, admin_fd)
+        return _scoped_repair_held(record, location, common, admin, admin_fd)
+
+
+def _scoped_repair_held(record, location, common, admin, admin_fd):
+    context = record['candidate']['context']
     expected_value = (str(Path(location) / '.git') + '\n').encode(errors='surrogateescape')
+    def guard():
+        bound_admin(context, admin_fd)
+        validate_pointer_admin(record)
+    guard()
     before_others = _other_registries(common, admin)
     # Already repaired is accepted only with exact journaled replacement bytes.
     transition = record.get('pointer_transition')
@@ -522,20 +565,24 @@ def scoped_repair(record, location):
     from .state import State
     state = State(state_path).prepare()
     expected_private = state.path / 'admin-recovery'
-    if backup.parent != expected_private or replacement.parent != expected_private or backup.name != record['id'] + ('-restore' if canonical(location) == canonical(record['original']) else '-apply') + '-gitdir-old':
+    if backup.parent != expected_private or replacement.parent != expected_private or replacement.name != record['id'] + ('-restore' if canonical(location) == canonical(record['original']) else '-apply') + '-gitdir-new' or backup.name != record['id'] + ('-restore' if canonical(location) == canonical(record['original']) else '-apply') + '-gitdir-old':
         raise SafetyError('Pointer recovery paths escaped signed private slots')
     state._private(expected_private, True)
     if not os.path.lexists(backup):
         validate_move_admin(record)
-        with directory_fd(admin) as admin_fd, directory_fd(expected_private) as private_fd:
+        with directory_fd(expected_private) as private_fd:
             if fingerprint(admin / 'gitdir', inspect_protected=False)['digest'] != transition['old']['digest']:
                 raise SafetyError('Captured back-pointer changed before replacement')
+            guard()
             rename_exclusive(admin_fd, 'gitdir', private_fd, backup.name)
+            guard()
         if fingerprint(backup, inspect_protected=False)['digest'] != transition['old']['digest']:
             # Preserve any raced-in bytes, restoring only to a still absent slot.
-            with directory_fd(expected_private) as private_fd, directory_fd(admin) as admin_fd:
+            with directory_fd(expected_private) as private_fd:
                 if not os.path.lexists(admin / 'gitdir'):
+                    guard()
                     rename_exclusive(private_fd, backup.name, admin_fd, 'gitdir')
+                    guard()
             raise SafetyError('Displaced back-pointer changed; unique bytes retained')
         transition['phase'] = 'old-captured'
         state.write_journal(record)
@@ -548,8 +595,11 @@ def scoped_repair(record, location):
     else:
         if fingerprint(replacement, inspect_protected=False)['digest'] != transition['new']['digest']:
             raise SafetyError('Prepared back-pointer replacement changed')
-        with directory_fd(expected_private) as private_fd, directory_fd(admin) as admin_fd:
+        with directory_fd(expected_private) as private_fd:
+            guard()
             rename_exclusive(private_fd, replacement.name, admin_fd, 'gitdir')
+            guard()
+    guard()
     transition['phase'] = 'installed'
     state.write_journal(record)
     if _other_registries(common, admin) != before_others:
@@ -711,7 +761,7 @@ def purge(record, state, process):
         if fingerprint(context['admin_dir'], Budget(10000, 24), inspect_protected=False)['digest'] != saved['original']['digest']:
             raise SafetyError('Administrative registration changed during interrupted content purge')
         row = next((row for row in registrations(common) if canonical(row['worktree']) == path), None)
-        if not row or row.get('HEAD') != context['head'] or row.get('locked'):
+        if not row or row.get('HEAD') != context['head'] or row.get('branch', 'detached') != context['branch'] or row.get('locked'):
             raise SafetyError('Interrupted worktree registry/HEAD changed')
         merge_proof(common, context['head'], record['config'])
         pointer = [record['git_pointer_record']]

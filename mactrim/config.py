@@ -17,7 +17,7 @@ def defaults():
             "repo_days": 90, "cache_days": 30, "max_files": 100000, "max_depth": 24,
             "discovery_depth": 4, "system_reports": True,
             "budgets": {"repositories": 20000, "worktrees": 20000, "caches": 20000, "duplicates": 20000, "apps": 10000, "system": 5000},
-            "storage_max_files": 10000, "storage_max_depth": 16, "github_squash": True,
+            "storage_max_files": 50000, "storage_max_depth": 16, "github_squash": True,
             "worktree_default_ref": "", "retired_apps": {}, "app_aliases": {},
             "history": {"enabled": True, "max_bytes": 16 * 1024 * 1024, "max_snapshots": 60, "max_days": 60, "auto_interval_seconds": 3600}}
 

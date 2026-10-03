@@ -38,7 +38,7 @@ def parser():
     storage = children.add_parser("storage", help="Metadata-only root storage explorer; no cleanup authority")
     storage.add_argument("path", nargs="?", default="/", type=Path)
     storage.add_argument("--json", action="store_true", help="Print bounded metadata dataset without a terminal")
-    storage.add_argument("--max-files", type=int, default=10000)
+    storage.add_argument("--max-files", type=int, default=50000, help="Metadata entries per root subtree (default 50000; max 1000000)")
     storage.add_argument("--max-depth", type=int, default=16)
     history = children.add_parser("history", help="Tiny local directory history; capture/list/compare/clear")
     history_sub = history.add_subparsers(dest="history_action", required=True)

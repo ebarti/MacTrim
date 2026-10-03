@@ -23,7 +23,7 @@ NAME = re.compile(r'(?:\.([a-f0-9]{32})\.(?:pending|[a-f0-9]{16}\.retiring)|([a-
 
 
 def policy(config, scope):
-    return {'collector': 'metadata.v2', 'scope': str(canonical(scope)),
+    return {'collector': 'metadata.v3', 'scope': str(canonical(scope)),
             'max_files': config['storage_max_files'], 'max_depth': config['storage_max_depth'],
             'root_child_budgets': canonical(scope) == Path('/'), 'follow_symlinks': False,
             'dataless': 'skip', 'hardlinks': 'inode-first', 'data_alias': 'skip', 'virtual': 'skip'}
@@ -135,7 +135,7 @@ class History:
             if capacity['status'] == 'measured' and any(type(capacity.get(key)) is not int or not 0 <= capacity[key] <= 2**64 for key in ('total', 'used', 'available')):
                 raise SafetyError('Invalid filesystem capacity bytes')
         expected_policy = {'collector', 'scope', 'max_files', 'max_depth', 'root_child_budgets', 'follow_symlinks', 'dataless', 'hardlinks', 'data_alias', 'virtual'}
-        if set(body['policy']) != expected_policy or body['policy']['collector'] != 'metadata.v2' or type(body['policy']['max_files']) is not int or not 1 <= body['policy']['max_files'] <= 1000000 or type(body['policy']['max_depth']) is not int or not 1 <= body['policy']['max_depth'] <= 64:
+        if set(body['policy']) != expected_policy or body['policy']['collector'] not in {'metadata.v2', 'metadata.v3'} or type(body['policy']['max_files']) is not int or not 1 <= body['policy']['max_files'] <= 1000000 or type(body['policy']['max_depth']) is not int or not 1 <= body['policy']['max_depth'] <= 64:
             raise SafetyError('Invalid history collector policy')
         values = body['directories']
         if not isinstance(values, list) or not 1 <= len(values) <= MAX_ENTRIES:
