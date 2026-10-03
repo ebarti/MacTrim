@@ -1,0 +1,28 @@
+{
+  "repo_roots": [
+    "~/Developer",
+    "~/Projects",
+    "~/src",
+    "~/Github"
+  ],
+  "duplicate_roots": [],
+  "cache_roots": [
+    "~/Library/Caches"
+  ],
+  "app_roots": [
+    "/Applications",
+    "/System/Applications",
+    "~/Applications"
+  ],
+  "app_data_roots": [
+    "~/Library/Caches",
+    "~/Library/Preferences",
+    "~/Library/Application Support"
+  ],
+  "repo_days": 90,
+  "cache_days": 30,
+  "max_files": 100000,
+  "max_depth": 24,
+  "discovery_depth": 4,
+  "system_reports": true
+}
