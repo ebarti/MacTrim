@@ -500,6 +500,30 @@ class ActivityParser(unittest.TestCase):
         for kind in (b"REG", b"DIR"):
             self.assertFalse(parse_lsof(base + b"t" + kind + b"\0n(unknown)\0\n", {10}).complete)
 
+    def test_own_explicit_scan_root_argv_is_not_use_but_other_pid_is(self):
+        own = os.getpid()
+        command = "python -m mactrim scan --duplicate-root /fixture"
+        observed = Activity(True, commands={own: command})
+        argv = ["/product/mactrim/__main__.py", "scan", "--duplicate-root", "/fixture"]
+        with patch("mactrim.activity.sys.argv", argv), patch("mactrim.activity.sys.prefix", "/global-python"):
+            self.assertFalse(observed.blockers("/fixture"))
+            observed.commands[own + 100000] = command
+            self.assertTrue(observed.blockers("/fixture"))
+        # The exemption is limited to this known scanner CLI invocation.
+        observed.commands = {own: command}
+        with patch("mactrim.activity.sys.argv", ["other-program", "scan", "--duplicate-root", "/fixture"]):
+            self.assertTrue(observed.blockers("/fixture"))
+
+    def test_own_scan_still_blocks_real_cwd_and_interpreter_prefix(self):
+        own = os.getpid()
+        argv = ["/product/mactrim/__main__.py", "scan", "--repo-root=/fixture"]
+        observed = Activity(True, commands={own: "python -m mactrim scan --repo-root=/fixture"})
+        with patch("mactrim.activity.sys.argv", argv), patch("mactrim.activity.sys.prefix", "/fixture/.venv"):
+            self.assertTrue(any("interpreter environment" in issue for issue in observed.blockers("/fixture")))
+        observed.paths = [(own, "MacTrim", "/fixture", "cwd")]
+        with patch("mactrim.activity.sys.argv", argv), patch("mactrim.activity.sys.prefix", "/global-python"):
+            self.assertTrue(any("cwd" in issue for issue in observed.blockers("/fixture")))
+
     def test_missing_descriptor_names_fail_at_next_fd_pid_and_eof(self):
         base = b"p10\0ctest\0\nfcwd\0tDIR\0n/fixture\0\n"
         for kind in (b"REG", b"DIR"):

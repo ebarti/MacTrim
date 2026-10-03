@@ -1,11 +1,20 @@
 """macOS lsof snapshots; uncertainty is a mutation blocker."""
 from dataclasses import dataclass, field
 import os
+from pathlib import Path
 import subprocess
 import sys
 import time
 
 from .safety import canonical, clean, within
+
+
+def _own_scanner_invocation():
+    entry = Path(sys.argv[0])
+    is_cli = entry.name == "mactrim" or (entry.parent.name == "mactrim" and entry.name in {"__main__.py", "cli.py"})
+    root_flags = ("--repo-root", "--duplicate-root", "--cache-root")
+    has_root_flag = any(argument == flag or argument.startswith(flag + "=") for argument in sys.argv[1:] for flag in root_flags)
+    return is_cli and "scan" in sys.argv[1:] and has_root_flag
 
 
 @dataclass
@@ -23,6 +32,13 @@ class Activity:
                 blockers.append("Active PID %s (%s), %s: %s" % (pid, clean(command), clean(descriptor), clean(path)))
         scoped = str(canonical(root))
         for pid, command_line in self.commands.items():
+            if pid == os.getpid() and _own_scanner_invocation():
+                # CLI root flags authorize inspection and are not evidence of
+                # self-use. Actual cwd/open handles still apply; preserve an env
+                # in which MacTrim itself is running, even if Python is a symlink.
+                if within(sys.prefix, root):
+                    blockers.append("MacTrim's own interpreter environment uses this scope")
+                continue
             # ps argv catches venv interpreters whose symlink resolves to a global
             # executable after pyvenv.cfg and startup files have been closed.
             if scoped + "/" in command_line or scoped in command_line:
