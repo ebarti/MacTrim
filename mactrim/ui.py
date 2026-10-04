@@ -90,11 +90,7 @@ class Approval(ModalScreen):
 class MacTrimApp(App):
     TITLE = 'MacTrim'
     SUB_TITLE = 'Evidence-led cleanup · storage explorer'
-    ENABLE_COMMAND_def signed_size(value):
-    return ('−' if value < 0 else '+') + human(abs(value))
-
-
-PALETTE = False
+    ENABLE_COMMAND_PALETTE = False
     BINDINGS = [('q', 'quit', 'Quit'), ('space', 'toggle', 'Select'),
                 ('v', 'validate', 'Validate'), ('a', 'quarantine', 'Quarantine'),
                 ('r', 'refresh', 'Refresh'), ('escape', 'cancel', 'Cancel scan')]
