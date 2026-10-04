@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -52,6 +53,42 @@ class NativeUITests(unittest.IsolatedAsyncioTestCase):
     def app(self, **kwargs):
         return MacTrimApp(plan=self.plan, state=self.state, config=self.config, storage_root=self.data,
                           executor_factory=lambda state: Executor(state, activity_provider=lambda: Activity(True)), **kwargs)
+
+    async def test_capacity_and_live_totals_visible_before_worker_finishes(self):
+        from mactrim.storage import complete, progress_snapshot
+        result = complete(self.data)
+        snapshot = progress_snapshot(result, 'Classifying unsettled directories', str(self.data))
+        snapshot.children[0].status = 'scanning'
+        entered, release = threading.Event(), threading.Event()
+        def pending_inventory(*args, **kwargs):
+            kwargs['progress'](snapshot, snapshot)
+            entered.set()
+            release.wait(10)
+            return result
+        capacities = [{'label': 'Fixture filesystem', 'path': '/', 'status': 'measured',
+                       'used': 100000, 'available': 100000, 'total': 200000}]
+        app = self.app(initial_tab='storage')
+        with patch('mactrim.ui.capacities', return_value=capacities), patch('mactrim.ui.inventory', side_effect=pending_inventory):
+            async with app.run_test(size=(140, 44)) as pilot:
+                try:
+                    await self.wait_for(pilot, lambda: entered.is_set() and app.storage_node is not None)
+                    self.assertTrue(app.storage_measuring)
+                    self.assertEqual(app.capacity_rows, capacities)
+                    summary = str(app.query_one('#storage-summary', Static).render())
+                    status = str(app.query_one('#storage-status', Static).render())
+                    self.assertIn('visited %s' % result.counters['visited'], summary)
+                    self.assertIn('observed lower bounds', summary)
+                    self.assertIn('Classifying unsettled directories', status)
+                    self.assertIn(str(self.data), status)
+                    self.assertGreater(app.storage_node.allocated, 0)
+                    self.assertTrue(app.query_one('#chart')._options)
+                    self.assertEqual(app.storage_nodes[0].status, 'scanning')
+                    app.cancel_storage()
+                    self.assertTrue(app.storage_cancel.is_set())
+                    self.assertIn('Cancellation requested', str(app.query_one('#storage-status', Static).render()))
+                finally:
+                    release.set()
+                await self.wait_for(pilot, lambda: not app.storage_measuring)
 
     async def test_native_tabs_selection_detail_and_exact_approval_refusal(self):
         app = self.app()

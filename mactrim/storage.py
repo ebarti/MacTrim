@@ -4,6 +4,7 @@ Only directories and multiply-linked file exceptions are retained. Presentation
 is paged independently of measurement. No contents are opened or hashed.
 """
 from collections import deque
+from copy import copy
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
@@ -51,6 +52,30 @@ def _signature(st):
     return st.st_dev, st.st_ino, st.st_mode, st.st_size, st.st_mtime_ns, st.st_ctime_ns
 
 
+def progress_snapshot(root, phase, current_path, totals=None, branches=None, reused=()):
+    """Stable, shallow UI observation. Unfinished directory totals are lower bounds."""
+    snapshot = copy(root)
+    snapshot.status = 'scanning'
+    snapshot.counters = dict(root.counters)
+    snapshot.issues = list(root.issues)
+    snapshot.exclusions = dict(root.exclusions)
+    snapshot.progress = {'phase': phase, 'path': current_path}
+    snapshot.children = []
+    if totals is not None:
+        snapshot.logical, snapshot.allocated, snapshot.entries = totals
+    # Presentation must not make every progress tick copy an unbounded tree.
+    # Totals above still include every observed directory and file.
+    for child in root.children[:PAGE_SIZE]:
+        row = copy(child)
+        row.issues = list(child.issues)
+        if branches is not None:
+            row.logical, row.allocated, row.entries = branches.get(child.path, (0, 0, 0))
+            if row.status == 'measured' and row.path not in reused:
+                row.status = 'scanning'
+        snapshot.children.append(row)
+    return snapshot
+
+
 def complete(path, cancel=None, progress=None, exclusions=(), reuse=None):
     """Iterative no-follow full walk; quotas/depth never determine completion.
 
@@ -66,22 +91,41 @@ def complete(path, cancel=None, progress=None, exclusions=(), reuse=None):
     records, directory_inodes, links = [], {}, {}
     reused = set()
     reconcile_scopes = set()
-    queue = deque([(root, None, None)])
+    queue = deque([(root, None, None, None)])
     now, last_progress = time.time(), 0.0
     own_exclusions = tuple(canonical(value) for value in exclusions)
-    def notify(node):
+    totals, branches = [0, 0, 0], {}
+    current, branch, accounted = None, None, (0, 0, 0)
+    def account():
+        nonlocal accounted
+        if current is None:
+            return
+        values = (current.logical, current.allocated, current.entries) if current.path in reused else (current.own_logical, current.own_allocated, current.entries)
+        delta = [value - old for value, old in zip(values, accounted)]
+        for index in range(3):
+            totals[index] += delta[index]
+        if branch is not None:
+            values_by_branch = branches.setdefault(branch.path, [0, 0, 0])
+            for index in range(3):
+                values_by_branch[index] += delta[index]
+        accounted = values
+    def notify(node, force=False, phase='Enumerating metadata'):
         nonlocal last_progress
-        if progress and time.monotonic() - last_progress >= .15:
+        if progress and (force or time.monotonic() - last_progress >= .15):
+            account()
             last_progress = time.monotonic()
-            progress(root, node)
+            progress(progress_snapshot(root, phase, node.path, totals, branches, reused), copy(node))
     def excluded(node, reason):
         node.status = 'skipped'
         node.issues.append(reason)
         root.counters['excluded'] += 1
         root.exclusions[reason] = root.exclusions.get(reason, 0) + 1
     while queue and not cancel.is_set():
-        node, expected, device = queue.popleft()
+        account()
+        node, expected, device, branch = queue.popleft()
+        current, accounted = node, (0, 0, 0)
         records.append(node)
+        notify(node)
         try:
             with directory_fd(Path(node.path).parent if node.path != '/' else '/') as parent:
                 st = os.stat(Path(node.path).name, dir_fd=parent, follow_symlinks=False) if node.path != '/' else os.fstat(parent)
@@ -138,17 +182,17 @@ def complete(path, cancel=None, progress=None, exclusions=(), reuse=None):
                     for entry in stream:
                         if cancel.is_set():
                             break
-                        absolute = str(Path(node.path) / entry.name)
                         try:
                             child_st = os.stat(entry.name, dir_fd=fd, follow_symlinks=False)
                             root.counters['visited'] += 1
                             root.metadata_visits += 1
                             kind = 'directory' if stat.S_ISDIR(child_st.st_mode) else 'file' if stat.S_ISREG(child_st.st_mode) else 'symlink' if stat.S_ISLNK(child_st.st_mode) else 'special'
                             if kind == 'directory':
+                                absolute = str(Path(node.path) / entry.name)
                                 child = StorageNode(absolute, entry.name, identity=(child_st.st_dev, child_st.st_ino),
                                                     kind=kind, protected=bool(protected(absolute)), status='scanning')
                                 node.children.append(child)
-                                queue.append((child, child.identity, st.st_dev))
+                                queue.append((child, child.identity, st.st_dev, child if node is root else branch))
                                 continue
                             node.entries += 1
                             node.direct_files += 1
@@ -164,7 +208,7 @@ def complete(path, cancel=None, progress=None, exclusions=(), reuse=None):
                                     root.counters['excluded'] += 1
                                     root.exclusions['Already accounted hardlink'] = root.exclusions.get('Already accounted hardlink', 0) + 1
                                     continue
-                                links[identity] = absolute
+                                links[identity] = str(Path(node.path) / entry.name)
                             node.own_logical += child_st.st_size
                             allocated = child_st.st_blocks * 512
                             node.own_allocated += allocated
@@ -179,7 +223,8 @@ def complete(path, cancel=None, progress=None, exclusions=(), reuse=None):
                             if len(node.issues) < 16:
                                 node.issues.append('Unobserved entry %s: %s' % (clean(entry.name), clean(exc)))
                             root.counters['denied'] += 1
-                        notify(node)
+                        finally:
+                            notify(node)
                 final = os.fstat(fd)
                 if _signature(final) != _signature(initial):
                     node.status = 'partial'
@@ -192,6 +237,8 @@ def complete(path, cancel=None, progress=None, exclusions=(), reuse=None):
             node.issues.append(clean(exc))
             root.counters['denied'] += 1
         notify(node)
+    account()
+    notify(current or root, force=True, phase='Aggregating directory totals')
     # Reverse breadth-first order propagates directory totals without recursion.
     for node in reversed(records):
         if node.path in reused:
