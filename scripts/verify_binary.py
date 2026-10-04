@@ -193,7 +193,7 @@ def main():
             text = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', transcript.decode(errors='replace'))
             args.report.with_suffix('.ansi').write_bytes(transcript)
             assert all(label in text for label in ('Cleanup', 'Storage', 'History / Growth'))
-            missing = [content for content in ('quarantine frees 0 bytes', 'Root /', 'Parent/child deltas overlap') if content not in text]
+            missing = [content for content in ('quarantine frees 0 bytes', 'Root /', 'Previous compatible', 'Latest observation') if content not in text]
             assert not missing, 'Tab content did not render: ' + repr(missing)
             assert 'Traceback' not in text and 'ModuleNotFoundError' not in text
             assert b'38;2;' in transcript or b'48;2;' in transcript
