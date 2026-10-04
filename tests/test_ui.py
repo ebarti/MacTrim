@@ -150,21 +150,18 @@ class NativeUITests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn('(absent)', text)
                 self.assertEqual((row['before'], row['after']), (17, 39))
 
-    async def test_deeper_capture_changes_bounded_policy_and_preserves_cleanup_plan(self):
+    async def test_full_capture_has_no_quota_controls_and_preserves_cleanup_plan(self):
         app = self.app(initial_tab='storage')
         original_budget = self.plan['config']['storage_max_files']
         async with app.run_test(size=(140, 44)) as pilot:
             await self.wait_for(pilot, lambda: not app.storage_measuring)
+            self.assertEqual(app.storage_node.collector, 'storage.complete.v1')
             generation = app.storage_generation
-            await pilot.click('#storage-deep')
+            await pilot.click('#storage-full')
             await self.wait_for(pilot, lambda: app.storage_generation > generation and not app.storage_measuring)
-            self.assertEqual(app.config['storage_max_files'], 10000)
-            self.assertEqual(app.config['storage_max_depth'], 32)
+            self.assertEqual(app.storage_node.status, 'measured', app.storage_node.issues)
             self.assertEqual(self.plan['config']['storage_max_files'], original_budget)
-            app.query_one('#storage-budget').value = 1000000
-            app.query_one('#storage-depth').value = 64
-            await self.wait_for(pilot, lambda: app.config['storage_max_files'] == 1000000 and not app.storage_measuring)
-            self.assertEqual(app.config['storage_max_depth'], 64)
+            self.assertFalse(app.query('#storage-budget'))
             await pilot.resize_terminal(90, 30)
             self.assertEqual(app.query_one('#tabs', TabbedContent).active, 'storage')
 

@@ -22,7 +22,11 @@ MAX_ENTRIES = 5000
 NAME = re.compile(r'(?:\.([a-f0-9]{32})\.(?:pending|[a-f0-9]{16}\.retiring)|([a-f0-9]{32}))\.json\.gz$')
 
 
-def policy(config, scope):
+def policy(config, scope, collector=None):
+    if collector == 'storage.complete.v1':
+        return {'collector': collector, 'scope': str(canonical(scope)),
+                'follow_symlinks': False, 'dataless': 'skip', 'hardlinks': 'inode-first',
+                'data_alias': 'skip', 'virtual': 'skip', 'directory_bytes': True}
     return {'collector': 'metadata.v3', 'scope': str(canonical(scope)),
             'max_files': config['storage_max_files'], 'max_depth': config['storage_max_depth'],
             'root_child_budgets': canonical(scope) == Path('/'), 'follow_symlinks': False,
@@ -33,19 +37,18 @@ def aggregates(root):
     # Walk only the collector's existing in-memory nodes, never the filesystem.
     heap = []
     sequence = 0
-    def visit(node, ancestors):
-        nonlocal sequence
+    pending = [(root, ())]
+    while pending:
+        node, ancestors = pending.pop()
         if node.kind != 'directory':
-            return
+            continue
         sequence += 1
         item = (node.allocated, -len(ancestors), sequence, node, ancestors)
         if len(heap) < MAX_ENTRIES - 1:
             heapq.heappush(heap, item)
         elif item[:3] > heap[0][:3]:
             heapq.heapreplace(heap, item)
-        for child in node.children:
-            visit(child, ancestors + (node,))
-    visit(root, ())
+        pending.extend((child, ancestors + (node,)) for child in node.children)
     selected = {root.path: root}
     for _, _, _, node, ancestors in sorted(heap, reverse=True):
         additions = {value.path: value for value in ancestors + (node,) if value.path not in selected}
@@ -135,7 +138,12 @@ class History:
             if capacity['status'] == 'measured' and any(type(capacity.get(key)) is not int or not 0 <= capacity[key] <= 2**64 for key in ('total', 'used', 'available')):
                 raise SafetyError('Invalid filesystem capacity bytes')
         expected_policy = {'collector', 'scope', 'max_files', 'max_depth', 'root_child_budgets', 'follow_symlinks', 'dataless', 'hardlinks', 'data_alias', 'virtual'}
-        if set(body['policy']) != expected_policy or body['policy']['collector'] not in {'metadata.v2', 'metadata.v3'} or type(body['policy']['max_files']) is not int or not 1 <= body['policy']['max_files'] <= 1000000 or type(body['policy']['max_depth']) is not int or not 1 <= body['policy']['max_depth'] <= 64:
+        complete_policy = body['policy'].get('collector') == 'storage.complete.v1'
+        if complete_policy:
+            valid_policy = body['policy'] == policy(self.config, body['scope'], 'storage.complete.v1')
+        else:
+            valid_policy = (set(body['policy']) == expected_policy and body['policy']['collector'] in {'metadata.v2', 'metadata.v3'} and type(body['policy']['max_files']) is int and 1 <= body['policy']['max_files'] <= 1000000 and type(body['policy']['max_depth']) is int and 1 <= body['policy']['max_depth'] <= 64)
+        if not valid_policy:
             raise SafetyError('Invalid history collector policy')
         values = body['directories']
         if not isinstance(values, list) or not 1 <= len(values) <= MAX_ENTRIES:
@@ -208,7 +216,7 @@ class History:
             raise SafetyError('Cancelled/non-directory observations are unsuitable for history')
         now = time.time() if now is None else now
         body = {'schema': SCHEMA, 'id': secrets.token_hex(16), 'created_at': now,
-                'scope': node.path, 'policy': policy(self.config, node.path),
+                'scope': node.path, 'policy': policy(self.config, node.path, getattr(node, 'collector', None)),
                 'directories': aggregates(node), 'capacity': capacity,
                 'coverage': {'status': node.status, 'entries': node.entries, 'issues': [clean(issue) for issue in node.issues[:16]], 'aggregate_limit': MAX_ENTRIES}}
         self.validate(body, body['id'])

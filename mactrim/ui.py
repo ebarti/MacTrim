@@ -18,15 +18,20 @@ from textual.widgets.option_list import Option
 
 from .config import defaults
 from .executor import Executor, selection
-from .measurement import capacities, measure
+from .measurement import capacities
+from .storage import complete, page, accounting, PAGE_SIZE
 from .history import History
 from .safety import SafetyError, canonical, clean
 from .scanner import Scanner
 from .tui import details, human
 
+def signed_size(value):
+    return ('−' if value < 0 else '+') + human(abs(value))
+
+
 PALETTE = ('#67e8f9', '#a78bfa', '#fbbf24', '#34d399', '#fb7185', '#93c5fd')
 STATUS_COLOR = {'measured': '#34d399', 'partial': '#fbbf24', 'denied': '#fb7185',
-                'skipped': '#94a3b8', 'unknown': '#94a3b8', 'cancelled': '#fbbf24'}
+                'skipped': '#94a3b8', 'unknown': '#94a3b8', 'cancelled': '#fbbf24', 'scanning': '#67e8f9'}
 
 
 class Approval(ModalScreen):
@@ -85,7 +90,11 @@ class Approval(ModalScreen):
 class MacTrimApp(App):
     TITLE = 'MacTrim'
     SUB_TITLE = 'Evidence-led cleanup · storage explorer'
-    ENABLE_COMMAND_PALETTE = False
+    ENABLE_COMMAND_def signed_size(value):
+    return ('−' if value < 0 else '+') + human(abs(value))
+
+
+PALETTE = False
     BINDINGS = [('q', 'quit', 'Quit'), ('space', 'toggle', 'Select'),
                 ('v', 'validate', 'Validate'), ('a', 'quarantine', 'Quarantine'),
                 ('r', 'refresh', 'Refresh'), ('escape', 'cancel', 'Cancel scan')]
@@ -141,6 +150,9 @@ class MacTrimApp(App):
         self.storage_generation = 0
         self.storage_metric = 'allocated'
         self.storage_sort = 'size'
+        self.storage_offset = 0
+        self.storage_page_rows = []
+        self.storage_has_more = False
         self.render_dirty = False
         self.capacity_rows = []
         self.storage_measuring = False
@@ -187,11 +199,9 @@ class MacTrimApp(App):
                     yield Select([('Allocated', 'allocated'), ('Logical', 'logical')], value='allocated', allow_blank=False, id='metric')
                     yield Select([('Size ↓', 'size'), ('Name A–Z', 'name')], value='size', allow_blank=False, id='storage-sort')
                 with Horizontal(classes='toolbar'):
-                    entry_options = sorted({10000, 100000, 1000000, self.config['storage_max_files']})
-                    depth_options = sorted({16, 32, 64, self.config['storage_max_depth']})
-                    yield Select([('%s entries' % format(value, ','), value) for value in entry_options], value=self.config['storage_max_files'], allow_blank=False, id='storage-budget')
-                    yield Select([('Depth %s' % value, value) for value in depth_options], value=self.config['storage_max_depth'], allow_blank=False, id='storage-depth')
-                    yield Button('Deeper ×10', id='storage-deep', variant='primary')
+                    yield Button('Full rescan', id='storage-full')
+                    yield Button('Previous page', id='storage-prev')
+                    yield Button('Next page', id='storage-next')
                 yield Static('Metadata only · estimates are lower bounds when incomplete · Enter drills into a directory', id='storage-summary')
                 with Horizontal(id='storage-body'):
                     yield OptionList(id='chart')
@@ -435,6 +445,8 @@ class MacTrimApp(App):
         self.storage_generation += 1
         self.storage_path = str(canonical(path))
         self.storage_node = None
+        self.storage_offset = 0
+        self.storage_page_rows = []
         self.storage_measuring = True
         self.query_one('#breadcrumbs', Static).update(Text(self.storage_path, style='bold #67e8f9'))
         self.query_one('#storage-status', Static).update('Measuring metadata in background… totals are lower bounds')
@@ -450,9 +462,7 @@ class MacTrimApp(App):
                 self.call_from_thread(self.storage_update, node, generation, False)
         try:
             capacity = capacities('/')
-            node = measure(path, config['storage_max_files'], config['storage_max_depth'],
-                           cancel=cancel, progress=progress, storage=True,
-                           independent_children=path == '/')
+            node = complete(path, cancel=cancel, progress=progress)
             self.call_from_thread(self.capacity_update, capacity)
             self.call_from_thread(self.storage_update, node, generation, True)
             if self.state is not None and not cancel.is_set() and node.entries > 1:
@@ -486,33 +496,47 @@ class MacTrimApp(App):
         self.storage_node = node
         if done:
             self.storage_measuring = False
+            self.load_storage_page()
         self.refresh_storage()
-        self.query_one('#storage-status', Static).update(Text('%s · %s observed entries · %s' % (node.status.upper(), node.entries, '; '.join(node.issues[:2]) if done else 'Measurement running; navigation and cancellation available'), style=STATUS_COLOR.get(node.status, '#fbbf24')))
+        self.query_one('#storage-status', Static).update(Text('%s · %s observed entries · %s' % (node.status.upper(), getattr(node, 'counters', {}).get('visited', node.entries), '; '.join(node.issues[:2]) if done else 'Measurement running; navigation and cancellation available'), style=STATUS_COLOR.get(node.status, '#fbbf24')))
 
     def refresh_storage(self):
         if self.storage_node is None:
             return
         metric = self.storage_metric
         node = self.storage_node
-        self.storage_nodes = sorted(list(node.children), key=(lambda row: (-getattr(row, metric), row.name)) if self.storage_sort == 'size' else lambda row: row.name)
+        self.storage_nodes = sorted(list(self.storage_page_rows if not self.storage_measuring else node.children[:PAGE_SIZE]), key=(lambda row: (-getattr(row, metric), row.name)) if self.storage_sort == 'size' else lambda row: row.name)
         table = self.query_one('#storage-table', DataTable)
         old_index = table.cursor_row
         table.clear()
         chart = self.query_one('#chart', OptionList)
         chart.clear_options()
-        total = sum(getattr(row, metric) for row in self.storage_nodes)
+        root_accounting = accounting(node, self.capacity_rows)
+        total = (root_accounting['filesystem_used_denominator'] if node.path == '/' and metric == 'allocated' else None) or getattr(node, metric)
+        graph_rows = sorted(node.children, key=lambda row: -getattr(row, metric))[:15]
         for index, child in enumerate(self.storage_nodes):
-            table.add_row(Text(child.status.upper(), style=STATUS_COLOR[child.status]), human(getattr(child, metric)), Text(clean(child.name) + ('/' if child.kind == 'directory' else '')), key=child.path)
-            if index < 15:
-                fraction = getattr(child, metric) / total if total else 0
-                bar = '━' * round(fraction * 24)
-                text = Text('%2d  ' % (index + 1))
-                text.append(bar.ljust(24), style=PALETTE[index % len(PALETTE)])
-                text.append(' %5.1f%%  %s\n    %s · %s' % (fraction * 100, clean(child.name), human(getattr(child, metric)), child.status.upper()))
-                chart.add_option(Option(text, id=child.path))
+            table.add_row(Text(child.status.upper(), style=STATUS_COLOR.get(child.status, '#94a3b8')), human(getattr(child, metric)), Text(clean(child.name) + ('/' if child.kind == 'directory' else '')), key=child.path)
+        for index, child in enumerate(graph_rows if not self.storage_measuring else []):
+            fraction = getattr(child, metric) / total if total else 0
+            bar = '━' * round(fraction * 24)
+            text = Text('%2d  ' % (index + 1))
+            text.append(bar.ljust(24), style=PALETTE[index % len(PALETTE)])
+            text.append(' %5.1f%%  %s\n    %s · %s' % (fraction * 100, clean(child.name), human(getattr(child, metric)), child.status.upper()))
+            chart.add_option(Option(text, id=child.path))
         if self.storage_nodes:
             table.move_cursor(row=min(old_index, len(self.storage_nodes) - 1))
-        self.query_one('#storage-summary', Static).update(Text('%s %s · %s immediate nodes · %s · graph shows first 15 sorted nodes\nMetadata only; partial totals are lower bounds. Enter drills; Deeper ×10 expands the bounded capture.' % (human(getattr(node, metric)), metric, len(self.storage_nodes), node.status.upper())))
+        difference = accounting(node, self.capacity_rows)['difference'] if node.path == '/' else None
+        note = (' · signed filesystem difference %s (APFS/excluded/inaccessible)' % signed_size(difference)) if difference is not None else ''
+        self.query_one('#storage-summary', Static).update(Text('%s %s · %s · page %s%s\nGraph: top 15 directories / filesystem used at root (allocated), otherwise scope estimate; partial scope totals are lower bounds. Inaccessible scopes are unknown. Full rescan has no entry/depth cap.' % (human(getattr(node, metric)), metric, 'SCANNING; unfinished totals' if self.storage_measuring else node.status.upper(), self.storage_offset // PAGE_SIZE + 1, note)))
+
+    def load_storage_page(self):
+        if self.storage_node is None:
+            return
+        try:
+            self.storage_page_rows, self.storage_has_more = page(self.storage_node, self.storage_offset)
+        except (OSError, SafetyError):
+            self.storage_page_rows = self.storage_node.children[self.storage_offset:self.storage_offset + PAGE_SIZE]
+            self.storage_has_more = len(self.storage_node.children) > self.storage_offset + PAGE_SIZE
 
     @on(Select.Changed, '#metric')
     @on(Select.Changed, '#storage-sort')
@@ -520,17 +544,6 @@ class MacTrimApp(App):
         self.storage_metric = self.query_one('#metric', Select).value
         self.storage_sort = self.query_one('#storage-sort', Select).value
         self.refresh_storage()
-
-    @on(Select.Changed, '#storage-budget')
-    @on(Select.Changed, '#storage-depth')
-    def storage_budget_changed(self):
-        entries = self.query_one('#storage-budget', Select).value
-        depth = self.query_one('#storage-depth', Select).value
-        if entries == Select.BLANK or depth == Select.BLANK:
-            return
-        if (entries, depth) != (self.config['storage_max_files'], self.config['storage_max_depth']):
-            self.config['storage_max_files'], self.config['storage_max_depth'] = entries, depth
-            self.start_storage(self.storage_path)
 
     def storage_selected(self, path):
         node = next((node for node in self.storage_nodes if node.path == path), None)
@@ -607,16 +620,15 @@ class MacTrimApp(App):
             self.start_storage(self.storage_path)
         elif identifier == 'cancel-storage':
             self.storage_cancel.set()
-        elif identifier == 'storage-deep':
-            entries = min(1000000, self.config['storage_max_files'] * 10)
-            depth = max(32, self.config['storage_max_depth'])
-            self.config['storage_max_files'], self.config['storage_max_depth'] = entries, depth
-            budget_widget = self.query_one('#storage-budget', Select)
-            choices = sorted({10000, 100000, 1000000, entries})
-            budget_widget.set_options([('%s entries' % format(value, ','), value) for value in choices])
-            budget_widget.value = entries
-            self.query_one('#storage-depth', Select).value = depth
+        elif identifier == 'storage-full':
             self.start_storage(self.storage_path)
+        elif identifier in {'storage-prev', 'storage-next'} and not self.storage_measuring:
+            if identifier == 'storage-prev':
+                self.storage_offset = max(0, self.storage_offset - PAGE_SIZE)
+            elif self.storage_has_more:
+                self.storage_offset += PAGE_SIZE
+            self.load_storage_page()
+            self.refresh_storage()
         elif identifier == 'history-refresh':
             self.load_history()
         elif identifier == 'history-capture':
@@ -675,7 +687,7 @@ class MacTrimApp(App):
             change = 'unknown' if delta is None else ('+' if delta > 0 else '') + human(delta)
             percent = '—' if row['percent'] is None else '%+.1f%%' % row['percent']
             table.add_row(Text(row['status'], style=color), Text(change, style=color), percent, Text(clean(row['path'])), key=row['path'])
-            if index < 15:
+        for index, child in enumerate(graph_rows if not self.storage_measuring else []):
                 bar = '━' * round(abs(delta or 0) / scale * 24)
                 text = Text(bar.ljust(24) + ' ' + change + '\n' + clean(row['path']), style=color)
                 chart.add_option(Option(text, id=row['path']))
