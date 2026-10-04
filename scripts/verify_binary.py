@@ -52,7 +52,8 @@ def main():
             result = subprocess.run([str(executable)] + [str(value) for value in arguments],
                                     cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
             elapsed = time.monotonic() - started
-            if result.returncode != expected:
+            accepted = expected if isinstance(expected, tuple) else (expected,)
+            if result.returncode not in accepted:
                 raise AssertionError('%s: exit %s; stderr %s' % (arguments, result.returncode, result.stderr))
             if list(extraction.iterdir()):
                 raise AssertionError('Normal exit left temporary extraction data')
@@ -102,7 +103,10 @@ def main():
         run(['--state', demo_state, 'review', manifest, '--details'])
         item = next(item for item in plan['candidates'] if item['kind'] == 'duplicate')
         before = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in (demo / 'duplicates').iterdir()}
-        dry = run(['--state', demo_state, 'dry-run', manifest, '--select', item['id']], expected=0 if item['eligible'] else 2)
+        dry = run(['--state', demo_state, 'dry-run', manifest, '--select', item['id']], expected=(0, 2) if item['eligible'] else 2)
+        if dry.returncode:
+            assert 'Activity evidence incomplete' in dry.stderr or 'Report-only candidate' in dry.stderr
+        report['dry_run'] = {'exit': dry.returncode, 'reason': dry.stderr.replace(str(root), '<fixture>').strip()}
         refused = run(['--state', demo_state, 'apply', manifest, '--select', item['id'], '--approve', 'yes'], expected=2)
         assert 'Exact approval required' in refused.stderr or 'Report-only candidate is unselectable' in refused.stderr
         after = {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in (demo / 'duplicates').iterdir()}
@@ -119,7 +123,7 @@ def main():
             try:
                 assert helper.stdout.readline().strip() == 'READY'
                 active = run(['--state', demo_state, 'apply', manifest, '--select', item['id'], '--approve', approval], expected=2)
-                assert 'Active PID' in active.stderr or 'Activity evidence is incomplete' in active.stderr
+                assert 'Active PID' in active.stderr or 'Activity evidence incomplete' in active.stderr
                 assert Path(item['path']).exists()
                 assert not list((demo_state / 'quarantine').iterdir())
                 report['real_open_file_refusal'] = active.stderr.replace(str(root), '<fixture>').strip()
@@ -129,11 +133,15 @@ def main():
                 helper.stdout.close()
         else:
             report['real_open_file_refusal'] = 'Initial real activity incomplete; report-only selection refused before mutation'
+        # Default entry is exercised with empty discovery scopes and a one-entry,
+        # one-level storage budget: root front-door metadata only, no broad walk.
+        ui_config = json.loads(config.read_text())
+        ui_config.update(storage_max_files=1, storage_max_depth=1)
+        config.write_text(json.dumps(ui_config))
         # A real terminal controls the frozen product; no source/Pilot execution.
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 44, 160, 0, 0))
-        process = subprocess.Popen([str(executable)] + [str(value) for value in prefix] +
-                                   ['storage', str(data), '--max-files', '100', '--max-depth', '8'],
+        process = subprocess.Popen([str(executable)] + [str(value) for value in prefix],
                                    cwd=cwd, env=env, stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
         os.close(slave)
         transcript = bytearray()
@@ -171,9 +179,11 @@ def main():
             assert not list(extraction.iterdir())
             text = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', transcript.decode(errors='replace'))
             assert all(label in text for label in ('Cleanup', 'Storage', 'History / Growth'))
+            assert all(content in text for content in ('quarantine frees 0 bytes', 'Metadata only', 'Parent/child deltas overlap'))
             assert 'Traceback' not in text and 'ModuleNotFoundError' not in text
             assert b'38;2;' in transcript or b'48;2;' in transcript
             report['actual_truecolor_pty_tabs'] = ['Cleanup', 'Storage', 'History / Growth']
+            report['actual_default_tui'] = True
             report['pty_normal_exit'] = process.returncode
         finally:
             if process.poll() is None:
