@@ -16,6 +16,7 @@ import select
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 import termios
 import time
@@ -108,6 +109,26 @@ def main():
         assert before == after
         assert not list((demo_state / 'quarantine').iterdir())
         report['denied_approval'] = refused.stderr.replace(str(root), '<fixture>').strip()
+        if item['eligible']:
+            approval = refused.stderr.strip().split('Exact approval required: ', 1)[1]
+            # An unrelated process really holds the selected fixture file open.
+            # The application still collects authentic macOS ps/lsof evidence.
+            helper = subprocess.Popen([sys.executable, '-c',
+                                       'import sys,time; f=open(sys.argv[1],"rb"); print("READY",flush=True); time.sleep(60)',
+                                       item['path']], cwd=cwd, stdout=subprocess.PIPE, text=True)
+            try:
+                assert helper.stdout.readline().strip() == 'READY'
+                active = run(['--state', demo_state, 'apply', manifest, '--select', item['id'], '--approve', approval], expected=2)
+                assert 'Active PID' in active.stderr or 'Activity evidence is incomplete' in active.stderr
+                assert Path(item['path']).exists()
+                assert not list((demo_state / 'quarantine').iterdir())
+                report['real_open_file_refusal'] = active.stderr.replace(str(root), '<fixture>').strip()
+            finally:
+                helper.terminate()
+                helper.wait(timeout=8)
+                helper.stdout.close()
+        else:
+            report['real_open_file_refusal'] = 'Initial real activity incomplete; report-only selection refused before mutation'
         # A real terminal controls the frozen product; no source/Pilot execution.
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 44, 160, 0, 0))
