@@ -166,7 +166,7 @@ class Cache:
         footprint = self.footprint()
         # Reserve old + replacement allocations concurrently, including metadata.
         reserve = ((len(encoded) + self.unit - 1) // self.unit) * self.unit + 4 * self.unit
-        if footprint + reserve > self.limit or len(json_bytes(body)) > MAX_DECODED // 2:
+        if footprint + reserve > self.limit or len(body['directories']) > 200000 or len(json_bytes(body)) > MAX_DECODED // 2:
             # Preserve complete totals as a small hint; missing index details
             # invalidate reuse next time, never the baseline measurement.
             body = dict(body, directories=[dict(body['directories'][0], child_paths=[])], complete_index=False)
