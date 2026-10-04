@@ -7,7 +7,7 @@ ROOT = Path(SPECPATH).resolve().parent
 # used by MacTrim and Textual's supporting tab/help/loading/tooltip components.
 WIDGETS = ('button', 'content_switcher', 'data_table', 'footer', 'header',
            'help_panel', 'input', 'key_panel', 'label', 'loading_indicator',
-           'option_list', 'progress_bar', 'select', 'static', 'tabbed_content',
+           'option_list', 'progress_bar', 'select', 'static', 'tabbed_content', 'tab_pane',
            'tabs', 'tooltip')
 a = Analysis(
     [str(ROOT / 'bundle' / 'entry.py')],
