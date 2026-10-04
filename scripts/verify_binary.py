@@ -75,7 +75,7 @@ def main():
             folder = data / ('stable-' + str(i)); folder.mkdir()
             for j in range(100): (folder / str(j)).write_bytes(b'x' * 100)
         storage = json.loads(run(['storage', data, '--json', '--max-files', 100, '--max-depth', 8]).stdout)
-        assert storage['measurement']['status'] == 'measured'
+        assert storage['measurement']['status'] == 'partial'  # explicit 100-entry preview of >1600 files
         config = root / 'scoped.json'
         config.write_text(json.dumps({'repo_roots': [], 'worktree_roots': [], 'cache_roots': [],
                                      'duplicate_roots': [], 'app_roots': [], 'app_data_roots': [],
