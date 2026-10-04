@@ -71,6 +71,9 @@ def main():
         data = root / 'storage-data'
         (data / 'growing').mkdir(parents=True)
         (data / 'growing' / 'data.txt').write_bytes(b'a' * 100)
+        for i in range(16):
+            folder = data / ('stable-' + str(i)); folder.mkdir()
+            for j in range(100): (folder / str(j)).write_bytes(b'x' * 100)
         storage = json.loads(run(['storage', data, '--json', '--max-files', 100, '--max-depth', 8]).stdout)
         assert storage['measurement']['status'] == 'measured'
         config = root / 'scoped.json'
@@ -79,8 +82,21 @@ def main():
                                      'system_reports': False, 'storage_max_files': 100, 'storage_max_depth': 8}))
         state = root / 'state'
         prefix = ['--state', state, '--config', config]
+        baseline = json.loads(run(prefix + ['storage', data, '--json', '--full']).stdout)['measurement']
+        quiet = json.loads(run(prefix + ['storage', data, '--json']).stdout)['measurement']
+        assert quiet['refresh']['mode'] == 'incremental', quiet['refresh']
+        assert not quiet['refresh']['warnings'], quiet['refresh']
+        assert quiet['logical'] == baseline['logical'] and quiet['allocated'] == baseline['allocated']
+        assert quiet['counters']['visited'] < baseline['counters']['visited']
         first = json.loads(run(prefix + ['history', 'capture', data]).stdout)
         (data / 'growing' / 'data.txt').write_bytes(b'a' * 350)
+        changed = json.loads(run(prefix + ['storage', data, '--json']).stdout)['measurement']
+        assert changed['refresh']['mode'] == 'incremental', changed['refresh']
+        assert changed['logical'] - baseline['logical'] == 250
+        assert changed['counters']['visited'] < baseline['counters']['visited']
+        verified = json.loads(run(prefix + ['storage', data, '--json', '--full']).stdout)['measurement']
+        assert (verified['logical'], verified['allocated']) == (changed['logical'], changed['allocated'])
+        report['native_restart_replay'] = {'full_visits': baseline['counters']['visited'], 'quiet_visits': quiet['counters']['visited'], 'changed_visits': changed['counters']['visited'], 'delta_logical': 250, 'cache': changed['refresh']['cache']}
         second = json.loads(run(prefix + ['history', 'capture', data]).stdout)
         catalog = json.loads(run(prefix + ['history', 'list']).stdout)
         assert len(catalog['snapshots']) == 2
@@ -134,15 +150,11 @@ def main():
                 helper.stdout.close()
         else:
             report['real_open_file_refusal'] = 'Initial real activity incomplete; report-only selection refused before mutation'
-        # Default entry is exercised with empty discovery scopes and a one-entry,
-        # one-level storage budget: root front-door metadata only, no broad walk.
-        ui_config = json.loads(config.read_text())
-        ui_config.update(storage_max_files=1, storage_max_depth=1)
-        config.write_text(json.dumps(ui_config))
+        # Explicit fixture Storage launch exercises all real tabs without a second whole-Mac walk.
         # A real terminal controls the frozen product; no source/Pilot execution.
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 44, 160, 0, 0))
-        process = subprocess.Popen([str(executable)] + [str(value) for value in prefix],
+        process = subprocess.Popen([str(executable)] + [str(value) for value in prefix + ['storage', data]],
                                    cwd=cwd, env=env, stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
         os.close(slave)
         transcript = bytearray()
@@ -186,7 +198,8 @@ def main():
             assert 'Traceback' not in text and 'ModuleNotFoundError' not in text
             assert b'38;2;' in transcript or b'48;2;' in transcript
             report['actual_truecolor_pty_tabs'] = ['Cleanup', 'Storage', 'History / Growth']
-            report['actual_default_tui'] = True
+            report['actual_scoped_storage_tui'] = True
+            report['default_non_tty_refusal'] = True
             report['pty_normal_exit'] = process.returncode
         finally:
             if process.poll() is None:

@@ -19,7 +19,8 @@ from textual.widgets.option_list import Option
 from .config import defaults
 from .executor import Executor, selection
 from .measurement import capacities
-from .storage import complete, page, accounting, PAGE_SIZE
+from .storage import page, accounting, PAGE_SIZE
+from .incremental import inventory
 from .history import History
 from .safety import SafetyError, canonical, clean
 from .scanner import Scanner
@@ -103,7 +104,7 @@ class MacTrimApp(App):
     .toolbar Button { min-width: 10; margin-right: 1; }
     .toolbar Select { width: 18; margin-right: 1; }
     #search { width: 1fr; }
-    #cleanup-summary, #storage-summary { height: 3; color: #a5b4fc; }
+    #cleanup-summary, #storage-summary { height: auto; min-height: 3; max-height: 7; color: #a5b4fc; }
     #categories { height: auto; max-height: 3; color: #67e8f9; }
     #cleanup-body { height: 1fr; }
     #cleanup-table { width: 3fr; height: 1fr; border: round #334155; }
@@ -130,11 +131,11 @@ class MacTrimApp(App):
     '''
 
     def __init__(self, plan=None, state=None, config=None, storage_root='/', output=None,
-                 initial_tab='cleanup', scanner_factory=Scanner, executor_factory=Executor):
+                 initial_tab='cleanup', initial_full=False, scanner_factory=Scanner, executor_factory=Executor):
         super().__init__()
         self.plan, self.state = plan, state
-        self.config = dict(config or (plan['config'] if plan else defaults()))
-        self.output, self.initial_tab = output, initial_tab
+        self.config = dict(defaults(), **(config or (plan['config'] if plan else {})))
+        self.output, self.initial_tab, self.initial_full = output, initial_tab, initial_full
         self.scanner_factory, self.executor_factory = scanner_factory, executor_factory
         self.items = list(plan['candidates']) if plan else []
         self.selected, self.completed = set(), set()
@@ -148,6 +149,7 @@ class MacTrimApp(App):
         self.storage_sort = 'size'
         self.storage_offset = 0
         self.storage_page_rows = []
+        self.storage_inventory = None
         self.storage_has_more = False
         self.render_dirty = False
         self.capacity_rows = []
@@ -196,6 +198,7 @@ class MacTrimApp(App):
                     yield Select([('Size ↓', 'size'), ('Name A–Z', 'name')], value='size', allow_blank=False, id='storage-sort')
                 with Horizontal(classes='toolbar'):
                     yield Button('Full rescan', id='storage-full')
+                    yield Button('Clear cache', id='storage-clear')
                     yield Button('Previous page', id='storage-prev')
                     yield Button('Next page', id='storage-next')
                 yield Static('Metadata only · estimates are lower bounds when incomplete · Enter drills into a directory', id='storage-summary')
@@ -229,7 +232,7 @@ class MacTrimApp(App):
         self.refresh_cleanup()
         if self.plan is None and self.state is not None and self.initial_tab == 'cleanup':
             self.start_scan()
-        self.start_storage(self.storage_path)
+        self.start_storage(self.storage_path, full=self.initial_full)
         self.load_history()
 
     def on_unmount(self):
@@ -435,7 +438,18 @@ class MacTrimApp(App):
             self.message('; '.join(row['status'] + ': ' + clean(row.get('reason', row['path'])) for row in result['outcomes']))
         self.refresh_cleanup()
 
-    def start_storage(self, path):
+    def start_storage(self, path, full=False):
+        target = str(canonical(path))
+        if not full and target != self.storage_path and not self.storage_measuring and self.storage_inventory is not None:
+            from .incremental import iter_nodes
+            remembered = next((row for row in iter_nodes(self.storage_inventory) if row.path == target), None)
+            if remembered is not None:
+                self.storage_path, self.storage_node, self.storage_offset = target, remembered, 0
+                remembered.refresh = dict(getattr(self.storage_inventory, 'refresh', {}), mode='cached observation', reason='Navigation reuses last observation; Refresh verifies filesystem events')
+                self.query_one('#breadcrumbs', Static).update(Text(target, style='bold #67e8f9'))
+                self.load_storage_page(); self.refresh_storage()
+                self.query_one('#storage-status', Static).update('Cached observation; Refresh verifies current filesystem events')
+                return
         self.storage_cancel.set()
         self.storage_cancel = threading.Event()
         self.storage_generation += 1
@@ -446,10 +460,10 @@ class MacTrimApp(App):
         self.storage_measuring = True
         self.query_one('#breadcrumbs', Static).update(Text(self.storage_path, style='bold #67e8f9'))
         self.query_one('#storage-status', Static).update('Measuring metadata in background… totals are lower bounds')
-        self.storage_worker(self.storage_path, self.storage_cancel, self.storage_generation, dict(self.config))
+        self.storage_worker(self.storage_path, self.storage_cancel, self.storage_generation, dict(self.config), full)
 
     @work(thread=True, group='storage', exclusive=True)
-    def storage_worker(self, path, cancel, generation, config):
+    def storage_worker(self, path, cancel, generation, config, full=False):
         last = [0.0]
         def progress(node, child):
             now = time.monotonic()
@@ -458,7 +472,7 @@ class MacTrimApp(App):
                 self.call_from_thread(self.storage_update, node, generation, False)
         try:
             capacity = capacities('/')
-            node = complete(path, cancel=cancel, progress=progress)
+            node = inventory(path, self.state, config, cancel=cancel, progress=progress, full=full)
             self.call_from_thread(self.capacity_update, capacity)
             self.call_from_thread(self.storage_update, node, generation, True)
             if self.state is not None and not cancel.is_set() and node.entries > 1:
@@ -492,9 +506,10 @@ class MacTrimApp(App):
         self.storage_node = node
         if done:
             self.storage_measuring = False
+            self.storage_inventory = node
             self.load_storage_page()
         self.refresh_storage()
-        self.query_one('#storage-status', Static).update(Text('%s · %s observed entries · %s' % (node.status.upper(), getattr(node, 'counters', {}).get('visited', node.entries), '; '.join(node.issues[:2]) if done else 'Measurement running; navigation and cancellation available'), style=STATUS_COLOR.get(node.status, '#fbbf24')))
+        self.query_one('#storage-status', Static).update(Text('%s · %s metadata visits · %s' % (node.status.upper(), getattr(node, 'counters', {}).get('visited', node.entries), '; '.join(node.issues[:2]) if done else 'Measurement running; navigation and cancellation available'), style=STATUS_COLOR.get(node.status, '#fbbf24')))
 
     def refresh_storage(self):
         if self.storage_node is None:
@@ -521,9 +536,27 @@ class MacTrimApp(App):
             chart.add_option(Option(text, id=child.path))
         if self.storage_nodes:
             table.move_cursor(row=min(old_index, len(self.storage_nodes) - 1))
+        refresh = getattr(node, 'refresh', {})
+        cache = refresh.get('cache', {})
+        refresh_note = '%s · visited %s / reused %s · %s' % (refresh.get('mode', 'scanning').upper(), refresh.get('visited', 0), refresh.get('reused_entries', 0), refresh.get('reason', ''))
+        if refresh.get('last_verified'):
+            refresh_note += ' · verified ' + datetime.fromtimestamp(refresh['last_verified']).strftime('%b %d %H:%M:%S')
+        if cache:
+            refresh_note += ' · cache %s / %s' % (human(cache.get('allocated_bytes', 0)), human(cache['limit_bytes']))
+        if refresh.get('warnings'):
+            refresh_note += ' · ' + '; '.join(refresh['warnings'][:2])
         difference = accounting(node, self.capacity_rows)['difference'] if node.path == '/' else None
         note = (' · signed filesystem difference %s (APFS/excluded/inaccessible)' % signed_size(difference)) if difference is not None else ''
-        self.query_one('#storage-summary', Static).update(Text('%s %s · %s · page %s%s\nGraph: top 15 directories / filesystem used at root (allocated), otherwise scope estimate; partial scope totals are lower bounds. Inaccessible scopes are unknown. Full rescan has no entry/depth cap.' % (human(getattr(node, metric)), metric, 'SCANNING; unfinished totals' if self.storage_measuring else node.status.upper(), self.storage_offset // PAGE_SIZE + 1, note)))
+        self.query_one('#storage-summary', Static).update(Text('%s %s · %s · page %s%s\nGraph: top 15 directories / filesystem used at root (allocated), otherwise scope estimate; partial scope totals are lower bounds. Inaccessible scopes are unknown. Full rescan has no entry/depth cap.' % (human(getattr(node, metric)), metric, 'SCANNING; unfinished totals' if self.storage_measuring else node.status.upper(), self.storage_offset // PAGE_SIZE + 1, note) + '\n' + refresh_note))
+
+    @work(thread=True, group='storage-cache', exclusive=True)
+    def clear_storage_cache(self):
+        try:
+            from .storage_cache import Cache
+            result = Cache(self.state, self.config['storage_cache']).clear()
+            self.call_from_thread(self.query_one('#storage-status', Static).update, Text('Owned cache cleared: ' + str(result)))
+        except Exception as exc:
+            self.call_from_thread(self.query_one('#storage-status', Static).update, Text('Cache preserved: ' + clean(exc)))
 
     def load_storage_page(self):
         if self.storage_node is None:
@@ -617,7 +650,9 @@ class MacTrimApp(App):
         elif identifier == 'cancel-storage':
             self.storage_cancel.set()
         elif identifier == 'storage-full':
-            self.start_storage(self.storage_path)
+            self.start_storage(self.storage_path, full=True)
+        elif identifier == 'storage-clear' and not self.storage_measuring and self.state is not None:
+            self.clear_storage_cache()
         elif identifier in {'storage-prev', 'storage-next'} and not self.storage_measuring:
             if identifier == 'storage-prev':
                 self.storage_offset = max(0, self.storage_offset - PAGE_SIZE)

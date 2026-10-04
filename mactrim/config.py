@@ -19,6 +19,7 @@ def defaults():
             "budgets": {"repositories": 20000, "worktrees": 20000, "caches": 20000, "duplicates": 20000, "apps": 10000, "system": 5000},
             "storage_max_files": 50000, "storage_max_depth": 16, "github_squash": True,
             "worktree_default_ref": "", "retired_apps": {}, "app_aliases": {},
+            "storage_cache": {"enabled": True, "max_bytes": 16 * 1024 * 1024, "reconcile_seconds": 7 * 86400},
             "history": {"enabled": True, "max_bytes": 16 * 1024 * 1024, "max_snapshots": 60, "max_days": 60, "auto_interval_seconds": 3600}}
 
 
@@ -29,6 +30,11 @@ def validate(config, state):
     for name in ("repo_days", "cache_days", "max_files", "max_depth", "discovery_depth", "storage_max_files", "storage_max_depth"):
         if type(config[name]) is not int or not 1 <= config[name] <= (1000000 if name in {"max_files", "storage_max_files"} else 36500 if name.endswith("days") else 64):
             raise SafetyError("Invalid positive configuration value: %s" % name)
+    cache = config['storage_cache']
+    if not isinstance(cache, dict) or set(cache) != set(expected['storage_cache']) or type(cache['enabled']) is not bool:
+        raise SafetyError('Invalid Storage cache configuration')
+    if type(cache['max_bytes']) is not int or not 1 <= cache['max_bytes'] <= 16 * 1024 * 1024 or type(cache['reconcile_seconds']) is not int or not 1 <= cache['reconcile_seconds'] <= 30 * 86400:
+        raise SafetyError('Storage cache limits out of bounds')
     history = config["history"]
     if not isinstance(history, dict) or set(history) != set(expected["history"]) or type(history["enabled"]) is not bool:
         raise SafetyError("Invalid history configuration")

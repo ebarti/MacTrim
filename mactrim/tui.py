@@ -28,7 +28,7 @@ def details(item):
     return lines
 
 
-def review(plan, state, config=None, storage_root="/", output=None, initial_tab="cleanup"):
+def review(plan, state, config=None, storage_root="/", output=None, initial_tab="cleanup", initial_full=False):
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         raise SafetyError("TUI requires an interactive terminal. Use review PLAN --details or scan --output PLAN.")
     try:
@@ -36,5 +36,5 @@ def review(plan, state, config=None, storage_root="/", output=None, initial_tab=
     except ImportError as exc:
         raise SafetyError("Install the project environment (see README) or run mactrim-launch: " + clean(exc)) from exc
     MacTrimApp(plan=plan, state=state, config=config, storage_root=storage_root,
-               output=output, initial_tab=initial_tab).run()
+               output=output, initial_tab=initial_tab, initial_full=initial_full).run()
     return 0
