@@ -27,6 +27,7 @@ def main():
     parser.add_argument('binary', type=Path)
     parser.add_argument('--report', required=True, type=Path)
     args = parser.parse_args()
+    args.report.parent.mkdir(parents=True, exist_ok=True)
     binary = args.binary.resolve(strict=True)
     report = {'artifact_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(), 'checks': []}
     with tempfile.TemporaryDirectory(prefix='mactrim-binary-qa-', dir='/private/tmp') as temporary:
@@ -169,7 +170,7 @@ def main():
             assert not any('.venv' in path.parts or 'evidence' in path.parts or 'tests' in path.parts for path in files)
             # Mouse clicks on Textual's real tab strip (row2), then quit from a
             # non-input widget. Labels/content must arrive in terminal output.
-            for x in (6, 19, 37):
+            for x in (6, 14, 27):
                 os.write(master, ('\x1b[<0;%s;2M\x1b[<0;%s;2m' % (x, x)).encode())
                 read_for(.7)
             os.write(master, b'q')
@@ -178,8 +179,10 @@ def main():
             assert process.returncode == 0
             assert not list(extraction.iterdir())
             text = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', transcript.decode(errors='replace'))
+            args.report.with_suffix('.ansi').write_bytes(transcript)
             assert all(label in text for label in ('Cleanup', 'Storage', 'History / Growth'))
-            assert all(content in text for content in ('quarantine frees 0 bytes', 'Metadata only', 'Parent/child deltas overlap'))
+            missing = [content for content in ('quarantine frees 0 bytes', 'Root /', 'Parent/child deltas overlap') if content not in text]
+            assert not missing, 'Tab content did not render: ' + repr(missing)
             assert 'Traceback' not in text and 'ModuleNotFoundError' not in text
             assert b'38;2;' in transcript or b'48;2;' in transcript
             report['actual_truecolor_pty_tabs'] = ['Cleanup', 'Storage', 'History / Growth']
@@ -193,7 +196,6 @@ def main():
         report['no_python_path'] = True
         report['poisoned_python_variables'] = True
         report['normal_extraction_cleanup'] = True
-    args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps(report, indent=2, sort_keys=True) + '\n')
     print(json.dumps(report, indent=2, sort_keys=True))
 
