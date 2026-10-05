@@ -682,8 +682,10 @@ class MacTrimApp(App):
             refresh_note += ' · verified ' + datetime.fromtimestamp(refresh['last_verified']).strftime('%b %d %H:%M:%S')
         if cache:
             refresh_note += ' · ' + index_save_status(node)
+            if cache.get('directory_count') is not None:
+                refresh_note += ' · %s directories retained' % cache['directory_count'] if cache.get('stored') else ' · %s directories measured' % cache['directory_count']
             if 'limit_bytes' in cache:
-                refresh_note += ' · cache %s / %s' % (human(cache.get('allocated_bytes', 0)), human(cache['limit_bytes']))
+                refresh_note += ' · cache %s / %s' % (human(cache.get('allocated_bytes', 0)), human(cache['limit_bytes']) if cache['limit_bytes'] is not None else 'automatic sizing')
         if refresh.get('warnings'):
             refresh_note += ' · ' + '; '.join(refresh['warnings'][:2])
         diagnostic = refresh.get('events', {})

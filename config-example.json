@@ -57,7 +57,7 @@
   },
   "storage_cache": {
     "enabled": true,
-    "max_bytes": 16777216,
+    "max_bytes": null,
     "reconcile_seconds": 604800
   }
 }
