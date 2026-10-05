@@ -226,6 +226,8 @@ def main():
             text = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', transcript.decode(errors='replace'))
             args.report.with_suffix('.ansi').write_bytes(transcript)
             assert all(label in text for label in ('Cleanup', 'Storage', 'History / Growth'))
+            assert 'Receiver:' in text, 'Receiver diagnostics did not render in Storage'
+            report['receiver_diagnostics_rendered'] = True
             missing = [content for content in ('quarantine frees 0 bytes', 'Root /', 'Previous compatible', 'Latest observation') if content not in text]
             assert not missing, 'Tab content did not render: ' + repr(missing)
             assert 'Traceback' not in text and 'ModuleNotFoundError' not in text

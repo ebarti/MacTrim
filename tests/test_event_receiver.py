@@ -170,3 +170,31 @@ class ProtocolDeadlineTests(unittest.TestCase):
             self.assertFalse(observed.refresh['cache']['reusable'])
             self.assertEqual(Cache(state, defaults()['storage_cache']).read()[1].logical, observed.logical)
             self.assertIsNotNone(receiver.process.poll())
+
+    def test_eof_reaps_helper_even_when_native_drain_stalls(self):
+        program = '''
+import sys,time
+import mactrim.event_receiver as receiver
+class Stalled:
+    diagnostics = {}
+    def __init__(self,*args): pass
+    def __enter__(self): return self
+    def __exit__(self,*args): pass
+    def drain(self):
+        print('draining', flush=True)
+        time.sleep(30)
+receiver.EventCollector = Stalled
+raise SystemExit(receiver.main())
+'''
+        process = subprocess.Popen([sys.executable, '-c', program], stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            process.stdin.write(b'{"root":"/fixture","since":1,"exclusions":[]}\n'); process.stdin.flush()
+            self.assertTrue(json.loads(process.stdout.readline())['ready'])
+            process.stdin.write(b'{"command":"drain"}\n'); process.stdin.flush()
+            self.assertEqual(process.stdout.readline().strip(), b'draining')
+            process.stdin.close()
+            self.assertEqual(process.wait(timeout=5), 0)
+        finally:
+            if process.poll() is None: process.kill(); process.wait()
+            for stream in (process.stdout, process.stderr): stream.close()
