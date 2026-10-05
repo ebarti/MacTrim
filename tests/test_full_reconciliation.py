@@ -27,17 +27,19 @@ class FullRepairTests(unittest.TestCase):
     def tearDown(self):
         self.ids.stop(); self.identity.stop(); self.temporary.cleanup()
 
-    def scan(self, batches):
+    def scan(self, batches, **kwargs):
         class Events:
             def __init__(self, *args): self.batches = iter(batches)
             def __enter__(self): return self
             def __exit__(self, *args): pass
             def drain(self): return next(self.batches, (set(), [], 100))
-        return inventory(self.data, self.state, defaults(), backend=Events, full=True)
+        return inventory(self.data, self.state, defaults(), backend=Events, full=True, **kwargs)
 
     def test_one_dropped_interval_gets_full_repair_in_same_scan(self):
+        phases = []
         with patch('mactrim.incremental.complete', wraps=complete) as walker:
-            observed = self.scan([(set(), [], 100), (set(), ['UserDropped'], 100)])
+            observed = self.scan([(set(), [], 100), (set(), ['UserDropped'], 100)],
+                                 progress=lambda snapshot, current: phases.append(snapshot.progress['phase']))
         self.assertEqual(walker.call_count, 2)
         self.assertIsNone(walker.call_args.kwargs['reuse'])
         self.assertEqual(observed.status, 'measured', observed.issues)
@@ -45,6 +47,7 @@ class FullRepairTests(unittest.TestCase):
         self.assertEqual(observed.refresh['reconciliation'],
                          {'attempted': True, 'full': True, 'reason': 'Dropped filesystem notifications'})
         self.assertTrue(observed.refresh['coverage']['complete'])
+        self.assertTrue(any(value.startswith('Full repair ·') for value in phases))
 
     def test_repeated_drops_finish_uncertain_without_infinite_restart(self):
         with patch('mactrim.incremental.complete', wraps=complete) as walker:

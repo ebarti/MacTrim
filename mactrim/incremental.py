@@ -87,6 +87,9 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
                 def walk_progress(snapshot, current):
                     snapshot.counters['visited'] += visits
                     snapshot.metadata_visits += visits
+                    if repair['attempted']:
+                        prefix = 'Full repair' if repair['full'] else 'Targeted repair'
+                        snapshot.progress['phase'] = prefix + ' · ' + snapshot.progress['phase']
                     progress(snapshot, current)
                 def reuse(node, st):
                     old = nodes.get(node.path)
