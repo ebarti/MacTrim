@@ -33,7 +33,10 @@ class NativeEvents:
             import CoreFoundation as C
             def callback(stream, info, count, paths, flags, ids):
                 self._record(paths, flags, ids)
-            flags = (F.kFSEventStreamCreateFlagUseCFTypes | F.kFSEventStreamCreateFlagFileEvents |
+            # We retain directory aggregates, so native directory-level
+            # coalescing preserves the required invalidation information.
+            # FileEvents unnecessarily multiplies callback traffic on root.
+            flags = (F.kFSEventStreamCreateFlagUseCFTypes |
                      F.kFSEventStreamCreateFlagWatchRoot | F.kFSEventStreamCreateFlagNoDefer)
             self.stream = F.FSEventStreamCreate(None, callback, None, [self.root], self.since, .1, flags)
             if not self.stream:
@@ -79,7 +82,10 @@ class NativeEvents:
                     continue
                 # Coalescing names a subtree that must be recursively measured;
                 # it does not by itself mean the entire stream lost continuity.
-                directory = flag & (F.kFSEventStreamEventFlagItemIsDir | F.kFSEventStreamEventFlagMustScanSubDirs)
+                # Without FileEvents, ordinary events have no item flags and
+                # already name the directory whose contents changed.
+                directory = not flag & (F.kFSEventStreamEventFlagItemIsFile | F.kFSEventStreamEventFlagItemIsSymlink)
+                directory |= bool(flag & (F.kFSEventStreamEventFlagItemIsDir | F.kFSEventStreamEventFlagMustScanSubDirs))
                 dirty = path if directory else str(Path(path).parent)
                 self.paths.add(dirty)
                 if flag & (F.kFSEventStreamEventFlagItemCreated | F.kFSEventStreamEventFlagItemRemoved | F.kFSEventStreamEventFlagItemRenamed):

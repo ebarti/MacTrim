@@ -7,7 +7,7 @@ from .history import policy
 from .safety import SafetyError, canonical, clean
 from .regions import Regions, Cancelled, check_cancel
 from .storage import progress_snapshot
-from .storage import complete, _signature
+from .storage import complete, _signature, coverage_report
 from .storage_cache import Cache, SCHEMA, flatten
 
 
@@ -32,6 +32,7 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
     visits = 0
     node = None
     identity, checkpoint, reuse_allowed = None, 0, True
+    repair = {'attempted': False}
     save_blocker = 'No private state configured' if state is None else 'Directory index disabled in configuration'
     def phase(value):
         check_cancel(cancel)
@@ -109,16 +110,38 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
                 node = walk(set(), False)
                 after, lost, _ = watcher.drain()
                 mode, reason = 'full', 'New multiply-linked file requires global accounting reconciliation'
-            if after and not lost and node.status != 'cancelled' and not getattr(node, 'requires_reconcile', False):
-                # One bounded reconciliation round avoids chasing hot writers.
-                phase('Reconciling changed directories')
+            unstable = set()
+            for row in iter_nodes(node):
+                check_cancel(cancel)
+                if any('changed during enumeration' in issue or 'changed before enumeration' in issue or
+                       'Queued directory replaced' in issue for issue in row.issues):
+                    unstable.add(row.path)
+            if (after or lost or unstable) and node.status != 'cancelled':
+                # One repair round, chosen by accounting scope, avoids both a
+                # blanket hardlink veto and endless restarts on hot writers.
+                after.update(unstable)
+                link_scopes = set(accounting_scopes) | set(getattr(node, 'reconcile_scopes', []))
+                global_repair = bool(lost or Regions(after, cancel).intersects_any(link_scopes, cancel))
+                repair = {'attempted': True, 'full': global_repair,
+                          'reason': 'Dropped filesystem notifications' if lost else
+                                    'Changes overlap hardlink accounting' if global_repair else 'Changed directories'}
+                warnings.extend('Before repair: ' + issue for issue in lost)
+                phase('Repairing event gap: full metadata sweep' if lost else
+                      'Repairing hardlink accounting: full metadata sweep' if global_repair else
+                      'Reconciling changed directories')
                 nodes = {}
-                for row in iter_nodes(node):
-                    check_cancel(cancel)
-                    nodes[row.path] = row
-                compatible = not Regions(after, cancel).intersects_any(accounting_scopes, cancel)
+                if not global_repair:
+                    for row in iter_nodes(node):
+                        check_cancel(cancel)
+                        nodes[row.path] = row
+                else:
+                    # A global repair cannot reuse this observation. Release
+                    # its tree before allocating another whole-disk tree.
+                    node = None
                 checkpoint = events.current_id()
-                node = walk(after, compatible)
+                node = walk(after, not global_repair)
+                if global_repair:
+                    mode, reason = 'full', 'Full reconciliation: ' + repair['reason']
                 after, lost, _ = watcher.drain()
                 if node.counters['reused'] and getattr(node, 'requires_reconcile', False):
                     checkpoint = events.current_id()
@@ -164,6 +187,13 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
         visits = node.counters['visited']
         node.refresh = {'mode': 'full', 'reason': 'Native event backend unavailable/unsafe; full metadata fallback',
                         'visited': node.counters['visited'], 'reused_entries': 0, 'last_verified': node.completed_at, 'warnings': warnings}
+    if node.status != 'cancelled':
+        try:
+            phase('Reporting coverage')
+            node.refresh['coverage'] = coverage_report(node, cancel=cancel)
+        except Cancelled:
+            node.status = 'cancelled'
+            node.issues.append('Cancelled while reporting coverage; previous saved index preserved')
     saved = {'stored': False, 'reason': save_blocker, 'reusable': False}
     if node.status == 'cancelled':
         saved['reason'] = 'Scan cancelled; previous saved index preserved'
@@ -198,6 +228,7 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
             warnings.append(clean(exc))
             saved['reason'] = 'Directory index not saved: ' + clean(exc)
     node.refresh['cache'] = saved
+    node.refresh['reconciliation'] = repair
     node.policy = current_policy
     node.refresh['last_full_reconciliation'] = previous['full_at'] if mode == 'incremental' and previous else node.completed_at
     if state:

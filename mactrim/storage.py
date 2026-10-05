@@ -14,6 +14,7 @@ import time
 
 from .measurement import Node, VIRTUAL, DATA_ALIAS, capacities
 from .safety import SafetyError, canonical, clean, directory_fd, protected, within
+from .regions import check_cancel
 
 PAGE_SIZE = 500
 FRONT_DOORS = {'/Users', '/Applications', '/Library', '/private', '/usr', '/System', '/bin', '/sbin', '/opt'}
@@ -263,6 +264,39 @@ def complete(path, cancel=None, progress=None, exclusions=(), reuse=None):
     if root.counters['excluded']:
         root.issues.append('Intentional exclusions: ' + '; '.join('%s (%s)' % (reason, count) for reason, count in root.exclusions.items()))
     return root
+
+
+def coverage_report(root, limit=8, cancel=None):
+    """Explain actual incomplete scopes; presentation limits never limit scans."""
+    counts = dict(permissions=0, changes=0, tracking=0, other=0)
+    examples = {key: [] for key in counts}
+    pending = [root]
+    while pending:
+        check_cancel(cancel)
+        node = pending.pop()
+        pending.extend(reversed(node.children))
+        if node.status in {'measured', 'skipped'}:
+            continue
+        local = [issue for issue in node.issues if not any(value in issue for value in
+                 ('descendant scopes incomplete', 'inaccessible/replaced entries', 'Intentional exclusions:',
+                  'Filesystem still changing or event continuity uncertain; pending regions:'))]
+        grouped = {}
+        for issue in local:
+            lower = issue.lower()
+            category = ('permissions' if any(value in lower for value in
+                         ('operation not permitted', 'permission denied', 'metadata inaccessible')) else
+                        'tracking' if 'unsettled filesystem events' in lower else
+                        'changes' if any(value in lower for value in
+                         ('changed', 'replaced', 'no such file or directory')) else 'other')
+            grouped.setdefault(category, issue)
+        for category, issue in grouped.items():
+            counts[category] += 1
+            if len(examples[category]) < limit:
+                examples[category].append({'path': node.path, 'reason': issue})
+    return {'scope': root.path, 'complete': root.status == 'measured', 'counts': counts,
+            'examples': examples, 'examples_per_category': limit,
+            'note': 'Complete means all accessible metadata measured under the no-follow local-disk policy. '
+                    'Permission failures need access granted by macOS; active writers can leave interval uncertainty.'}
 
 
 def page(node, offset=0, limit=PAGE_SIZE):

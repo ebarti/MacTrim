@@ -37,3 +37,26 @@ class SaveStatusTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn(expected, footer)
                     self.assertIn(expected, summary)
                     self.assertFalse(app.storage_measuring)
+
+    async def test_coverage_dialog_shows_blocked_path_and_esc_only_closes_dialog(self):
+        from mactrim.storage import coverage_report
+        from mactrim.ui import Coverage
+        node = complete(self.data)
+        node.status = 'partial'
+        blocked = node.children[0]
+        blocked.status = 'denied'
+        blocked.issues = ['Operation not permitted']
+        node.refresh = {'coverage': coverage_report(node)}
+        app = self.app(initial_tab='storage')
+        with patch.object(app, 'storage_worker'), patch.object(app, 'history_worker'):
+            async with app.run_test(size=(140, 44)) as pilot:
+                app.storage_update(node, app.storage_generation, True)
+                await pilot.click('#storage-coverage')
+                await pilot.pause(.05)
+                self.assertIsInstance(app.screen, Coverage)
+                content = '\n'.join(str(widget.content) for widget in app.screen.query(Static))
+                self.assertIn(blocked.path, content)
+                self.assertIn('Operation not permitted', content)
+                await pilot.press('escape')
+                self.assertNotIsInstance(app.screen, Coverage)
+                self.assertFalse(app.storage_cancel.is_set())

@@ -119,6 +119,47 @@ class Approval(ModalScreen):
             self.dismiss(value)
 
 
+class Coverage(ModalScreen):
+    BINDINGS = [Binding('escape', 'close', 'Close', priority=True)]
+    CSS = '''
+    Coverage { align: center middle; background: $background 75%; }
+    #coverage-dialog { width: 90%; max-width: 120; height: 85%; border: thick $warning; padding: 1 2; background: $surface; }
+    #coverage-reasons { height: 1fr; }
+    '''
+
+    def __init__(self, report):
+        super().__init__()
+        self.report = report
+
+    def compose(self):
+        with Vertical(id='coverage-dialog'):
+            yield Label('Storage coverage · ' + ('COMPLETE' if self.report['complete'] else 'INCOMPLETE'))
+            yield Static(Text(clean(self.report['scope'])))
+            with VerticalScroll(id='coverage-reasons'):
+                yield Static(self.report['note'])
+                for category, label in [('permissions', 'Access blocked'), ('changes', 'Changed during measurement'),
+                                        ('tracking', 'Change tracking uncertain'), ('other', 'Other incomplete scopes')]:
+                    count = self.report['counts'][category]
+                    if count:
+                        yield Static(Text('\n%s: %s scopes' % (label, count), style='bold #fbbf24'))
+                        for row in self.report['examples'][category]:
+                            yield Static(Text('%s\n%s' % (clean(row['path']), clean(row['reason']))))
+                        omitted = count - len(self.report['examples'][category])
+                        if omitted:
+                            yield Static('%s further scopes; directory details retain their individual reasons.' % omitted)
+                if self.report['counts']['permissions']:
+                    yield Static('\nFor protected personal folders: System Settings → Privacy & Security → Full Disk Access for the app that launches MacTrim. Unix permission failures may need a separate read-only privileged scan. A sudo password does not grant macOS privacy access.')
+            yield Button('Close', id='coverage-close', variant='primary')
+
+    def action_close(self):
+        self.dismiss(None)
+
+    @on(Button.Pressed)
+    def close_button(self, event):
+        if event.button.id == 'coverage-close':
+            self.action_close()
+
+
 class CancelScan(ModalScreen):
     BINDINGS = [Binding('y', 'confirm', 'Yes', priority=True),
                 Binding('n', 'keep_running', 'No', priority=True),
@@ -277,6 +318,7 @@ class MacTrimApp(App):
                     yield Button('Clear cache', id='storage-clear')
                     yield Button('Previous page', id='storage-prev')
                     yield Button('Next page', id='storage-next')
+                    yield Button('Coverage', id='storage-coverage')
                 yield Static('Metadata only · estimates are lower bounds when incomplete · Enter drills into a directory', id='storage-summary')
                 with Horizontal(id='storage-body'):
                     yield OptionList(id='chart')
@@ -598,6 +640,9 @@ class MacTrimApp(App):
             status += ' · Storage stopped; Refresh starts another scan. Previous saved index preserved.'
         elif done:
             status = 'Scan finished (%s) · %s\n%s metadata visits · %s' % (node.status.upper(), index_save_status(node), getattr(node, 'counters', {}).get('visited', node.entries), '; '.join(node.issues[:2]))
+            report = getattr(node, 'refresh', {}).get('coverage')
+            if report and not report['complete']:
+                status += ' · Coverage shows exact blockers'
         self.query_main('#storage-status', Static).update(Text(status, style=STATUS_COLOR.get(node.status, '#fbbf24')))
 
     def refresh_storage(self):
@@ -775,6 +820,9 @@ class MacTrimApp(App):
             self.request_scan_cancel('storage')
         elif identifier == 'storage-full':
             self.start_storage(self.storage_path, full=True)
+        elif identifier == 'storage-coverage' and self.storage_node is not None and not self.storage_measuring:
+            from .storage import coverage_report
+            self.push_screen(Coverage(getattr(self.storage_node, 'refresh', {}).get('coverage') or coverage_report(self.storage_node)))
         elif identifier == 'storage-clear' and not self.storage_measuring and self.state is not None:
             self.clear_storage_cache()
         elif identifier in {'storage-prev', 'storage-next'} and not self.storage_measuring:
