@@ -85,6 +85,13 @@ def main():
         baseline = json.loads(run(prefix + ['storage', data, '--json', '--full']).stdout)['measurement']
         quiet = json.loads(run(prefix + ['storage', data, '--json']).stdout)['measurement']
         assert quiet['refresh']['mode'] == 'incremental', quiet['refresh']
+        for observed in (baseline, quiet):
+            diagnostics = observed['refresh']['events']
+            assert diagnostics['receiver_pid'] > 0, diagnostics
+            assert diagnostics['latency_seconds'] == 1.0, diagnostics
+            assert diagnostics['callbacks'] > 0, diagnostics
+            assert not diagnostics.get('tracking_error'), diagnostics
+        report['event_receiver'] = quiet['refresh']['events']
         assert not quiet['refresh']['warnings'], quiet['refresh']
         assert quiet['logical'] == baseline['logical'] and quiet['allocated'] == baseline['allocated']
         assert quiet['counters']['visited'] < baseline['counters']['visited']

@@ -686,6 +686,13 @@ class MacTrimApp(App):
                 refresh_note += ' · cache %s / %s' % (human(cache.get('allocated_bytes', 0)), human(cache['limit_bytes']))
         if refresh.get('warnings'):
             refresh_note += ' · ' + '; '.join(refresh['warnings'][:2])
+        diagnostic = refresh.get('events', {})
+        if diagnostic.get('receiver_pid'):
+            refresh_note += '\nReceiver: %s callbacks · %s drop signals · %s pending regions · %s broader invalidations · slowest callback %.2f ms' % (
+                diagnostic.get('callbacks', 0), diagnostic.get('drop_signals', 0),
+                diagnostic.get('pending_regions', 0),
+                diagnostic.get('coarsened_batches', 0) + diagnostic.get('coarsened_regions', 0),
+                diagnostic.get('callback_max_ms', 0))
         difference = accounting(node, self.capacity_rows)['difference'] if node.path == '/' else None
         note = (' · signed filesystem difference %s (APFS/excluded/inaccessible)' % signed_size(difference)) if difference is not None else ''
         if self.storage_measuring:

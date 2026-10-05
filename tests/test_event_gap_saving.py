@@ -148,3 +148,64 @@ class GapSavingTests(unittest.TestCase):
         self.assertEqual(result.status, 'cancelled')
         self.assertFalse(result.refresh['cache']['stored'])
         self.assertEqual(path.read_bytes(), before)
+
+    def test_receiver_failure_after_walk_preserves_observation_without_restart(self):
+        class Broken:
+            diagnostics = {'callbacks': 7, 'drop_signals': 1, 'receiver_pid': 123}
+            def __init__(self, *args): self.drains = 0
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def drain(self):
+                self.drains += 1
+                if self.drains > 1: raise OSError('receiver died')
+                return set(), [], 100
+        with patch('mactrim.incremental.complete', wraps=complete) as walker:
+            result = inventory(self.data, self.state, self.config, backend=Broken)
+        self.assertEqual(walker.call_count, 1)
+        self.assertEqual(result.logical, complete(self.data).logical)
+        self.assertEqual(result.status, 'partial')
+        self.assertTrue(result.refresh['cache']['stored'])
+        self.assertFalse(result.refresh['cache']['reusable'])
+        self.assertEqual(result.refresh['events']['callbacks'], 7)
+        self.assertIn('receiver died', result.refresh['events']['tracking_error'])
+        body, root, nodes = self.cache()
+        self.assertEqual(root.logical, result.logical)
+        self.assertEqual(body['event_diagnostics'], result.refresh['events'])
+        self.assertFalse(body['reuse_allowed'])
+        self.assertIsNone(body['volume'][2])
+        self.assertGreater(result.refresh['coverage']['counts']['tracking'], 0)
+        self.assertEqual(self.scan().refresh['mode'], 'full')
+        self.assertEqual(self.scan().refresh['mode'], 'incremental')
+
+    def test_receiver_shutdown_failure_does_not_repeat_completed_walk(self):
+        class BrokenExit:
+            def __init__(self, *args): pass
+            def __enter__(self): return self
+            def __exit__(self, *args): raise OSError('receiver shutdown failed')
+            def drain(self): return set(), [], 100
+        with patch('mactrim.incremental.complete', wraps=complete) as walker:
+            result = inventory(self.data, self.state, self.config, backend=BrokenExit)
+        self.assertEqual(walker.call_count, 1)
+        self.assertEqual(result.status, 'partial')
+        self.assertTrue(result.refresh['cache']['stored'])
+        self.assertFalse(result.refresh['cache']['reusable'])
+
+    def test_cancel_during_receiver_failure_preserves_previous_commit(self):
+        self.scan()
+        cache_path = self.state.path / 'storage-cache' / 'index.json.gz'
+        before = cache_path.read_bytes()
+        cancel = threading.Event()
+        class Broken:
+            def __init__(self, *args): self.drains = 0
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def drain(self):
+                self.drains += 1
+                if self.drains > 1:
+                    cancel.set()
+                    raise OSError('receiver died while cancelling')
+                return set(), [], 100
+        result = inventory(self.data, self.state, self.config, backend=Broken, full=True, cancel=cancel)
+        self.assertEqual(result.status, 'cancelled')
+        self.assertFalse(result.refresh['cache']['stored'])
+        self.assertEqual(cache_path.read_bytes(), before)

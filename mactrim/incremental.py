@@ -30,7 +30,7 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
     excluded = (state.path / 'storage-cache', state.path / 'history') if state else ()
     warnings, dirty, previous, nodes, cached = [], set(), None, {}, None
     visits = 0
-    node = None
+    node, watcher = None, None
     identity, checkpoint, reuse_allowed = None, 0, True
     repair = {'attempted': False}
     save_blocker = 'No private state configured' if state is None else 'Directory index disabled in configuration'
@@ -68,7 +68,10 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
         # Watching precedes every walk, so changes during enumeration can be
         # observed. A checkpoint precedes the observation interval; it is never
         # advanced past unmeasured events.
-        with backend(path, since, excluded) as watcher:
+        watcher = backend(path, since, excluded)
+        if hasattr(watcher, 'cancel'):
+            watcher.cancel = cancel
+        with watcher:
             dirty, lost, _ = watcher.drain()
             if lost:
                 warnings.extend('Before scan: ' + issue for issue in lost); compatible = False
@@ -185,11 +188,31 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
     except (ImportError, OSError, SafetyError) as exc:
         warnings.append(clean(exc))
         reuse_allowed = False
-        mode = 'full'
-        node = complete(path, cancel=cancel, progress=progress, exclusions=excluded)
-        visits = node.counters['visited']
-        node.refresh = {'mode': 'full', 'reason': 'Native event backend unavailable/unsafe; full metadata fallback',
-                        'visited': node.counters['visited'], 'reused_entries': 0, 'last_verified': node.completed_at, 'warnings': warnings}
+        if node is None:
+            mode = 'full'
+            node = complete(path, cancel=cancel, progress=progress, exclusions=excluded)
+            visits = node.counters['visited']
+            reason = 'Native event backend unavailable/unsafe; full metadata fallback'
+        else:
+            # A failed flush/receiver shutdown invalidates tracking, not the
+            # completed measurement. Do not restart an hours-long walk here.
+            reason = 'Completed measurement preserved; native event receiver failed'
+            for row in iter_nodes(node):
+                if cancel is not None and cancel.is_set():
+                    node.status = 'cancelled'
+                    node.issues.append('Cancelled while classifying receiver failure; previous saved index preserved')
+                    break
+                if row.status == 'measured':
+                    row.status = 'partial'
+                    row.issues.append('Unsettled filesystem events; receiver failed, reconciliation required')
+        node.counters['visited'] = node.metadata_visits = visits
+        node.refresh = {'mode': mode, 'reason': reason,
+                        'visited': visits, 'reused_entries': node.counters['reused'],
+                        'last_verified': node.completed_at, 'warnings': warnings}
+    diagnostics = dict(getattr(watcher, 'diagnostics', {}))
+    if not reuse_allowed and warnings:
+        diagnostics['tracking_error'] = warnings[-1][:1024]
+    node.refresh['events'] = diagnostics
     if node.status != 'cancelled':
         try:
             phase('Reporting coverage')
@@ -212,7 +235,7 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
             # an observation whose stream could not establish continuity.
             saved_identity = identity if reuse_allowed else identity[:2] + [None]
             body = {'schema': SCHEMA, 'scope': str(path), 'policy': current_policy, 'volume': saved_identity,
-                    'reuse_allowed': reuse_allowed,
+                    'reuse_allowed': reuse_allowed, 'event_diagnostics': diagnostics,
                     'checkpoint': checkpoint, 'previous_checkpoint': previous['checkpoint'] if previous else None,
                     'created_at': node.completed_at, 'full_at': previous['full_at'] if mode == 'incremental' else node.completed_at,
                     'complete_index': True, 'reconcile_scopes': sorted(set(getattr(node, 'reconcile_scopes', [])) | (set(accounting_scopes) if mode == 'incremental' else set())), 'requires_reconcile': bool(getattr(node, 'requires_reconcile', False) or (mode == 'incremental' and previous.get('requires_reconcile'))),
