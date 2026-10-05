@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from mactrim.config import defaults
-from mactrim.events import NativeEvents
+from mactrim.events import EventCollector
 from mactrim.incremental import inventory
 from mactrim.state import State
 from mactrim.storage import complete, coverage_report, StorageNode
@@ -95,7 +95,8 @@ class DirectoryEventTests(unittest.TestCase):
             import FSEvents
         except ImportError:
             self.skipTest('Native macOS environment required')
-        events = NativeEvents('/fixture')
+        events = EventCollector('/fixture')
         events._record(['/fixture/a'], [0], [100])
+        events._process_pending()
         self.assertEqual(events.paths, {'/fixture/a'})
         self.assertEqual(events.issues, [])
