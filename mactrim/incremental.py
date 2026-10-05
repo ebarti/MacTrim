@@ -31,6 +31,8 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
     warnings, dirty, previous, nodes, cached = [], set(), None, {}, None
     visits = 0
     node = None
+    identity, checkpoint, reuse_allowed = None, 0, True
+    save_blocker = 'No private state configured' if state is None else 'Directory index disabled in configuration'
     def phase(value):
         check_cancel(cancel)
         if progress and node is not None:
@@ -51,9 +53,11 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
         except (OSError, SafetyError) as exc:
             warnings.append(clean(exc)); cache = None
             reason = 'Unsafe/unreadable cache preserved; full reconciliation'
+            save_blocker = reason
     try:
         identity, now_id = volume_identity(path), events.current_id()
         compatible = bool(previous and cached and previous['policy'] == current_policy and previous['volume'] == identity and
+                          previous.get('reuse_allowed', True) and
                           previous['checkpoint'] <= now_id and time.time() - previous['full_at'] < settings['reconcile_seconds'])
         if full:
             reason = 'Explicit full reconciliation'
@@ -66,8 +70,8 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
         with backend(path, since, excluded) as watcher:
             dirty, lost, _ = watcher.drain()
             if lost:
-                warnings.extend(lost); compatible = False
-                reason = 'FSEvents continuity lost; full reconciliation'
+                warnings.extend('Before scan: ' + issue for issue in lost); compatible = False
+                reason = 'Full reconciliation after a pre-scan FSEvents gap'
             if compatible and not full:
                 mode = 'incremental'
                 reason = 'Persistent FSEvents replay; changed directories measured, unchanged subtrees reused'
@@ -136,27 +140,14 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
                     if row.status == 'measured' and (lost or after_index.intersects(row.path)):
                         row.status = 'partial'
                         row.issues.append('Unsettled filesystem events; growth for this scope remains unknown')
-                # Retain the pre-walk checkpoint so unsettled changes replay next time.
-                # Continuity loss prevents any cache commit.
+                # Save the observation even when continuity is lost. It remains
+                # explicitly ineligible for reuse until a fresh scan repairs it.
                 if lost:
-                    cache = None
+                    reuse_allowed = False
             node.counters['visited'] = node.metadata_visits = visits
             node.refresh = {'mode': mode, 'reason': reason, 'dirty_regions': len(dirty),
                             'visited': node.counters['visited'], 'reused_entries': node.counters['reused'],
                             'last_verified': node.completed_at, 'warnings': warnings}
-            if cache and node.status != 'cancelled':
-                phase('Saving directory index')
-                directories = flatten(node, cancel=cancel)
-                check_cancel(cancel)
-                body = {'schema': SCHEMA, 'scope': str(path), 'policy': current_policy, 'volume': identity,
-                        'checkpoint': checkpoint, 'previous_checkpoint': previous['checkpoint'] if previous else None,
-                        'created_at': node.completed_at, 'full_at': previous['full_at'] if mode == 'incremental' else node.completed_at,
-                        'complete_index': True, 'reconcile_scopes': sorted(set(getattr(node, 'reconcile_scopes', [])) | (set(accounting_scopes) if mode == 'incremental' else set())), 'requires_reconcile': bool(getattr(node, 'requires_reconcile', False) or (mode == 'incremental' and previous.get('requires_reconcile'))),
-                        'directories': directories}
-                try:
-                    node.refresh['cache'] = cache.write(body, cancel=cancel)
-                except (OSError, SafetyError) as exc:
-                    warnings.append(clean(exc))
     except Cancelled:
         if node is None:
             node = complete(path, cancel=cancel, exclusions=excluded)
@@ -167,9 +158,46 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
                         'reused_entries': node.counters['reused'], 'warnings': warnings}
     except (ImportError, OSError, SafetyError) as exc:
         warnings.append(clean(exc))
+        reuse_allowed = False
+        mode = 'full'
         node = complete(path, cancel=cancel, progress=progress, exclusions=excluded)
+        visits = node.counters['visited']
         node.refresh = {'mode': 'full', 'reason': 'Native event backend unavailable/unsafe; full metadata fallback',
                         'visited': node.counters['visited'], 'reused_entries': 0, 'last_verified': node.completed_at, 'warnings': warnings}
+    saved = {'stored': False, 'reason': save_blocker, 'reusable': False}
+    if node.status == 'cancelled':
+        saved['reason'] = 'Scan cancelled; previous saved index preserved'
+    elif cache:
+        try:
+            phase('Saving directory index')
+            directories = flatten(node, cancel=cancel)
+            check_cancel(cancel)
+            if identity is None:
+                st = os.lstat(path)
+                identity = [st.st_dev, st.st_ino, None]
+            # Missing event identity also prevents older binaries from reusing
+            # an observation whose stream could not establish continuity.
+            saved_identity = identity if reuse_allowed else identity[:2] + [None]
+            body = {'schema': SCHEMA, 'scope': str(path), 'policy': current_policy, 'volume': saved_identity,
+                    'reuse_allowed': reuse_allowed,
+                    'checkpoint': checkpoint, 'previous_checkpoint': previous['checkpoint'] if previous else None,
+                    'created_at': node.completed_at, 'full_at': previous['full_at'] if mode == 'incremental' else node.completed_at,
+                    'complete_index': True, 'reconcile_scopes': sorted(set(getattr(node, 'reconcile_scopes', [])) | (set(accounting_scopes) if mode == 'incremental' else set())), 'requires_reconcile': bool(getattr(node, 'requires_reconcile', False) or (mode == 'incremental' and previous.get('requires_reconcile'))),
+                    'directories': directories}
+            saved = cache.write(body, cancel=cancel)
+            saved['reusable'] = bool(saved['stored'] and saved.get('complete_index') and reuse_allowed)
+            if saved['stored']:
+                saved['reason'] = ('Directory index saved; incremental refresh available' if saved['reusable'] else
+                                   'Totals saved only; directory details exceeded retention limits' if not saved.get('complete_index') else
+                                   'Directory observation saved; event continuity uncertain, full reconciliation required')
+        except Cancelled:
+            node.status = 'cancelled'
+            node.issues.append('Cancelled while saving; previous saved index preserved')
+            saved['reason'] = 'Scan cancelled; previous saved index preserved'
+        except (OSError, SafetyError) as exc:
+            warnings.append(clean(exc))
+            saved['reason'] = 'Directory index not saved: ' + clean(exc)
+    node.refresh['cache'] = saved
     node.policy = current_policy
     node.refresh['last_full_reconciliation'] = previous['full_at'] if mode == 'incremental' and previous else node.completed_at
     if state:

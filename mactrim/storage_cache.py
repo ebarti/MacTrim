@@ -156,6 +156,8 @@ class Cache:
                 raise SafetyError('Invalid cache transaction metadata')
             if body['schema'] != SCHEMA or type(body['checkpoint']) is not int or body['checkpoint'] < 0 or body['created_at'] > time.time() + 60:
                 raise SafetyError('Cache schema/checkpoint invalid')
+            if type(body.get('reuse_allowed', True)) is not bool:
+                raise SafetyError('Invalid index reuse eligibility')
             root, nodes = inflate(body['directories'], body['scope']) if body['complete_index'] else (None, {})
         except (OSError, ValueError, KeyError, TypeError, EOFError) as exc:
             raise SafetyError('Corrupt cache preserved; complete fallback required') from exc
