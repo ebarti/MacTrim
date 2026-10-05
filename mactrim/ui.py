@@ -8,6 +8,7 @@ import time
 from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.coordinate import Coordinate
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
@@ -105,13 +106,58 @@ class Approval(ModalScreen):
             self.dismiss(value)
 
 
+class CancelScan(ModalScreen):
+    BINDINGS = [Binding('y', 'confirm', 'Yes', priority=True),
+                Binding('n', 'keep_running', 'No', priority=True),
+                Binding('escape', 'keep_running', 'Keep running', priority=True)]
+    CSS = '''
+    CancelScan { align: center middle; background: $background 75%; }
+    #cancel-dialog { width: 72; height: auto; border: thick $warning; padding: 1 2; background: $surface; }
+    #cancel-buttons { height: 3; margin-top: 1; }
+    #cancel-buttons Button { margin-right: 2; }
+    '''
+
+    def __init__(self, scope, path=None):
+        super().__init__()
+        self.scope, self.path = scope, path
+
+    def compose(self):
+        with Vertical(id='cancel-dialog'):
+            yield Label('Cancel the %s scan? [y/n]' % self.scope.title(), classes='title')
+            if self.path:
+                yield Static(Text(clean(self.path)))
+            yield Static('This stops only the %s scan. Other background scans keep running.' % self.scope.title())
+            if self.scope == 'storage':
+                yield Static('Unfinished progress is not saved. The previous saved index is preserved.')
+            with Horizontal(id='cancel-buttons'):
+                yield Button('No · keep running', id='cancel-no', variant='primary')
+                yield Button('Yes · cancel scan', id='cancel-yes', variant='warning')
+
+    def on_mount(self):
+        self.query_one('#cancel-no', Button).focus()
+
+    def action_confirm(self):
+        self.dismiss(True)
+
+    def action_keep_running(self):
+        self.dismiss(False)
+
+    @on(Button.Pressed)
+    def buttons(self, event):
+        event.stop()
+        if event.button.id == 'cancel-yes':
+            self.action_confirm()
+        elif event.button.id == 'cancel-no':
+            self.action_keep_running()
+
+
 class MacTrimApp(App):
     TITLE = 'MacTrim'
     SUB_TITLE = 'Evidence-led cleanup · storage explorer'
     ENABLE_COMMAND_PALETTE = False
     BINDINGS = [('q', 'quit', 'Quit'), ('space', 'toggle', 'Select'),
                 ('v', 'validate', 'Validate'), ('a', 'quarantine', 'Quarantine'),
-                ('r', 'refresh', 'Refresh'), ('escape', 'cancel', 'Cancel scan')]
+                ('r', 'refresh', 'Refresh'), ('ctrl+x', 'request_cancel', 'Cancel scan')]
     CSS = '''
     Screen { background: #0b1120; color: #e2e8f0; }
     Header { background: #172554; color: #67e8f9; }
@@ -241,10 +287,14 @@ class MacTrimApp(App):
                 yield Static('History loading…', id='history-status')
         yield Footer()
 
+    def query_main(self, selector, expect_type=None):
+        # Background workers update the main view even while a modal is active.
+        return self.screen_stack[0].query_one(selector, expect_type)
+
     def on_mount(self):
-        self.query_one('#cleanup-table', DataTable).add_columns('Select', 'Status', 'Category', 'Allocated', 'Path')
-        self.query_one('#storage-table', DataTable).add_columns('Status', 'Size', 'Directory / file')
-        self.query_one('#history-table', DataTable).add_columns('Status', 'Change', '%', 'Directory')
+        self.query_main('#cleanup-table', DataTable).add_columns('Select', 'Status', 'Category', 'Allocated', 'Path')
+        self.query_main('#storage-table', DataTable).add_columns('Status', 'Size', 'Directory / file')
+        self.query_main('#history-table', DataTable).add_columns('Status', 'Change', '%', 'Directory')
         self.set_interval(.15, self.flush_rows)
         self.refresh_cleanup()
         if self.plan is None and self.state is not None and self.initial_tab == 'cleanup':
@@ -257,7 +307,7 @@ class MacTrimApp(App):
         self.storage_cancel.set()
 
     def message(self, value):
-        self.query_one('#cleanup-status', Static).update(Text(clean(value)))
+        self.query_main('#cleanup-status', Static).update(Text(clean(value)))
 
     def flush_rows(self):
         if self.render_dirty:
@@ -265,16 +315,16 @@ class MacTrimApp(App):
             self.refresh_cleanup()
 
     def visible_items(self):
-        query = self.query_one('#search', Input).value.casefold()
-        mode = self.query_one('#filter', Select).value
-        sort = self.query_one('#sort', Select).value
+        query = self.query_main('#search', Input).value.casefold()
+        mode = self.query_main('#filter', Select).value
+        sort = self.query_main('#sort', Select).value
         rows = [item for item in self.items if item['id'] not in self.completed and
                 (mode == 'all' or item['eligible'] == (mode == 'ready')) and
                 (not query or query in (item['path'] + ' ' + item['kind'] + ' ' + str(item['context'].get('bundle_id', ''))).casefold())]
         return sorted(rows, key=(lambda item: (-item['fingerprint']['allocated'], item['path'])) if sort == 'size' else lambda item: (item[sort], item['path']))
 
     def refresh_cleanup(self):
-        table = self.query_one('#cleanup-table', DataTable)
+        table = self.query_main('#cleanup-table', DataTable)
         old_key = self.highlighted_cleanup()
         old_index = table.cursor_row
         table.clear()
@@ -294,16 +344,16 @@ class MacTrimApp(App):
         for kind, count in counts.items():
             category = 'worktrees' if kind == 'git-worktree' else 'duplicates' if kind == 'duplicate' else 'repositories' if kind in {'repo-artifact', 'unique-artifact'} else 'system' if kind == 'macos-managed' else 'caches' if kind in {'user-cache', 'xcode-cache', 'app-cache'} else 'apps'
             groups[category] += count
-        self.query_one('#categories', Static).update(Text('  ·  '.join('%s %s' % (kind, count) for kind, count in groups.items())))
+        self.query_main('#categories', Static).update(Text('  ·  '.join('%s %s' % (kind, count) for kind, count in groups.items())))
         selected = [item for item in self.items if item['id'] in self.selected]
         size = sum(item['fingerprint']['allocated'] for item in selected)
-        self.query_one('#selected-summary', Static).update('Selected %s · %s allocated estimate · quarantine frees 0 bytes' % (len(selected), human(size)))
+        self.query_main('#selected-summary', Static).update('Selected %s · %s allocated estimate · quarantine frees 0 bytes' % (len(selected), human(size)))
         for identifier in ('validate', 'quarantine', 'select-item'):
-            self.query_one('#' + identifier, Button).disabled = self.scanning or self.busy or self.plan is None
-        self.query_one('#rescan', Button).disabled = self.scanning or self.busy
+            self.query_main('#' + identifier, Button).disabled = self.scanning or self.busy or self.plan is None
+        self.query_main('#rescan', Button).disabled = self.scanning or self.busy
 
     def highlighted_cleanup(self):
-        table = self.query_one('#cleanup-table', DataTable)
+        table = self.query_main('#cleanup-table', DataTable)
         if table.row_count:
             return str(table.coordinate_to_cell_key(Coordinate(table.cursor_row, 0)).row_key.value)
         return None
@@ -311,7 +361,7 @@ class MacTrimApp(App):
     def show_cleanup_detail(self, identifier):
         item = next((item for item in self.items if item['id'] == identifier), None)
         if item:
-            self.query_one('#details', Static).update(Text('\n'.join(details(item))))
+            self.query_main('#details', Static).update(Text('\n'.join(details(item))))
 
     @on(DataTable.RowHighlighted, '#cleanup-table')
     def cleanup_highlight(self, event):
@@ -325,7 +375,7 @@ class MacTrimApp(App):
             self.refresh_cleanup()
 
     def action_toggle(self):
-        if self.query_one('#tabs', TabbedContent).active != 'cleanup' or self.scanning or self.busy or self.plan is None:
+        if self.query_main('#tabs', TabbedContent).active != 'cleanup' or self.scanning or self.busy or self.plan is None:
             return
         identifier = self.highlighted_cleanup()
         if identifier is None:
@@ -350,7 +400,7 @@ class MacTrimApp(App):
         self.items = []
         self.selected.clear()
         self.completed.clear()
-        self.query_one('#scan-progress', ProgressBar).update(total=None)
+        self.query_main('#scan-progress', ProgressBar).update(total=None)
         self.message('Discovering current-user activity and configured scopes… navigation remains available')
         self.refresh_cleanup()
         self.scan_worker(self.scan_cancel)
@@ -382,12 +432,12 @@ class MacTrimApp(App):
             self.plan, self.items = plan, list(plan['candidates'])
             activity = 'complete for current UID' if plan['activity']['complete'] else 'INCOMPLETE — actions blocked'
             partial = sum(row.get('status') in {'partial', 'cancelled'} for row in plan['coverage'])
-            self.query_one('#cleanup-summary', Static).update(Text('%s candidates · %s partial scopes · activity %s\n%s logical / %s allocated estimate; APFS reclamation can differ' % (len(self.items), partial, activity, human(plan['totals']['logical']), human(plan['totals']['allocated']))))
+            self.query_main('#cleanup-summary', Static).update(Text('%s candidates · %s partial scopes · activity %s\n%s logical / %s allocated estimate; APFS reclamation can differ' % (len(self.items), partial, activity, human(plan['totals']['logical']), human(plan['totals']['allocated']))))
             issues = plan['activity']['issues'] + plan['issues']
             self.message(('Discovery cancelled; rescan before actions. ' if plan.get('cancelled') else 'Discovery finished. ') + ('; '.join(issues[:4]) if issues else 'Review evidence and select explicitly.'))
         else:
             self.message('Discovery failed: ' + str(error))
-        self.query_one('#scan-progress', ProgressBar).update(total=1, progress=1)
+        self.query_main('#scan-progress', ProgressBar).update(total=1, progress=1)
         self.refresh_cleanup()
 
     def action_validate(self):
@@ -463,9 +513,9 @@ class MacTrimApp(App):
             if remembered is not None:
                 self.storage_path, self.storage_node, self.storage_offset = target, remembered, 0
                 remembered.refresh = dict(getattr(self.storage_inventory, 'refresh', {}), mode='cached observation', reason='Navigation reuses last observation; Refresh verifies filesystem events')
-                self.query_one('#breadcrumbs', Static).update(Text(target, style='bold #67e8f9'))
+                self.query_main('#breadcrumbs', Static).update(Text(target, style='bold #67e8f9'))
                 self.load_storage_page(); self.refresh_storage()
-                self.query_one('#storage-status', Static).update('Cached observation; Refresh verifies current filesystem events')
+                self.query_main('#storage-status', Static).update('Cached observation; Refresh verifies current filesystem events')
                 return
         self.storage_cancel.set()
         self.storage_cancel = threading.Event()
@@ -475,8 +525,8 @@ class MacTrimApp(App):
         self.storage_offset = 0
         self.storage_page_rows = []
         self.storage_measuring = True
-        self.query_one('#breadcrumbs', Static).update(Text(self.storage_path, style='bold #67e8f9'))
-        self.query_one('#storage-status', Static).update('Measuring metadata in background… totals are lower bounds')
+        self.query_main('#breadcrumbs', Static).update(Text(self.storage_path, style='bold #67e8f9'))
+        self.query_main('#storage-status', Static).update('Measuring metadata in background… totals are lower bounds')
         self.storage_worker(self.storage_path, self.storage_cancel, self.storage_generation, dict(self.config), full)
 
     @work(thread=True, group='storage', exclusive=True)
@@ -514,12 +564,12 @@ class MacTrimApp(App):
             else:
                 text.append('%s · used %s · available %s · total %s\n' % (row['label'], human(row['used']), human(row['available']), human(row['total'])))
         text.append('Filesystem capacity is separate from directory estimates; APFS volumes share capacity.', style='#94a3b8')
-        self.query_one('#capacity', Static).update(text)
+        self.query_main('#capacity', Static).update(text)
 
     def storage_error(self, generation, error):
         if generation == self.storage_generation:
             self.storage_measuring = False
-            self.query_one('#storage-status', Static).update(Text('Measurement failed: ' + error))
+            self.query_main('#storage-status', Static).update(Text('Measurement failed: ' + error))
 
     def storage_update(self, node, generation, done):
         if generation != self.storage_generation:
@@ -530,7 +580,10 @@ class MacTrimApp(App):
             self.storage_inventory = node
             self.load_storage_page()
         self.refresh_storage()
-        self.query_one('#storage-status', Static).update(Text('%s · %s metadata visits · %s' % (node.status.upper(), getattr(node, 'counters', {}).get('visited', node.entries), '; '.join(node.issues[:2]) if done else ('%s · %s' % (getattr(node, 'progress', {}).get('phase', 'Measuring'), clean(getattr(node, 'progress', {}).get('path', node.path))))), style=STATUS_COLOR.get(node.status, '#fbbf24')))
+        status = '%s · %s metadata visits · %s' % (node.status.upper(), getattr(node, 'counters', {}).get('visited', node.entries), '; '.join(node.issues[:2]) if done else ('%s · %s' % (getattr(node, 'progress', {}).get('phase', 'Measuring'), clean(getattr(node, 'progress', {}).get('path', node.path)))))
+        if done and node.status == 'cancelled':
+            status += ' · Storage stopped; Refresh starts another scan. Previous saved index preserved.'
+        self.query_main('#storage-status', Static).update(Text(status, style=STATUS_COLOR.get(node.status, '#fbbf24')))
 
     def refresh_storage(self):
         if self.storage_node is None:
@@ -538,9 +591,9 @@ class MacTrimApp(App):
         metric = self.storage_metric
         node = self.storage_node
         self.storage_nodes = sorted(list(self.storage_page_rows if not self.storage_measuring else node.children[:PAGE_SIZE]), key=(lambda row: (-getattr(row, metric), row.name)) if self.storage_sort == 'size' else lambda row: row.name)
-        table = self.query_one('#storage-table', DataTable)
+        table = self.query_main('#storage-table', DataTable)
         old_index, old_path = table.cursor_row, highlighted_path(table)
-        chart = self.query_one('#chart', OptionList)
+        chart = self.query_main('#chart', OptionList)
         with table.prevent(DataTable.RowHighlighted), chart.prevent(OptionList.OptionHighlighted):
             table.clear()
             chart.clear_options()
@@ -575,16 +628,17 @@ class MacTrimApp(App):
         note = (' · signed filesystem difference %s (APFS/excluded/inaccessible)' % signed_size(difference)) if difference is not None else ''
         if self.storage_measuring:
             refresh_note += ' · live rows: first %s immediate directories; totals include all observations' % PAGE_SIZE
-        self.query_one('#storage-summary', Static).update(Text('%s %s · %s · page %s%s\nGraph: top 15 directories / filesystem used at root (allocated), otherwise scope estimate; partial scope totals are lower bounds. Inaccessible scopes are unknown. Full rescan has no entry/depth cap.' % (human(getattr(node, metric)), metric, 'SCANNING; observed lower bounds' if self.storage_measuring else node.status.upper(), self.storage_offset // PAGE_SIZE + 1, note) + '\n' + refresh_note))
+        lifecycle = ('CANCELLING; observed lower bounds' if self.storage_cancel.is_set() else 'SCANNING; observed lower bounds') if self.storage_measuring else node.status.upper()
+        self.query_main('#storage-summary', Static).update(Text('%s %s · %s · page %s%s\nGraph: top 15 directories / filesystem used at root (allocated), otherwise scope estimate; partial scope totals are lower bounds. Inaccessible scopes are unknown. Full rescan has no entry/depth cap.' % (human(getattr(node, metric)), metric, lifecycle, self.storage_offset // PAGE_SIZE + 1, note) + '\n' + refresh_note))
 
     @work(thread=True, group='storage-cache', exclusive=True)
     def clear_storage_cache(self):
         try:
             from .storage_cache import Cache
             result = Cache(self.state, self.config['storage_cache']).clear()
-            self.call_from_thread(self.query_one('#storage-status', Static).update, Text('Owned cache cleared: ' + str(result)))
+            self.call_from_thread(self.query_main('#storage-status', Static).update, Text('Owned cache cleared: ' + str(result)))
         except Exception as exc:
-            self.call_from_thread(self.query_one('#storage-status', Static).update, Text('Cache preserved: ' + clean(exc)))
+            self.call_from_thread(self.query_main('#storage-status', Static).update, Text('Cache preserved: ' + clean(exc)))
 
     def load_storage_page(self):
         if self.storage_node is None:
@@ -598,14 +652,14 @@ class MacTrimApp(App):
     @on(Select.Changed, '#metric')
     @on(Select.Changed, '#storage-sort')
     def storage_settings(self):
-        self.storage_metric = self.query_one('#metric', Select).value
-        self.storage_sort = self.query_one('#storage-sort', Select).value
+        self.storage_metric = self.query_main('#metric', Select).value
+        self.storage_sort = self.query_main('#storage-sort', Select).value
         self.refresh_storage()
 
     def storage_selected(self, path):
         node = next((node for node in self.storage_nodes if node.path == path), None)
         if node:
-            self.query_one('#storage-detail', Static).update(Text('%s\n%s logical · %s allocated · %s · %s\n%s' % (clean(node.path), human(node.logical), human(node.allocated), node.status.upper(), 'protected: read-only' if node.protected else 'read-only metadata', '; '.join(node.issues) or 'No content read')))
+            self.query_main('#storage-detail', Static).update(Text('%s\n%s logical · %s allocated · %s · %s\n%s' % (clean(node.path), human(node.logical), human(node.allocated), node.status.upper(), 'protected: read-only' if node.protected else 'read-only metadata', '; '.join(node.issues) or 'No content read')))
         return node
 
     @on(DataTable.RowHighlighted, '#storage-table')
@@ -614,7 +668,7 @@ class MacTrimApp(App):
         if path != highlighted_path(event.control):
             return
         self.storage_selected(path)
-        highlight_chart(self.query_one('#chart', OptionList), path)
+        highlight_chart(self.query_main('#chart', OptionList), path)
 
     @on(OptionList.OptionHighlighted, '#chart')
     def chart_highlight(self, event):
@@ -624,7 +678,7 @@ class MacTrimApp(App):
         node = self.storage_selected(path)
         if node:
             index = next(i for i, row in enumerate(self.storage_nodes) if row.path == path)
-            table = self.query_one('#storage-table', DataTable)
+            table = self.query_main('#storage-table', DataTable)
             with table.prevent(DataTable.RowHighlighted):
                 table.move_cursor(row=index)
 
@@ -643,19 +697,40 @@ class MacTrimApp(App):
 
     def cancel_storage(self):
         self.storage_cancel.set()
-        self.query_one('#storage-status', Static).update('Cancellation requested; waiting for the current operation to return…')
+        self.query_main('#storage-status', Static).update('Cancellation requested; waiting for the current operation to return…')
+        self.refresh_storage()
 
-    def action_cancel(self):
-        if self.query_one('#tabs', TabbedContent).active == 'storage':
-            self.cancel_storage()
-        elif self.scanning:
-            self.scan_cancel.set()
-            self.message('Cancellation requested; already discovered reports remain visible')
+    def request_scan_cancel(self, scope):
+        if isinstance(self.screen, CancelScan):
+            return
+        running = self.storage_measuring if scope == 'storage' else self.scanning
+        token = self.storage_cancel if scope == 'storage' else self.scan_cancel
+        if not running or token.is_set():
+            self.notify('No %s scan waiting for cancellation.' % scope.title())
+            return
+        def confirmed(answer):
+            current = self.storage_cancel if scope == 'storage' else self.scan_cancel
+            running = self.storage_measuring if scope == 'storage' else self.scanning
+            if not answer or current is not token or not running:
+                return
+            if scope == 'storage':
+                self.cancel_storage()
+            else:
+                token.set()
+                self.message('Cleanup cancellation requested; Storage continues independently if running')
+        self.push_screen(CancelScan(scope, self.storage_path if scope == 'storage' else None), confirmed)
+
+    def action_request_cancel(self):
+        scope = self.query_main('#tabs', TabbedContent).active
+        if scope in {'storage', 'cleanup'}:
+            self.request_scan_cancel(scope)
+        else:
+            self.notify('Choose Storage or Cleanup to cancel its scan with Ctrl+X.')
 
     def action_refresh(self):
-        if self.query_one('#tabs', TabbedContent).active == 'storage':
+        if self.query_main('#tabs', TabbedContent).active == 'storage':
             self.start_storage(self.storage_path)
-        elif self.query_one('#tabs', TabbedContent).active == 'history':
+        elif self.query_main('#tabs', TabbedContent).active == 'history':
             self.load_history()
         else:
             self.start_scan()
@@ -666,7 +741,7 @@ class MacTrimApp(App):
         if identifier == 'rescan':
             self.start_scan()
         elif identifier == 'cancel-scan':
-            self.scan_cancel.set()
+            self.request_scan_cancel('cleanup')
         elif identifier == 'select-item':
             self.action_toggle()
         elif identifier == 'validate':
@@ -680,7 +755,7 @@ class MacTrimApp(App):
         elif identifier == 'storage-refresh':
             self.start_storage(self.storage_path)
         elif identifier == 'cancel-storage':
-            self.cancel_storage()
+            self.request_scan_cancel('storage')
         elif identifier == 'storage-full':
             self.start_storage(self.storage_path, full=True)
         elif identifier == 'storage-clear' and not self.storage_measuring and self.state is not None:
@@ -700,7 +775,7 @@ class MacTrimApp(App):
 
     def load_history(self):
         if self.state is None:
-            self.query_one('#history-status', Static).update('This session has no private state; use the installed CLI to enable local history.')
+            self.query_main('#history-status', Static).update('This session has no private state; use the installed CLI to enable local history.')
             return
         self.history_generation += 1
         self.history_worker(self.history_earlier, self.history_later, self.history_metric, self.history_generation)
@@ -719,13 +794,13 @@ class MacTrimApp(App):
         if generation != self.history_generation:
             return
         if error:
-            self.query_one('#history-status', Static).update(Text('History unavailable: ' + error + ' · cleanup and browsing remain available'))
+            self.query_main('#history-status', Static).update(Text('History unavailable: ' + error + ' · cleanup and browsing remain available'))
             return
         self.history_catalog, self.history_result = catalog, result
         self.history_choices_ready = False
         choices = [(datetime.fromtimestamp(row['created_at']).strftime('%b %d %H:%M') + ' ' + clean(row['scope'])[-30:], row['id']) for row in catalog['snapshots'] if not row['temporary']]
-        before = self.query_one('#history-before', Select)
-        after = self.query_one('#history-after', Select)
+        before = self.query_main('#history-before', Select)
+        after = self.query_main('#history-after', Select)
         before.set_options([('Previous compatible', 'previous')] + choices)
         after.set_options([('Latest observation', 'latest')] + choices)
         before.value = self.history_earlier or 'previous'
@@ -739,9 +814,9 @@ class MacTrimApp(App):
         result, catalog = self.history_result, self.history_catalog
         key = (lambda row: (row['delta'] is None, -(row['delta'] or 0), row['path'])) if self.history_sort == 'growth' else (lambda row: (row['delta'] is None, row['delta'] or 0, row['path'])) if self.history_sort == 'shrink' else lambda row: row['path']
         self.history_rows = sorted(result.get('rows', []), key=key)
-        table = self.query_one('#history-table', DataTable)
+        table = self.query_main('#history-table', DataTable)
         old_index, old_path = table.cursor_row, highlighted_path(table)
-        chart = self.query_one('#history-chart', OptionList)
+        chart = self.query_main('#history-chart', OptionList)
         with table.prevent(DataTable.RowHighlighted), chart.prevent(OptionList.OptionHighlighted):
             table.clear()
             chart.clear_options()
@@ -766,8 +841,8 @@ class MacTrimApp(App):
         if result.get('earlier_at'):
             times = datetime.fromtimestamp(result['earlier_at']).strftime('%Y-%m-%d %H:%M') + ' → ' + datetime.fromtimestamp(result['later_at']).strftime('%Y-%m-%d %H:%M')
         capacity = ' · '.join(clean(row['label']) + ': used ' + ('+' if row['used_delta'] > 0 else '') + human(row['used_delta']) + (' (shared/alias; not additive)' if row['shared_observation_alias'] else '') for row in result.get('capacity', []))
-        self.query_one('#history-summary', Static).update(Text('%s\n%s\nHistory %s / %s allocated · %s snapshots · %s directory estimates' % (times or 'First measured baseline / no comparable pair', capacity or 'Capacity trends require two observations; directory growth requires comparable measured baselines.', human(catalog['allocated_bytes']), human(catalog['limit_bytes']), len(catalog['snapshots']), self.history_metric)))
-        self.query_one('#history-status', Static).update(Text(result.get('note', '') + (' · ' + '; '.join(catalog['issues'] + result.get('issues', [])) if catalog['issues'] or result.get('issues') else '')))
+        self.query_main('#history-summary', Static).update(Text('%s\n%s\nHistory %s / %s allocated · %s snapshots · %s directory estimates' % (times or 'First measured baseline / no comparable pair', capacity or 'Capacity trends require two observations; directory growth requires comparable measured baselines.', human(catalog['allocated_bytes']), human(catalog['limit_bytes']), len(catalog['snapshots']), self.history_metric)))
+        self.query_main('#history-status', Static).update(Text(result.get('note', '') + (' · ' + '; '.join(catalog['issues'] + result.get('issues', [])) if catalog['issues'] or result.get('issues') else '')))
 
     @on(Select.Changed, '#history-before')
     @on(Select.Changed, '#history-after')
@@ -775,9 +850,9 @@ class MacTrimApp(App):
     def history_selection(self):
         if not self.is_mounted or not self.history_choices_ready:
             return
-        before = self.query_one('#history-before', Select).value
-        after = self.query_one('#history-after', Select).value
-        metric = self.query_one('#history-metric', Select).value
+        before = self.query_main('#history-before', Select).value
+        after = self.query_main('#history-after', Select).value
+        metric = self.query_main('#history-metric', Select).value
         values = (None if before == 'previous' else before, None if after == 'latest' else after, metric)
         if values != (self.history_earlier, self.history_later, self.history_metric):
             self.history_earlier, self.history_later, self.history_metric = values
@@ -785,18 +860,18 @@ class MacTrimApp(App):
 
     @on(Select.Changed, '#history-sort')
     def history_sort_changed(self):
-        self.history_sort = self.query_one('#history-sort', Select).value
+        self.history_sort = self.query_main('#history-sort', Select).value
         self.refresh_history()
 
     def history_captured(self, result, error):
         if error:
-            self.query_one('#history-status', Static).update(Text('History capture unavailable: ' + error + ' · browser remains usable'))
+            self.query_main('#history-status', Static).update(Text('History capture unavailable: ' + error + ' · browser remains usable'))
         else:
             self.load_history()
 
     def capture_current(self):
         if self.storage_measuring or self.storage_node is None or self.state is None:
-            self.query_one('#history-status', Static).update('Wait for a completed Storage measurement; capture does not run another scan.')
+            self.query_main('#history-status', Static).update('Wait for a completed Storage measurement; capture does not run another scan.')
             return
         self.manual_capture_worker(self.storage_node, self.capacity_rows)
 
@@ -820,7 +895,7 @@ class MacTrimApp(App):
             elif row['status'] == 'removed-directory':
                 after = '0 B (absent)'
             overlap = ' · Included in parent totals' if row['overlaps_parent'] else ''
-            self.query_one('#history-detail', Static).update(Text('%s\n%s · before %s · after %s%s\nCurrent recently modified allocated bytes: 7d %s / 30d %s; recently created 7d %s — activity clues, NOT measured growth.\nEnter opens this directory in Storage; missing/partial observations remain unknown.' % (clean(path), row['status'], before, after, overlap, human(recent.get('modified_7d', 0)), human(recent.get('modified_30d', 0)), human(recent.get('created_7d', 0)))))
+            self.query_main('#history-detail', Static).update(Text('%s\n%s · before %s · after %s%s\nCurrent recently modified allocated bytes: 7d %s / 30d %s; recently created 7d %s — activity clues, NOT measured growth.\nEnter opens this directory in Storage; missing/partial observations remain unknown.' % (clean(path), row['status'], before, after, overlap, human(recent.get('modified_7d', 0)), human(recent.get('modified_30d', 0)), human(recent.get('created_7d', 0)))))
 
     @on(DataTable.RowHighlighted, '#history-table')
     def history_highlight(self, event):
@@ -828,7 +903,7 @@ class MacTrimApp(App):
         if path != highlighted_path(event.control):
             return
         self.history_detail(path)
-        highlight_chart(self.query_one('#history-chart', OptionList), path)
+        highlight_chart(self.query_main('#history-chart', OptionList), path)
 
     @on(OptionList.OptionHighlighted, '#history-chart')
     def history_chart_highlight(self, event):
@@ -838,18 +913,18 @@ class MacTrimApp(App):
         self.history_detail(path)
         index = next((i for i, row in enumerate(self.history_rows) if row['path'] == path), None)
         if index is not None:
-            table = self.query_one('#history-table', DataTable)
+            table = self.query_main('#history-table', DataTable)
             with table.prevent(DataTable.RowHighlighted):
                 table.move_cursor(row=index)
 
     @on(DataTable.RowSelected, '#history-table')
     def history_enter(self, event):
-        self.query_one('#tabs', TabbedContent).active = 'storage'
+        self.query_main('#tabs', TabbedContent).active = 'storage'
         self.start_storage(str(event.row_key.value))
-        self.call_after_refresh(self.query_one('#storage-table', DataTable).focus)
+        self.call_after_refresh(self.query_main('#storage-table', DataTable).focus)
 
     @on(OptionList.OptionSelected, '#history-chart')
     def history_chart_enter(self, event):
-        self.query_one('#tabs', TabbedContent).active = 'storage'
+        self.query_main('#tabs', TabbedContent).active = 'storage'
         self.start_storage(event.option.id)
-        self.call_after_refresh(self.query_one('#storage-table', DataTable).focus)
+        self.call_after_refresh(self.query_main('#storage-table', DataTable).focus)
