@@ -49,9 +49,6 @@ class EventCollector:
         if not self.ready.wait(5) or self.failure or not self.stream:
             self.__exit__(None, None, None)
             raise SafetyError('Native FSEvents unavailable: ' + '; '.join(self.issues))
-        if not self.history_done.wait(5) or self.failure:
-            self.__exit__(None, None, None)
-            raise SafetyError('Native FSEvents replay did not establish HistoryDone')
         return self
 
     def _run(self):
@@ -168,6 +165,13 @@ class EventCollector:
 
     def drain(self):
         import FSEvents as F
+        # Large journal intervals need not fit in a fixed startup deadline.
+        # The helper reports actual delivery progress while we await the
+        # historical sentinel; EOF and the client's idle deadline still reap
+        # an abandoned or stalled reader.
+        while not self.history_done.wait(.1):
+            if self.stop.is_set() or self.failure or self.stream is None:
+                raise SafetyError('Native FSEvents replay did not establish HistoryDone')
         if self.failure or self.stream is None:
             raise SafetyError('Native FSEvents stream unavailable: ' + (self.failure or 'stream stopped'))
         self.stop.wait(DELIVERY_LATENCY + .1)
@@ -205,24 +209,29 @@ class NativeEvents:
                 offset += self.process.stdin.write(payload[offset:])
             self.process.stdin.flush()
             deadline = time.monotonic() + timeout
-            while b'\n' not in self.buffer:
+            while True:
                 check_cancel(self.cancel)
                 if time.monotonic() >= deadline:
                     raise SafetyError('Native event receiver response timed out')
-                if select.select([self.process.stdout], [], [], .1)[0]:
+                if b'\n' not in self.buffer and select.select([self.process.stdout], [], [], .1)[0]:
                     chunk = os.read(self.process.stdout.fileno(), 65536)
                     if not chunk: raise SafetyError('Native event receiver exited before responding')
                     self.buffer.extend(chunk)
                     if len(self.buffer) > 16 * 1024 * 1024:
                         raise SafetyError('Native event receiver response exceeded memory allowance')
-            line, _, rest = self.buffer.partition(b'\n')
-            self.buffer = bytearray(rest)
-            response = json.loads(line)
-            if not isinstance(response, dict):
-                raise SafetyError('Malformed native event receiver response')
-            self.diagnostics = response.get('diagnostics', self.diagnostics)
-            if 'error' in response: raise SafetyError(response['error'])
-            return response
+                if b'\n' not in self.buffer:
+                    continue
+                line, _, rest = self.buffer.partition(b'\n')
+                self.buffer = bytearray(rest)
+                response = json.loads(line)
+                if not isinstance(response, dict):
+                    raise SafetyError('Malformed native event receiver response')
+                self.diagnostics = response.get('diagnostics', self.diagnostics)
+                if 'error' in response: raise SafetyError(response['error'])
+                if response.get('progress') is True:
+                    deadline = time.monotonic() + timeout
+                    continue
+                return response
         except (OSError, ValueError) as exc:
             raise SafetyError('Native event receiver communication failed: ' + clean(exc)) from exc
 

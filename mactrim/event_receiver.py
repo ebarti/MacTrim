@@ -40,7 +40,24 @@ def main():
                 request = json.loads(line)
                 if request.get('command') != 'drain':
                     raise ValueError('Unknown receiver command')
-                paths, issues, latest = collector.drain()
+                result = queue.Queue(maxsize=1)
+                def drain():
+                    try: result.put((collector.drain(), None))
+                    except Exception as exc: result.put((None, exc))
+                threading.Thread(target=drain, name='mactrim-journal-drain', daemon=True).start()
+                last_progress = None
+                while True:
+                    try:
+                        observed, error = result.get(timeout=.5)
+                        break
+                    except queue.Empty:
+                        delivered = collector.diagnostics.get('callbacks', 0)
+                        if delivered and delivered != last_progress:
+                            last_progress = delivered
+                            reply({'progress': True})
+                if error is not None:
+                    raise error
+                paths, issues, latest = observed
                 reply({'paths': sorted(paths), 'issues': issues, 'latest': latest})
         return 0
     except Exception as exc:

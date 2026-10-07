@@ -93,7 +93,7 @@ class ProgressTests(unittest.TestCase):
                 def __exit__(self, *args): pass
                 def drain(self):
                     self.drains += 1
-                    return (set() if self.drains == 1 else {str(data / 'hot')}, [], 123)
+                    return ({str(data / 'hot')}, [], 123)
             with patch('mactrim.incremental.volume_identity', return_value=[1, 2, 'test']), patch('mactrim.events.current_id', return_value=123):
                 observed = inventory(data, state, config, backend=HotEvents)
                 self.assertEqual(observed.status, 'partial')

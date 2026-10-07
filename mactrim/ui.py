@@ -689,6 +689,10 @@ class MacTrimApp(App):
         if refresh.get('warnings'):
             refresh_note += ' · ' + '; '.join(refresh['warnings'][:2])
         diagnostic = refresh.get('events', {})
+        if diagnostic.get('mode') == 'journal':
+            refresh_note += '\nJournal: %s reads · %s recovered replays · checkpoint %s' % (
+                diagnostic.get('replay_attempts', 0), diagnostic.get('recovered_replays', 0),
+                diagnostic.get('checkpoint', 0))
         if diagnostic.get('receiver_pid'):
             refresh_note += '\nReceiver: %s callbacks · %s drop signals · %s pending regions · %s broader invalidations · slowest callback %.2f ms' % (
                 diagnostic.get('callbacks', 0), diagnostic.get('drop_signals', 0),

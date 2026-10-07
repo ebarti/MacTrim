@@ -100,7 +100,11 @@ class IncrementalTests(unittest.TestCase):
             def __init__(self, *args): pass
             def __exit__(self, *args): pass
             def __enter__(self): raise SafetyError('Simulated dropped event history')
-        result = self.scan(backend=Unavailable); self.same(result)
+        result = self.scan(backend=Unavailable)
+        self.assertEqual((result.logical, result.allocated), (complete(self.data).logical, complete(self.data).allocated))
+        self.assertEqual(result.status, 'partial')
+        self.assertTrue(result.refresh['cache']['stored'])
+        self.assertFalse(result.refresh['cache']['reusable'])
         self.assertEqual(result.refresh['mode'], 'full')
         self.assertIn('Simulated', ' '.join(result.refresh['warnings']))
 
@@ -130,19 +134,21 @@ class IncrementalTests(unittest.TestCase):
         result = self.scan(progress=mutate)
         self.same(result)
 
-    def test_simulated_gap_requires_full_measurement(self):
+    def test_simulated_delivery_gap_is_recovered_by_fresh_native_replay(self):
         from mactrim.events import NativeEvents
         self.scan()
         (self.data / '7' / 'file').write_bytes(b'gap' * 1234)
         class Gap(NativeEvents):
+            injected = False
             def drain(self):
                 paths, issues, latest = super().drain()
-                if not getattr(self, 'injected', False):
-                    self.injected = True
+                if not Gap.injected:
+                    Gap.injected = True
                     issues.append('Simulated UserDropped gap')
                 return paths, issues, latest
         result = self.scan(backend=Gap); self.same(result)
-        self.assertEqual(result.refresh['mode'], 'full')
+        self.assertEqual(result.refresh['mode'], 'incremental')
+        self.assertEqual(result.refresh['events']['recovered_replays'], 1)
         self.assertIn('Simulated', ' '.join(result.refresh['warnings']))
 
     def test_hardlinked_scopes_allow_quiet_reuse_and_reconcile_changes(self):

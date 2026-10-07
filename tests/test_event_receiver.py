@@ -115,6 +115,27 @@ class IsolatedNativeTests(unittest.TestCase):
             for stream in (process.stdout, process.stderr): stream.close()
 
 class ProtocolDeadlineTests(unittest.TestCase):
+    def test_delivery_progress_extends_idle_deadline_and_keeps_response_separate(self):
+        receiver = NativeEvents('/fixture')
+        program = '''
+import json,sys,time
+sys.stdin.buffer.readline()
+for count in range(4):
+    print(json.dumps({'progress': True, 'diagnostics': {'callbacks': count+1}}), flush=True)
+    time.sleep(.07)
+print(json.dumps({'paths': ['/fixture/changed'], 'issues': [], 'latest': 42}), flush=True)
+'''
+        receiver.process = subprocess.Popen([sys.executable, '-c', program], stdin=subprocess.PIPE,
+                                           stdout=subprocess.PIPE, bufsize=0)
+        try:
+            response = receiver._request({'command': 'drain'}, timeout=.15)
+            self.assertEqual(response['paths'], ['/fixture/changed'])
+            self.assertEqual(response['latest'], 42)
+            self.assertEqual(receiver.diagnostics['callbacks'], 4)
+        finally:
+            receiver.__exit__()
+        self.assertIsNotNone(receiver.process.poll())
+
     def test_partial_response_cannot_block_past_deadline(self):
         receiver = NativeEvents('/fixture')
         receiver.process = subprocess.Popen([sys.executable, '-c',
