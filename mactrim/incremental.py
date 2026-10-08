@@ -15,10 +15,14 @@ def volume_identity(path):
     import FSEvents as F
     import CoreFoundation as C
     st = os.lstat(path)
-    uuid = F.FSEventsCopyUUIDForDevice(st.st_dev)
-    if uuid is None:
+    device, mount, relative = events.device_scope(path)
+    namespace_uuid = F.FSEventsCopyUUIDForDevice(st.st_dev)
+    uuid = namespace_uuid if device == st.st_dev else F.FSEventsCopyUUIDForDevice(device)
+    if uuid is None or namespace_uuid is None:
         raise SafetyError('Volume event-history identity unavailable')
-    return [st.st_dev, st.st_ino, str(C.CFUUIDCreateString(None, uuid))]
+    return [st.st_dev, st.st_ino, str(C.CFUUIDCreateString(None, namespace_uuid)),
+            device, str(C.CFUUIDCreateString(None, uuid)), mount, relative,
+            bool(os.statvfs(path).f_flag & os.ST_RDONLY)]
 
 
 def inventory(path, state=None, config=None, cancel=None, progress=None, full=False, backend=events.NativeEvents):
@@ -70,7 +74,7 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
                 continue
             finally:
                 for key, value in getattr(reader, 'diagnostics', {}).items():
-                    if key in {'callbacks', 'events', 'drop_signals', 'coarsened_batches', 'coarsened_regions'}:
+                    if key in {'callbacks', 'events', 'drop_signals', 'mount_signals', 'coarsened_batches', 'coarsened_regions'}:
                         diagnostics[key] = diagnostics.get(key, 0) + value
                     elif key in {'callback_max_ms', 'pending_peak_bytes', 'dirty_peak_regions'}:
                         diagnostics[key] = max(diagnostics.get(key, 0), value)
@@ -92,6 +96,9 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
     current_policy = policy(config, path, 'storage.complete.v1')
     # Measurement-owned stores are explicitly excluded and accounted separately.
     current_policy = dict(current_policy, measurement_state=[str(value) for value in excluded])
+    # Journal source changes require a new index baseline, without changing
+    # the directory accounting policy used to compare History observations.
+    cache_policy = dict(current_policy, event_source='device-journal.v1')
     try:
         if cache:
             try:
@@ -104,7 +111,7 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
                 reason = 'Unsafe/unreadable cache preserved; full reconciliation'
                 save_blocker = reason
         identity, now_id = volume_identity(path), events.current_id()
-        compatible = bool(previous and cached and previous['policy'] == current_policy and previous['volume'] == identity and
+        compatible = bool(previous and cached and previous['policy'] == cache_policy and previous['volume'] == identity and
                           previous.get('reuse_allowed', True) and
                           previous['checkpoint'] <= now_id and time.time() - previous['full_at'] < settings['reconcile_seconds'])
         if full:
@@ -284,7 +291,7 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
             # Missing event identity also prevents older binaries from reusing
             # an observation whose stream could not establish continuity.
             saved_identity = identity if reuse_allowed else identity[:2] + [None]
-            body = {'schema': SCHEMA, 'scope': str(path), 'policy': current_policy, 'volume': saved_identity,
+            body = {'schema': SCHEMA, 'scope': str(path), 'policy': cache_policy, 'volume': saved_identity,
                     'reuse_allowed': reuse_allowed, 'event_diagnostics': diagnostics,
                     'checkpoint': checkpoint, 'previous_checkpoint': previous['checkpoint'] if previous else None,
                     'created_at': node.completed_at, 'full_at': previous['full_at'] if mode == 'incremental' else node.completed_at,

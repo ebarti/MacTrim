@@ -693,6 +693,8 @@ class MacTrimApp(App):
             refresh_note += '\nJournal: %s reads · %s recovered replays · checkpoint %s' % (
                 diagnostic.get('replay_attempts', 0), diagnostic.get('recovered_replays', 0),
                 diagnostic.get('checkpoint', 0))
+            if diagnostic.get('source') == 'device-journal':
+                refresh_note += ' · device %s · %s mount changes' % (diagnostic.get('device'), diagnostic.get('mount_signals', 0))
         if diagnostic.get('receiver_pid'):
             refresh_note += '\nReceiver: %s callbacks · %s drop signals · %s pending regions · %s broader invalidations · slowest callback %.2f ms' % (
                 diagnostic.get('callbacks', 0), diagnostic.get('drop_signals', 0),
