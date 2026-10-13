@@ -7,6 +7,7 @@ No production activity provider is replaced. Unknown real activity must block.
 import argparse
 import fcntl
 import hashlib
+import gzip
 import json
 import os
 from pathlib import Path
@@ -77,6 +78,10 @@ def main():
         dependency = data / 'node_modules'
         (dependency / 'package' / 'lib').mkdir(parents=True)
         (dependency / 'package' / 'lib' / 'payload').write_bytes(b'd' * 8192)
+        deep = data
+        for depth in range(1, 14):
+            deep /= 'depth-%s' % depth; deep.mkdir()
+        (deep / 'payload').write_bytes(b'beyond depth eight')
         storage = json.loads(run(['storage', data, '--json', '--max-files', 100, '--max-depth', 8]).stdout)
         assert storage['measurement']['status'] == 'partial'  # explicit 100-entry preview of >1600 files
         config = root / 'scoped.json'
@@ -101,6 +106,22 @@ def main():
         assert summary['details_deferred'] and summary['logical'] >= 8192
         index = state / 'storage-cache' / 'index.json.gz'
         saved_index = index.read_bytes()
+        assert saved_index.startswith(b'MACTRIM-INDEX-3\n')
+        records = gzip.decompress(saved_index[len(b'MACTRIM-INDEX-3\n') + 65:]).splitlines()[1:]
+        indexed_paths, deferred = [], 0
+        for raw in records:
+            row = json.loads(raw); parent, name = row[:2]
+            folder = data if parent == -1 else indexed_paths[parent] / name
+            indexed_paths.append(folder)
+            depth = len(folder.relative_to(data).parts)
+            assert depth <= 9
+            if depth == 9:
+                assert row[-1] is True
+                expected = folder.stat().st_size + sum(entry.stat().st_size for entry in folder.rglob('*'))
+                assert row[2] == expected, 'Deferred depth total omitted descendant metadata'
+                deferred += 1
+        assert deferred > 0
+        report['lazy_depth_boundary'] = {'detailed_levels': 8, 'deferred_level': 9, 'deep_size_included': True}
         detail = json.loads(run(['--state', root / 'detail-state', '--config', config,
                                  'storage', dependency, '--json']).stdout)['measurement']
         assert not detail['details_deferred'] and detail['children']
