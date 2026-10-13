@@ -93,7 +93,24 @@ class NavigationTests(unittest.IsolatedAsyncioTestCase):
                     self.assertFalse(app.storage_node.details_deferred)
                     self.assertTrue(app.storage_node.children)
                     self.assertEqual((self.state.path/'storage-cache'/'index.json.gz').read_bytes(),committed[0])
+                    generation = app.storage_generation
                     app.start_storage(str(self.data))
                     app.start_storage(str(dependencies))
+                    self.assertEqual(app.storage_generation, generation)
+                    self.assertFalse(app.storage_measuring)
+                    await pilot.pause(.1)
                     self.assertEqual(len(calls),2,'Repeated navigation reloaded existing details')
                 finally: release.set()
+
+    async def test_completed_worker_callbacks_do_not_touch_unmounted_widgets(self):
+        from mactrim.storage import StorageNode
+        app = self.app(initial_tab='storage')
+        node = StorageNode(str(self.data), 'storage', status='measured')
+        # Textual marks the app non-running before removing its widgets.
+        # Queued thread callbacks may still reach it during that shutdown.
+        with patch.object(app, 'query_main', side_effect=AssertionError('Late widget access')):
+            app.storage_update(node, app.storage_generation, True, True)
+            app.storage_error(app.storage_generation, 'Receiver already stopped')
+            app.capacity_update([], app.storage_generation)
+            app.history_captured(None, 'Shutdown')
+        self.assertIsNone(app.storage_inventory)
