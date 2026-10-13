@@ -58,7 +58,7 @@ def aggregates(root):
     for node in selected.values():
         result.append({'path': node.path, 'logical': node.logical, 'allocated': node.allocated,
                        'status': node.status, 'identity': list(node.identity),
-                       'children_complete': node.status == 'measured' and all(child.path in selected for child in node.children if child.kind == 'directory'),
+                       'children_complete': node.status == 'measured' and not getattr(node, 'details_deferred', False) and all(child.path in selected for child in node.children if child.kind == 'directory'),
                        'recent': dict(node.recent)})
     return sorted(result, key=lambda item: item['path'])
 

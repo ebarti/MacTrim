@@ -74,6 +74,9 @@ def main():
         for i in range(16):
             folder = data / ('stable-' + str(i)); folder.mkdir()
             for j in range(100): (folder / str(j)).write_bytes(b'x' * 100)
+        dependency = data / 'node_modules'
+        (dependency / 'package' / 'lib').mkdir(parents=True)
+        (dependency / 'package' / 'lib' / 'payload').write_bytes(b'd' * 8192)
         storage = json.loads(run(['storage', data, '--json', '--max-files', 100, '--max-depth', 8]).stdout)
         assert storage['measurement']['status'] == 'partial'  # explicit 100-entry preview of >1600 files
         config = root / 'scoped.json'
@@ -94,6 +97,17 @@ def main():
         report['event_receiver'] = quiet['refresh']['events']
         assert not quiet['refresh']['warnings'], quiet['refresh']
         assert quiet['logical'] == baseline['logical'] and quiet['allocated'] == baseline['allocated']
+        summary = next(row for row in baseline['children'] if row['name'] == 'node_modules')
+        assert summary['details_deferred'] and summary['logical'] >= 8192
+        index = state / 'storage-cache' / 'index.json.gz'
+        saved_index = index.read_bytes()
+        detail = json.loads(run(['--state', root / 'detail-state', '--config', config,
+                                 'storage', dependency, '--json']).stdout)['measurement']
+        assert not detail['details_deferred'] and detail['children']
+        assert detail['logical'] == summary['logical']
+        assert index.read_bytes() == saved_index
+        report['lazy_dependency_details'] = {'summary_measured': True, 'explicit_details_loaded': True,
+                                              'main_index_preserved': True}
         assert quiet['counters']['visited'] < baseline['counters']['visited']
         first = json.loads(run(prefix + ['history', 'capture', data]).stdout)
         (data / 'growing' / 'data.txt').write_bytes(b'a' * 350)
