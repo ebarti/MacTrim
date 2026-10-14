@@ -41,6 +41,15 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
     diagnostics = {'mode': 'journal', 'replay_attempts': 0, 'recovered_replays': 0}
     accounting_scopes = []
     save_blocker = 'No private state configured' if state is None else 'Directory index disabled in configuration'
+    def refresh_state():
+        return {'mode': mode, 'reason': reason, 'dirty_regions': len(dirty),
+                'warnings': list(warnings), 'events': dict(diagnostics)}
+
+    def annotate(snapshot):
+        snapshot.refresh = refresh_state()
+        if getattr(snapshot, 'view', None) is not None:
+            snapshot.view.refresh = snapshot.refresh
+
     def phase(value):
         check_cancel(cancel)
         if progress and node is not None:
@@ -50,6 +59,7 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
                 selected = find_directory(node, view())
                 if selected is not None and selected is not node:
                     snapshot.view = progress_snapshot(selected, value, node.path)
+            annotate(snapshot)
             snapshot.counters['visited'] = visits
             snapshot.metadata_visits = visits
             progress(snapshot, snapshot)
@@ -123,7 +133,22 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
         if full:
             reason = 'Explicit full reconciliation'
         elif previous and not compatible:
-            reason = 'Index/policy/volume/event continuity or periodic reconciliation requires a full scan'
+            if previous['policy'] != cache_policy:
+                reason = 'Saved index scope or measurement policy changed; full reconciliation required'
+            elif not previous.get('reuse_allowed', True):
+                reason = 'Saved observation has unverified event continuity; full reconciliation required'
+            elif previous['volume'] != identity:
+                old = previous['volume']
+                changed_history = (len(old) > 2 and old[2] is not None and
+                                   (old[2] != identity[2] or (len(old) > 4 and old[4] != identity[4])))
+                reason = ('Filesystem event-history UUID changed; saved checkpoint cannot be replayed, full reconciliation required'
+                          if changed_history else 'Filesystem volume or scope identity changed; full reconciliation required')
+            elif previous['checkpoint'] > now_id:
+                reason = 'Saved checkpoint is ahead of the current event journal; full reconciliation required'
+            elif time.time() - previous['full_at'] >= settings['reconcile_seconds']:
+                reason = 'Periodic full reconciliation is due; replay alone cannot establish a new full baseline'
+            else:
+                reason = 'Saved directory details are absent; full reconciliation required'
         checkpoint = now_id
         if compatible and not full:
             try:
@@ -145,6 +170,7 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
             nonlocal visits
             regions = Regions(regions, cancel)
             def walk_progress(snapshot, current):
+                annotate(snapshot)
                 snapshot.counters['visited'] += visits
                 snapshot.metadata_visits += visits
                 if repair['attempted']:
@@ -253,9 +279,12 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
         reuse_allowed = False
         if node is None:
             mode = 'full'
-            node = complete(path, cancel=cancel, progress=progress, exclusions=excluded)
-            visits = node.counters['visited']
             reason = 'Native event backend unavailable/unsafe; full metadata fallback'
+            def fallback_progress(snapshot, current):
+                annotate(snapshot)
+                progress(snapshot, current)
+            node = complete(path, cancel=cancel, progress=fallback_progress if progress else None, exclusions=excluded)
+            visits = node.counters['visited']
         else:
             # A failed flush/receiver shutdown invalidates tracking, not the
             # completed measurement. Do not restart an hours-long walk here.

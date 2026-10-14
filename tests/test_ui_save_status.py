@@ -60,3 +60,16 @@ class SaveStatusTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.press('escape')
                 self.assertNotIsInstance(app.screen, Coverage)
                 self.assertFalse(app.storage_cancel.is_set())
+
+    async def test_running_scan_displays_full_fallback_reason(self):
+        from mactrim.storage import progress_snapshot
+        node = progress_snapshot(complete(self.data), 'Enumerating metadata', str(self.data))
+        node.refresh = {'mode': 'full', 'reason': 'Filesystem event-history UUID changed; full reconciliation required'}
+        app = self.app(initial_tab='storage')
+        with patch.object(app, 'storage_worker'), patch.object(app, 'history_worker'):
+            async with app.run_test(size=(140, 44)) as pilot:
+                app.storage_update(node, app.storage_generation, False)
+                summary = str(app.query_one('#storage-summary', Static).content)
+                self.assertIn('FULL', summary)
+                self.assertIn('event-history UUID changed', summary)
+                self.assertTrue(app.storage_measuring)

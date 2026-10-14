@@ -59,6 +59,35 @@ class JournalReplayTests(unittest.TestCase):
         self.assertEqual(first.status, 'measured')
         self.assertGreater(quiet.counters['reused'], 0)
 
+    def test_changed_history_reports_full_reason_before_walk_and_never_replays_old_checkpoint(self):
+        self.scan()
+        self.starts.clear()
+        self.event_id = 200
+        updates = []
+        views = []
+        def progress(snapshot, current):
+            updates.append(snapshot.refresh)
+            if getattr(snapshot, 'view', None) is not None:
+                views.append(snapshot.view.refresh)
+        with patch('mactrim.incremental.volume_identity', return_value=[1, 2, 'new-history']):
+            observed = self.scan(progress=progress, view=lambda: self.data / 'hot')
+        self.assertEqual(observed.refresh['mode'], 'full')
+        self.assertEqual(self.starts, [200])
+        self.assertEqual(observed.counters['reused'], 0)
+        self.assertEqual(updates[0]['mode'], 'full')
+        self.assertIn('event-history UUID changed', updates[0]['reason'])
+        self.assertTrue(views)
+        self.assertIn('event-history UUID changed', views[0]['reason'])
+        self.assertTrue(observed.refresh['cache']['reusable'])
+
+    def test_incremental_mode_and_reason_are_visible_during_walk(self):
+        self.scan()
+        updates = []
+        observed = self.scan(progress=lambda snapshot, current: updates.append(snapshot.refresh))
+        self.assertEqual(updates[0]['mode'], 'incremental')
+        self.assertIn('Persistent journal replay', updates[0]['reason'])
+        self.assertGreater(observed.counters['reused'], 0)
+
     def test_fresh_replay_recovers_drop_before_repeating_full_scan(self):
         with patch('mactrim.incremental.complete', wraps=complete) as walker:
             observed = self.scan([(set(), ['UserDropped'], 110), (set(), [], 111)])
