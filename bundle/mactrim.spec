@@ -12,7 +12,7 @@ WIDGETS = ('button', 'content_switcher', 'data_table', 'footer', 'header',
 a = Analysis(
     [str(ROOT / 'bundle' / 'entry.py')],
     pathex=[str(ROOT)],
-    binaries=[],
+    binaries=[(str(ROOT / 'build' / 'native' / 'libmactrim_storage.dylib'), '.')],
     datas=copy_metadata('textual') + copy_metadata('rich'),
     hiddenimports=['mactrim.ui', 'FSEvents', 'CoreFoundation', 'Foundation', 'objc'] + ['textual.widgets._' + name for name in WIDGETS],
     hookspath=[], hooksconfig={}, runtime_hooks=[],

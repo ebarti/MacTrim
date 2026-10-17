@@ -10,10 +10,11 @@ Python 3.9+ and macOS are required for cleanup activity evidence. Textual 8.2.8 
 cd /path/to/MacTrim
 python3 -m venv .venv
 .venv/bin/python -m pip install -e .
+.venv/bin/python scripts/build_native.py
 ./mactrim-launch
 ```
 
-The executable launcher works from a fresh shell and any working directory; it uses this project's `.venv` without changing global packages or shell configuration. The installed environment in this delivery uses Python 3.12. Core CLI/reporting and safety tests also support Python 3.9. `./mactrim-launch --help` lists commands. `python3 -m mactrim` remains available; native UI commands need the project dependencies.
+The source build uses Apple's command-line compiler for the system-FTS size collector. The standalone binary bundles the compiled collector and requires neither Python nor a compiler on the machine running it. Rebuild the collector after editing its C source. The executable launcher uses this project's `.venv` without changing global packages or shell configuration. Core CLI/reporting and safety tests also support Python 3.9. `./mactrim-launch --help` lists commands.
 
 Cleanup, Storage, and History / Growth are separate tabs. Discovery and measurement run in background workers, publish partial results, and support cancellation. Keyboard shortcuts appear in the footer. Cleanup offers search, status filter, sorting, category counts, full evidence/blockers, selected totals, fresh validation, and an exact typed approval dialog. Reports cannot be selected. Storage's chart and sortable list share measured nodes: Enter drills down; Parent, Root, Refresh, logical/allocated mode and breadcrumbs support navigation. Storage discovers ordinary directory levels first and leaves dependency/deep-folder interiors unopened until selected. Full rescan forces a fresh baseline; Refresh uses native filesystem events. Directory/file rows are paged independently of measurement. History retains up to 5000 directory aggregates. Storage and History never grant cleanup authority.
 

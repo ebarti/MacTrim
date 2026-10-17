@@ -14,3 +14,6 @@ mactrim = "mactrim.cli:main"
 
 [tool.setuptools]
 packages = ["mactrim"]
+
+[tool.setuptools.package-data]
+mactrim = ["native/*.c"]
