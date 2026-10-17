@@ -18,6 +18,7 @@ from .regions import check_cancel
 
 PAGE_SIZE = 500
 FRONT_DOORS = {'/Users', '/Applications', '/Library', '/private', '/usr', '/System', '/bin', '/sbin', '/opt'}
+LAZY_DETAILS = frozenset({'node_modules', '.venv', 'venv', '.tox', '.nox', '__pypackages__'})
 
 
 @dataclass
@@ -32,11 +33,12 @@ class StorageNode(Node):
     own_logical: int = 0
     own_allocated: int = 0
     signature: tuple = ()
+    details_deferred: bool = False
 
     def summary(self):
         return dict(super().summary(), collector=self.collector, started_at=self.started_at,
                     completed_at=self.completed_at, refresh=getattr(self, 'refresh', {}), counters=self.counters, exclusions=self.exclusions,
-                    direct_files=self.direct_files, page_size=PAGE_SIZE)
+                    direct_files=self.direct_files, page_size=PAGE_SIZE, details_deferred=self.details_deferred)
 
     def export(self):
         # No recursive per-file JSON tree. Current-directory pages are separate
@@ -90,13 +92,13 @@ def progress_snapshot(root, phase, current_path, totals=None, branches=None, reu
         row.allocated = max(row.allocated, child.own_allocated)
         if branches is not None:
             row.logical, row.allocated, row.entries = branches.get(child.path, (0, 0, 0))
-            if row.status == 'measured' and row.path not in reused:
-                row.status = 'scanning'
+        if row.status == 'measured' and row.path not in reused:
+            row.status = 'scanning'
         snapshot.children.append(row)
     return snapshot
 
 
-def complete(path, cancel=None, progress=None, exclusions=(), reuse=None, view=None):
+def complete(path, cancel=None, progress=None, exclusions=(), reuse=None, view=None, lazy=True):
     """Iterative no-follow full walk; quotas/depth never determine completion.
 
     Each directory is opened from verified ancestors with a captured inode;
@@ -111,11 +113,12 @@ def complete(path, cancel=None, progress=None, exclusions=(), reuse=None, view=N
     records, directory_inodes, links = [], {}, {}
     reused = set()
     reconcile_scopes = set()
-    queue = deque([(root, None, None, None)])
+    queue = deque([(root, None, None, None, None)])
     now, last_progress = time.time(), 0.0
     own_exclusions = tuple(canonical(value) for value in exclusions)
     totals, branches = [0, 0, 0], {}
     current, branch, accounted = None, None, (0, 0, 0)
+    aggregate = None
     selected_view = [None, None]
     def account():
         nonlocal accounted
@@ -125,11 +128,25 @@ def complete(path, cancel=None, progress=None, exclusions=(), reuse=None, view=N
         delta = [value - old for value, old in zip(values, accounted)]
         for index in range(3):
             totals[index] += delta[index]
+        if aggregate is not None and aggregate is not current:
+            aggregate.own_logical += delta[0]
+            aggregate.own_allocated += delta[1]
+            aggregate.entries += delta[2]
         if branch is not None:
             values_by_branch = branches.setdefault(branch.path, [0, 0, 0])
             for index in range(3):
                 values_by_branch[index] += delta[index]
         accounted = values
+    def finish_current():
+        if current is None or aggregate is None or aggregate is current:
+            return
+        aggregate.newest_ns = max(aggregate.newest_ns, current.newest_ns)
+        for key in aggregate.recent:
+            aggregate.recent[key] += current.recent[key]
+        if current.status not in {'measured', 'skipped'}:
+            aggregate.status = 'partial'
+            if len(aggregate.issues) < 16:
+                aggregate.issues.append('%s: %s' % (clean(current.path), '; '.join(current.issues)))
     def notify(node, force=False, phase='Enumerating metadata'):
         nonlocal last_progress
         if progress and (force or time.monotonic() - last_progress >= .15):
@@ -149,9 +166,14 @@ def complete(path, cancel=None, progress=None, exclusions=(), reuse=None, view=N
         root.exclusions[reason] = root.exclusions.get(reason, 0) + 1
     while queue and not cancel.is_set():
         account()
-        node, expected, device, branch = queue.popleft()
+        finish_current()
+        node, expected, device, branch, aggregate = queue.popleft()
+        if aggregate is None and lazy and node is not root and node.name in LAZY_DETAILS:
+            aggregate = node
+            node.details_deferred = True
         current, accounted = node, (0, 0, 0)
-        records.append(node)
+        if aggregate is None or aggregate is node:
+            records.append(node)
         notify(node)
         try:
             with directory_fd(Path(node.path).parent if node.path != '/' else '/') as parent:
@@ -181,10 +203,10 @@ def complete(path, cancel=None, progress=None, exclusions=(), reuse=None, view=N
                     continue
                 if node.identity in directory_inodes:
                     node.alias_of = directory_inodes[node.identity]
-                    reconcile_scopes.update((node.path, node.alias_of))
+                    reconcile_scopes.update((aggregate.path if aggregate else node.path, node.alias_of))
                     excluded(node, 'Already accounted directory/firmlink inode')
                     continue
-                directory_inodes[node.identity] = node.path
+                directory_inodes[node.identity] = aggregate.path if aggregate else node.path
                 if not st.st_mode & 0o444 or not st.st_mode & 0o111:
                     raise PermissionError('Directory metadata inaccessible')
                 fd = os.open(Path(node.path).name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent) if node.path != '/' else os.dup(parent)
@@ -193,10 +215,13 @@ def complete(path, cancel=None, progress=None, exclusions=(), reuse=None, view=N
                 if _signature(initial) != _signature(st):
                     raise SafetyError('Directory changed before enumeration')
                 node.signature = _signature(st)
-                cached = reuse(node, st) if reuse else None
+                cached = reuse(node, st) if reuse and (aggregate is None or aggregate is node) else None
                 if cached is not None:
                     for key in ('logical', 'allocated', 'entries', 'newest_ns', 'direct_files', 'own_logical', 'own_allocated', 'signature', 'recent', 'status', 'issues', 'children', 'kind'):
                         setattr(node, key, getattr(cached, key))
+                    if node.details_deferred:
+                        node.own_logical, node.own_allocated = node.logical, node.allocated
+                        node.children = []
                     reused.add(node.path)
                     root.counters['reused'] += node.entries
                     continue
@@ -218,8 +243,13 @@ def complete(path, cancel=None, progress=None, exclusions=(), reuse=None, view=N
                                 absolute = str(Path(node.path) / entry.name)
                                 child = StorageNode(absolute, entry.name, identity=(child_st.st_dev, child_st.st_ino),
                                                     kind=kind, protected=bool(protected(absolute)), status='scanning')
-                                node.children.append(child)
-                                queue.append((child, child.identity, st.st_dev, child if node is root else branch))
+                                if aggregate is None:
+                                    node.children.append(child)
+                                item = (child, child.identity, st.st_dev, child if node is root else branch, aggregate)
+                                if aggregate is None:
+                                    queue.append(item)
+                                else:
+                                    queue.appendleft(item)
                                 continue
                             node.entries += 1
                             node.direct_files += 1
@@ -230,7 +260,7 @@ def complete(path, cancel=None, progress=None, exclusions=(), reuse=None, view=N
                                 continue
                             identity = (child_st.st_dev, child_st.st_ino)
                             if child_st.st_nlink > 1:
-                                reconcile_scopes.add(node.path)
+                                reconcile_scopes.add(aggregate.path if aggregate else node.path)
                                 if identity in links:
                                     root.counters['excluded'] += 1
                                     root.exclusions['Already accounted hardlink'] = root.exclusions.get('Already accounted hardlink', 0) + 1
@@ -265,6 +295,7 @@ def complete(path, cancel=None, progress=None, exclusions=(), reuse=None, view=N
             root.counters['denied'] += 1
         notify(node)
     account()
+    finish_current()
     notify(current or root, force=True, phase='Aggregating directory totals')
     # Reverse breadth-first order propagates directory totals without recursion.
     for node in reversed(records):
@@ -289,6 +320,21 @@ def complete(path, cancel=None, progress=None, exclusions=(), reuse=None, view=N
         root.issues.append('%s inaccessible/replaced entries; estimates are lower bounds' % root.counters['denied'])
     if root.counters['excluded']:
         root.issues.append('Intentional exclusions: ' + '; '.join('%s (%s)' % (reason, count) for reason, count in root.exclusions.items()))
+    if lazy:
+        # Previously saved detailed trees can donate their sizes without a
+        # new baseline solely to change presentation granularity.
+        pending = list(root.children)
+        while pending:
+            if cancel.is_set():
+                root.status = 'cancelled'
+                break
+            node = pending.pop()
+            if node.name in LAZY_DETAILS:
+                node.details_deferred = True
+                node.own_logical, node.own_allocated = node.logical, node.allocated
+                node.children = []
+            else:
+                pending.extend(node.children)
     return root
 
 
@@ -331,6 +377,8 @@ def page(node, offset=0, limit=PAGE_SIZE):
     Directory aggregates come from the completed inventory. Regular file rows
     are inspected only for the requested page and never determine completion.
     """
+    if getattr(node, 'details_deferred', False):
+        return [], False
     directories = {child.name: child for child in node.children}
     rows, seen, more = [], 0, False
     with directory_fd(node.path) as fd, os.scandir(fd) as stream:

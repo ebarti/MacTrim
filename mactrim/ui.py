@@ -23,7 +23,7 @@ from .measurement import capacities
 from .storage import page, accounting, PAGE_SIZE, find_directory, StorageNode
 from .incremental import inventory
 from .history import History
-from .safety import SafetyError, canonical, clean
+from .safety import SafetyError, canonical, clean, within
 from .scanner import Scanner
 from .tui import details, human
 
@@ -269,6 +269,7 @@ class MacTrimApp(App):
         self.storage_inventory = None
         self.storage_progress = None
         self.storage_scan_path = self.storage_path
+        self.storage_details = {}
         self.storage_has_more = False
         self.render_dirty = False
         self.capacity_rows = []
@@ -564,9 +565,16 @@ class MacTrimApp(App):
 
     def start_storage(self, path, full=False, refresh=False):
         target = str(canonical(path))
+        if not self.storage_measuring and (full or refresh) and self.storage_inventory is not None and target != self.storage_inventory.path and within(target, self.storage_inventory.path):
+            self.start_details(target)
+            return
         if not full and not refresh and (self.storage_measuring or (target != self.storage_path and self.storage_inventory is not None)):
             source = self.storage_progress if self.storage_measuring else self.storage_inventory
             remembered = find_directory(source, target) if source is not None else None
+            if remembered is None and self.storage_measuring and self.storage_node is not None:
+                remembered = find_directory(self.storage_node, target)
+            if remembered is None and (not self.storage_measuring or not within(target, self.storage_scan_path)):
+                remembered = self.observed_directory(target)
             if self.storage_measuring or remembered is not None:
                 self.storage_path, self.storage_offset = target, 0
                 self.storage_node = remembered or StorageNode(target, Path(target).name or '/', kind='directory', status='scanning')
@@ -577,6 +585,8 @@ class MacTrimApp(App):
                 self.query_main('#storage-status', Static).update(
                     'Browsing while scan continues at %s; waiting for observed directory details' % self.storage_scan_path if self.storage_measuring else
                     'Cached observation; Refresh verifies current filesystem events')
+                if not self.storage_measuring and self.storage_node.details_deferred:
+                    self.start_details(target)
                 return
         self.storage_cancel.set()
         self.storage_cancel = threading.Event()
@@ -584,6 +594,7 @@ class MacTrimApp(App):
         self.storage_path = str(canonical(path))
         self.storage_scan_path = self.storage_path
         self.storage_progress = None
+        self.storage_details.clear()
         self.storage_node = None
         self.storage_offset = 0
         self.storage_page_rows = []
@@ -591,6 +602,35 @@ class MacTrimApp(App):
         self.query_main('#breadcrumbs', Static).update(Text(self.storage_path, style='bold #67e8f9'))
         self.query_main('#storage-status', Static).update('Measuring metadata in background… totals are lower bounds')
         self.storage_worker(self.storage_path, self.storage_cancel, self.storage_generation, dict(self.config), full)
+
+    def observed_directory(self, target):
+        for root in sorted(self.storage_details.values(), key=lambda node: len(node.path), reverse=True):
+            node = find_directory(root, target)
+            if node is not None:
+                return node
+        return find_directory(self.storage_inventory, target) if self.storage_inventory is not None else None
+
+    def start_details(self, target):
+        self.storage_generation += 1
+        self.storage_cancel = threading.Event()
+        self.storage_path = self.storage_scan_path = target
+        self.storage_measuring = True
+        self.query_main('#storage-status', Static).update('Loading directory details; main index preserved')
+        self.details_worker(target, self.storage_cancel, self.storage_generation, dict(self.config))
+
+    @work(thread=True, group='storage-details', exclusive=True)
+    def details_worker(self, path, cancel, generation, config):
+        def progress(node, current):
+            if not cancel.is_set():
+                self.call_from_thread(self.storage_update, node, generation, False, True)
+        progress.view = lambda: self.storage_path
+        try:
+            # Details are an independent observation, never a replacement for
+            # the completed whole-scope index or its History baseline.
+            node = inventory(path, None, config, cancel=cancel, progress=progress)
+            self.call_from_thread(self.storage_update, node, generation, True, True)
+        except Exception as exc:
+            self.call_from_thread(self.storage_error, generation, clean(exc))
 
     @work(thread=True, group='storage', exclusive=True)
     def storage_worker(self, path, cancel, generation, config, full=False):
@@ -635,7 +675,7 @@ class MacTrimApp(App):
             self.storage_measuring = False
             self.query_main('#storage-status', Static).update(Text('Measurement failed: ' + error))
 
-    def storage_update(self, node, generation, done):
+    def storage_update(self, node, generation, done, detail=False):
         if generation != self.storage_generation:
             return
         self.storage_progress = node
@@ -644,21 +684,29 @@ class MacTrimApp(App):
             selected = None
         if selected is None and node.path == self.storage_path:
             selected = node
+        if selected is None:
+            selected = self.observed_directory(self.storage_path)
         self.storage_node = selected or StorageNode(self.storage_path, Path(self.storage_path).name or '/', kind='directory', status='scanning' if not done else 'unknown')
         if done:
             self.storage_measuring = False
-            self.storage_inventory = node
+            if detail:
+                if node.status != 'cancelled':
+                    self.storage_details[node.path] = node
+            else:
+                self.storage_inventory = node
             self.load_storage_page()
         self.refresh_storage()
         status = '%s · %s metadata visits · %s' % (node.status.upper(), getattr(node, 'counters', {}).get('visited', node.entries), '; '.join(node.issues[:2]) if done else ('%s · %s' % (getattr(node, 'progress', {}).get('phase', 'Measuring'), clean(getattr(node, 'progress', {}).get('path', node.path)))))
         if done and node.status == 'cancelled':
             status += ' · Storage stopped; Refresh starts another scan. Previous saved index preserved.'
         elif done:
-            status = 'Scan finished (%s) · %s\n%s metadata visits · %s' % (node.status.upper(), index_save_status(node), getattr(node, 'counters', {}).get('visited', node.entries), '; '.join(node.issues[:2]))
+            status = 'Scan finished (%s) · %s\n%s metadata visits · %s' % (node.status.upper(), 'Details loaded; main index preserved' if detail else index_save_status(node), getattr(node, 'counters', {}).get('visited', node.entries), '; '.join(node.issues[:2]))
             report = getattr(node, 'refresh', {}).get('coverage')
             if report and not report['complete']:
                 status += ' · Coverage shows exact blockers'
         self.query_main('#storage-status', Static).update(Text(status, style=STATUS_COLOR.get(node.status, '#fbbf24')))
+        if done and not detail and node.status != 'cancelled' and self.storage_node.details_deferred:
+            self.start_details(self.storage_path)
 
     def refresh_storage(self):
         if self.storage_node is None:
@@ -676,7 +724,7 @@ class MacTrimApp(App):
             total = (root_accounting['filesystem_used_denominator'] if node.path == '/' and metric == 'allocated' else None) or getattr(node, metric)
             graph_rows = sorted(node.children, key=lambda row: -getattr(row, metric))[:15]
             for index, child in enumerate(self.storage_nodes):
-                table.add_row(Text(child.status.upper(), style=STATUS_COLOR.get(child.status, '#94a3b8')), human(getattr(child, metric)), Text(clean(child.name) + ('/' if child.kind == 'directory' else '')), key=child.path)
+                table.add_row(Text(child.status.upper() + (' · LAZY' if getattr(child, 'details_deferred', False) else ''), style=STATUS_COLOR.get(child.status, '#94a3b8')), human(getattr(child, metric)), Text(clean(child.name) + ('/' if child.kind == 'directory' else '')), key=child.path)
             for index, child in enumerate(graph_rows):
                 fraction = getattr(child, metric) / total if total else 0
                 bar = '━' * round(fraction * 24)
@@ -721,6 +769,8 @@ class MacTrimApp(App):
         if self.storage_measuring:
             refresh_note += ' · live rows: first %s immediate directories; totals include all observations' % PAGE_SIZE
             refresh_note += ' · scan root: ' + self.storage_scan_path
+        if getattr(node, 'details_deferred', False):
+            refresh_note += ' · size measured; details deferred until opened (queued while current scan runs)'
         lifecycle = ('CANCELLING; observed lower bounds' if self.storage_cancel.is_set() else 'SCANNING; observed lower bounds') if self.storage_measuring else node.status.upper()
         self.query_main('#storage-summary', Static).update(Text('%s %s · %s · page %s%s\nGraph: top 15 directories / filesystem used at root (allocated), otherwise scope estimate; partial scope totals are lower bounds. Inaccessible scopes are unknown. Full rescan has no entry/depth cap.' % (human(getattr(node, metric)), metric, lifecycle, self.storage_offset // PAGE_SIZE + 1, note) + '\n' + refresh_note))
 
@@ -752,7 +802,7 @@ class MacTrimApp(App):
     def storage_selected(self, path):
         node = next((node for node in self.storage_nodes if node.path == path), None)
         if node:
-            self.query_main('#storage-detail', Static).update(Text('%s\n%s logical · %s allocated · %s · %s\n%s' % (clean(node.path), human(node.logical), human(node.allocated), node.status.upper(), 'protected: read-only' if node.protected else 'read-only metadata', '; '.join(node.issues) or 'No content read')))
+            self.query_main('#storage-detail', Static).update(Text('%s\n%s logical · %s allocated · %s · %s\n%s' % (clean(node.path), human(node.logical), human(node.allocated), node.status.upper(), 'protected: read-only' if node.protected else 'read-only metadata', ('Size measured; details load when opened. ' if getattr(node, 'details_deferred', False) else '') + ('; '.join(node.issues) or 'No content read'))))
         return node
 
     @on(DataTable.RowHighlighted, '#storage-table')

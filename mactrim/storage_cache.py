@@ -15,11 +15,12 @@ from .regions import check_cancel
 
 MAX_DECODED = 64 * 1024 * 1024
 SCHEMA = 'mactrim.storage-cache.v1'
-MAGIC = b'MACTRIM-INDEX-2\n'
+MAGIC_V2 = b'MACTRIM-INDEX-2\n'
+MAGIC = b'MACTRIM-INDEX-3\n'
 AUTH_BYTES = 65  # SHA-256 hex digest plus newline
 FIELDS = ('logical', 'allocated', 'own_logical', 'own_allocated', 'entries',
           'direct_files', 'newest_ns', 'status', 'kind', 'protected', 'issues',
-          'alias_of', 'recent', 'identity', 'signature')
+          'alias_of', 'recent', 'identity', 'signature', 'details_deferred')
 
 
 class BudgetExceeded(Exception):
@@ -72,6 +73,9 @@ def flatten(root, cancel=None):
 def node_from_row(row, scope, nodes):
     if not isinstance(row, dict):
         raise SafetyError('Invalid cached directory object')
+    row = dict(row, details_deferred=row.get('details_deferred', False))
+    if type(row['details_deferred']) is not bool:
+        raise SafetyError('Invalid deferred directory detail flag')
     path = row.get('path')
     if not isinstance(path, str) or str(canonical(path)) != path or not within(path, scope) or path in nodes:
         raise SafetyError('Escaped/duplicate cached directory')
@@ -174,9 +178,9 @@ class Cache:
                     raise SafetyError('Cache replaced before read')
                 with os.fdopen(os.dup(file_fd), 'rb') as stream:
                     prefix = stream.read(len(MAGIC))
-                    if prefix == MAGIC:
+                    if prefix in {MAGIC, MAGIC_V2}:
                         signature = stream.read(AUTH_BYTES)
-                        auth = hmac.new(self.state.key, MAGIC, hashlib.sha256)
+                        auth = hmac.new(self.state.key, prefix, hashlib.sha256)
                         while chunk := stream.read(1024 * 1024):
                             check_cancel(cancel)
                             auth.update(chunk)
@@ -190,10 +194,11 @@ class Cache:
                             if not body['complete_index']:
                                 raise SafetyError('Invalid compact index completeness')
                             nodes, ordered = {}, []
+                            fields = FIELDS if prefix == MAGIC else FIELDS[:-1]
                             for line in decoded if details else ():
                                 check_cancel(cancel)
                                 record = json.loads(line)
-                                if not isinstance(record, list) or len(record) != len(FIELDS) + 2:
+                                if not isinstance(record, list) or len(record) != len(fields) + 2:
                                     raise SafetyError('Invalid compact directory record')
                                 parent, name = record[:2]
                                 if type(parent) is not int or not isinstance(name, str):
@@ -206,7 +211,7 @@ class Cache:
                                     if not 0 <= parent < len(ordered) or name in {'', '.', '..'} or '/' in name or '\x00' in name:
                                         raise SafetyError('Invalid directory tree link')
                                     path = str(Path(ordered[parent].path) / name)
-                                row = dict(zip(FIELDS, record[2:]), path=path, name=name)
+                                row = dict(zip(fields, record[2:]), path=path, name=name)
                                 node = node_from_row(row, body['scope'], nodes)
                                 if ordered:
                                     ordered[parent].children.append(node)
