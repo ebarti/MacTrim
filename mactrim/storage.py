@@ -8,6 +8,7 @@ from copy import copy
 from dataclasses import dataclass, field
 import os
 import errno
+import heapq
 from pathlib import Path
 import stat
 import sys
@@ -56,7 +57,7 @@ class StorageNode(Node):
         # from the complete totals; omission never stops filesystem traversal.
         return dict(self.summary(), path=self.path, name=self.name, protected=self.protected,
                     children=[dict(child.summary(), path=child.path, name=child.name, protected=child.protected)
-                              for child in self.children[:PAGE_SIZE]],
+                              for child in directory_page(self)[0]],
                     presentation={'limit': PAGE_SIZE, 'directory_rows': len(self.children),
                                   'file_rows_available': self.direct_files,
                                   'note': 'All descendant bytes are measured; collapsed directory details load on demand'})
@@ -79,7 +80,7 @@ def find_directory(root, path):
     return node
 
 
-def progress_snapshot(root, phase, current_path, totals=None, branches=None, reused=()):
+def progress_snapshot(root, phase, current_path, totals=None, branches=None, reused=(), completed=None):
     """Stable, shallow UI observation. Unfinished directory totals are lower bounds."""
     snapshot = copy(root)
     snapshot.__dict__.pop('_scan_parent', None)
@@ -96,7 +97,7 @@ def progress_snapshot(root, phase, current_path, totals=None, branches=None, reu
         snapshot.allocated = max(root.allocated, root.own_allocated + sum(child.allocated for child in root.children))
     # Presentation must not make every progress tick copy an unbounded tree.
     # Totals above still include every observed directory and file.
-    for child in root.children[:PAGE_SIZE]:
+    for child in heapq.nsmallest(PAGE_SIZE, root.children, key=storage_order()):
         row = copy(child)
         row.__dict__.pop('_scan_parent', None)
         row.issues = list(child.issues)
@@ -105,7 +106,7 @@ def progress_snapshot(root, phase, current_path, totals=None, branches=None, reu
         row.allocated = max(row.allocated, child.own_allocated)
         if branches is not None:
             row.logical, row.allocated, row.entries = branches.get(child.path, (0, 0, 0))
-        if row.status == 'measured' and row.path not in reused:
+        if row.status == 'measured' and row.path not in reused and not (completed and completed(row.path)):
             row.status = 'scanning'
         snapshot.children.append(row)
     return snapshot
@@ -382,9 +383,8 @@ def complete(path, cancel=None, progress=None, exclusions=(), reuse=None, view=N
             cursor = cursor.parent
 
     def snapshot(scope):
-        done = {child.path for child in scope.children[:PAGE_SIZE] if is_finished(child.path)}
         row = progress_snapshot(scope, 'Native size scan', current.path,
-                                (scope.logical, scope.allocated, scope.entries), reused=done)
+                                (scope.logical, scope.allocated, scope.entries), completed=is_finished)
         row.progress.update(traversal='native', scope_finished=is_finished(scope.path))
         if is_finished(scope.path):
             row.status = scope.status
@@ -547,39 +547,70 @@ def coverage_report(root, limit=8, cancel=None):
                     'Permission failures need access granted by macOS; active writers can leave interval uncertainty.'}
 
 
-def page(node, offset=0, limit=PAGE_SIZE):
-    """Bounded current-directory display; fresh file metadata has its own interval.
+def storage_order(metric='allocated', order='size'):
+    """One stable global ordering for lists and bounded page selection."""
+    if metric not in {'allocated', 'logical'} or order not in {'size', 'name'}:
+        raise ValueError('Unknown Storage ordering')
+    return (lambda row: (-getattr(row, metric), row.name, row.path)) if order == 'size' else (lambda row: (row.name, row.path))
 
-    Directory aggregates come from the completed inventory. Regular file rows
-    are inspected only for the requested page and never determine completion.
+
+def directory_page(node, offset=0, limit=PAGE_SIZE, metric='allocated', order='size'):
+    """Immediate cached folder rows, globally ordered before taking a page."""
+    ranked = heapq.nsmallest(offset + limit + 1, node.children, key=storage_order(metric, order))
+    return ranked[offset:offset + limit], len(ranked) > offset + limit
+
+
+def _immediate_rows(node, cancel=None):
+    # Directory totals belong to the saved observation. File rows are fresh
+    # immediate metadata, never recursive scans or additive accounting totals.
+    directories = {child.name for child in node.children}
+    for child in node.children:
+        check_cancel(cancel)
+        yield child
+    with directory_fd(node.path) as fd, os.scandir(fd) as stream:
+        for entry in stream:
+            check_cancel(cancel)
+            if entry.name in directories:
+                continue
+            path = str(Path(node.path) / entry.name)
+            try:
+                st = os.stat(entry.name, dir_fd=fd, follow_symlinks=False)
+            except OSError as exc:
+                yield Node(path, entry.name, status='denied', issues=[clean(exc)])
+                continue
+            is_directory = stat.S_ISDIR(st.st_mode)
+            yield Node(path, entry.name, logical=0 if is_directory else st.st_size,
+                       allocated=0 if is_directory else st.st_blocks * 512,
+                       status='unknown' if is_directory else 'measured',
+                       kind='directory' if is_directory else 'file' if stat.S_ISREG(st.st_mode) else
+                            'symlink' if stat.S_ISLNK(st.st_mode) else 'special',
+                       issues=['Directory absent from saved observation; open to measure' if is_directory else
+                               'Current listing metadata; file rows are not additive accounting totals'])
+
+
+def page(node, offset=0, limit=PAGE_SIZE, metric='allocated', order='size', cancel=None):
+    """Globally rank immediate entries, then page; O(N log K), O(D + K).
+
+    K is offset + limit + 1; D is the cached immediate-directory name index.
+    File records stream through a bounded heap, with no per-file persisted
+    inventory. This metadata operation belongs in a UI background worker.
     """
     if getattr(node, 'details_deferred', False):
         return [], False
-    directories = {child.name: child for child in node.children}
-    rows, seen, more = [], 0, False
-    with directory_fd(node.path) as fd, os.scandir(fd) as stream:
-        for entry in stream:
-            if seen < offset:
-                seen += 1
-                continue
-            if len(rows) >= limit:
-                more = True
-                break
-            if entry.name in directories:
-                rows.append(directories[entry.name])
-            else:
-                try:
-                    st = os.stat(entry.name, dir_fd=fd, follow_symlinks=False)
-                except OSError as exc:
-                    rows.append(Node(str(Path(node.path) / entry.name), entry.name, status='denied', issues=[clean(exc)]))
-                    seen += 1
-                    continue
-                rows.append(Node(str(Path(node.path) / entry.name), entry.name, logical=st.st_size,
-                                 allocated=st.st_blocks * 512, status='measured',
-                                 kind='file' if stat.S_ISREG(st.st_mode) else 'symlink' if stat.S_ISLNK(st.st_mode) else 'special',
-                                 issues=['Current page metadata; file rows are not additive accounting totals']))
-            seen += 1
-    return rows, more
+    if offset < 0 or limit < 1:
+        raise ValueError('Invalid Storage page bounds')
+    ranked = heapq.nsmallest(offset + limit + 1, _immediate_rows(node, cancel), key=storage_order(metric, order))
+    return ranked[offset:offset + limit], len(ranked) > offset + limit
+
+
+def page_offset(node, target, metric='allocated', order='size', cancel=None):
+    """Locate a graph directory in the same global order as file/list rows."""
+    selected = next((child for child in node.children if child.path == target), None)
+    if selected is None:
+        return 0
+    key = storage_order(metric, order)
+    rank = sum(key(row) < key(selected) for row in _immediate_rows(node, cancel))
+    return rank // PAGE_SIZE * PAGE_SIZE
 
 
 def accounting(node, capacity_rows):

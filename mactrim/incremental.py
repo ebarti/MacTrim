@@ -53,12 +53,12 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
     def phase(value):
         check_cancel(cancel)
         if progress and node is not None:
-            snapshot = progress_snapshot(node, value, node.path, reused={child.path for child in node.children[:500]})
+            snapshot = progress_snapshot(node, value, node.path, completed=lambda _: True)
             if view:
                 from .storage import find_directory
                 selected = find_directory(node, view())
                 if selected is not None and selected is not node:
-                    snapshot.view = progress_snapshot(selected, value, node.path, reused={child.path for child in selected.children[:500]})
+                    snapshot.view = progress_snapshot(selected, value, node.path, completed=lambda _: True)
             annotate(snapshot)
             snapshot.counters['visited'] = visits
             snapshot.metadata_visits = visits
