@@ -37,9 +37,9 @@ def parser():
     children.add_parser("tui", help="Open Cleanup and Storage tabs; background read-only discovery")
     storage = children.add_parser("storage", help="Metadata-only root storage explorer; no cleanup authority")
     storage.add_argument("path", nargs="?", default="/", type=Path)
-    storage.add_argument("--json", action="store_true", help="Print bounded metadata dataset without a terminal")
-    storage.add_argument("--max-files", type=int, default=50000, help="Metadata entries per root subtree (default 50000; max 1000000)")
-    storage.add_argument("--max-depth", type=int, default=16)
+    storage.add_argument("--json", action="store_true", help="Print complete metadata totals without a terminal")
+    storage.add_argument("--max-files", type=int, help="Opt into bounded preview; never used by default Storage")
+    storage.add_argument("--max-depth", type=int, help="Opt into bounded preview depth")
     history = children.add_parser("history", help="Tiny local directory history; capture/list/compare/clear")
     history_sub = history.add_subparsers(dest="history_action", required=True)
     capture = history_sub.add_parser("capture", help="One metadata walk; directory-only compressed snapshot")
@@ -160,19 +160,28 @@ def main(argv=None):
             return 0
         if arguments.command == "storage" and arguments.json:
             from .measurement import measure, capacities
-            if not 1 <= arguments.max_files <= 1000000 or not 1 <= arguments.max_depth <= 64:
-                raise SafetyError("Storage bounds must be positive (files <= 1000000; depth <= 64)")
-            node = measure(arguments.path, arguments.max_files, arguments.max_depth, storage=True,
-                           independent_children=canonical(arguments.path) == Path("/"))
-            output_json({"measurement": node.export(), "filesystems": capacities("/"), "note": "Metadata only; incomplete totals are lower bounds; no deletion rights"})
+            from .storage import complete, accounting
+            preview = arguments.max_files is not None or arguments.max_depth is not None
+            if preview:
+                files, depth = arguments.max_files or 50000, arguments.max_depth or 16
+                if not 1 <= files <= 1000000 or not 1 <= depth <= 64:
+                    raise SafetyError("Preview bounds must be positive (files <= 1000000; depth <= 64)")
+                node = measure(arguments.path, files, depth, storage=True,
+                               independent_children=canonical(arguments.path) == Path("/"))
+            else:
+                node = complete(arguments.path)
+            capacity = capacities('/')
+            output_json({"measurement": node.export(), "filesystems": capacity,
+                         "accounting": accounting(node, capacity), "preview": preview,
+                         "note": "Metadata only; denied scopes remain unknown; no deletion rights"})
             return 0
         # Reject a non-TTY TUI before scanning or creating state.
         if (getattr(arguments, "tui", False) or arguments.command in {"tui", "storage"}) and (not sys.stdin.isatty() or not sys.stdout.isatty()):
             raise SafetyError("TUI requires an interactive terminal. Use textual review --details or scan --output.")
         if arguments.command == "storage":
             config = read_config(arguments.config, arguments.state, validate_now=False)
-            config["storage_max_files"] = arguments.max_files
-            config["storage_max_depth"] = arguments.max_depth
+            if arguments.max_files is not None or arguments.max_depth is not None:
+                raise SafetyError("Bounded preview is available with storage --json; interactive Storage is complete")
             config = validate(config, arguments.state)
             return review(None, State(arguments.state).prepare(), config=config, storage_root=arguments.path, initial_tab="storage")
         state = State(arguments.state).prepare()
@@ -187,8 +196,12 @@ def main(argv=None):
             config = validate(config, state.path)
             history = History(state, config)
             if arguments.history_action == "capture":
-                node = measure(arguments.path, config['storage_max_files'], config['storage_max_depth'], storage=True,
-                               independent_children=canonical(arguments.path) == Path('/'))
+                if arguments.max_files is not None or arguments.max_depth is not None:
+                    node = measure(arguments.path, config['storage_max_files'], config['storage_max_depth'], storage=True,
+                                   independent_children=canonical(arguments.path) == Path('/'))
+                else:
+                    from .storage import complete
+                    node = complete(arguments.path)
                 output_json(history.capture(node, capacities('/')))
             elif arguments.history_action == "list":
                 output_json(history.list())

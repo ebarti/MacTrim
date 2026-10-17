@@ -118,3 +118,12 @@ The delivered configuration targets Apple Silicon arm64. Intel or universal buil
 The native build measured about 14 MiB for the executable and 19 MiB during extraction; repeated `--version` launches took roughly 0.3–0.7 seconds on the build Mac. These observations vary with hardware and filesystem caches. Run the disposable outside-repository checks with `.venv/bin/python scripts/verify_binary.py dist/mactrim --report evidence/binary-smoke.json`. The harness removes only its owned fixtures, executes the binary with no Python on PATH, poisons Python environment paths, opens the real three-tab terminal UI, and records real activity refusals without replacing the production activity provider.
 
 The onefile parent repeats scanner arguments. MacTrim excludes only that argv evidence after proving a direct parent in fresh same-user process inventories, identical full scanner arguments, and both executable descriptors matching the running binary's device/inode. Actual cwd/open/executable paths, interpreter scope, unrelated processes and incomplete coverage still block actions; missing proof keeps the conservative blocker.
+
+
+### Complete Storage inventory
+
+Storage now measures every accessible entry under its metadata-only traversal policy, without a file-count or depth cutoff. The graph uses filesystem-used bytes at `/` for allocated percentages; directory sums and the signed accounting difference remain estimates because APFS clones, snapshots and inaccessible regions differ from namespace totals. Denied regions show explicit reasons; intentional symlink, cloud placeholder, alias and mount exclusions do not falsely mark the parent incomplete.
+
+The list shows pages of 500 immediate entries. Paging limits presentation, never measurement. The complete collector retains directories rather than a node for every file. `mactrim storage / --json` is complete by default; explicit `--max-files` / `--max-depth` opt into the legacy bounded JSON preview. Those legacy config values continue to govern previews only. Cleanup retains its separate discovery/evidence budgets and approval protocol.
+
+History uses a new complete measurement policy. Existing sampled snapshots are preserved and cannot be used to assert growth against complete observations. Full rescan has no quota controls; Cancel leaves unvisited regions unknown.
