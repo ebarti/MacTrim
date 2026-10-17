@@ -99,7 +99,8 @@ class GapSavingTests(unittest.TestCase):
     def test_loss_during_walk_saves_observation_without_reusing_it(self):
         initial = self.scan()
         before = self.cache()[0]['created_at']
-        observed = self.scan([(set(), [], 100), (set(), ['live drop'], 100)], full=True)
+        observed = self.scan([(set(), [], 100), (set(), ['live drop'], 100),
+                              (set(), ['repeated drop'], 100)], full=True)
         self.assertEqual(observed.status, 'partial')
         self.assertTrue(observed.refresh['cache']['stored'])
         self.assertFalse(observed.refresh['cache']['reusable'])
