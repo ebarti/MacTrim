@@ -75,6 +75,7 @@ def main():
     actual = {normalize(name): version for name, version in installed.items()}
     if actual != expected:
         parser.error('Isolated build environment contains unexpected or mismatched packages; inspect build/binary-venv')
+    run([args.python, ROOT / 'scripts' / 'build_native.py'], env)
     with tempfile.TemporaryDirectory(prefix='binary-output-', dir=build) as directory:
         output = Path(directory)
         run([python, '-I', '-m', 'PyInstaller', '--clean', '--noconfirm', '--distpath', output, '--workpath', build / 'binary-work', SPEC], env)
@@ -91,6 +92,7 @@ def main():
                   'lock_sha256': sha(LOCK), 'spec_sha256': sha(SPEC),
                   'artifact_sha256': sha(artifact), 'artifact_bytes': st.st_size,
                   'artifact_allocated_bytes': st.st_blocks * 512,
+                  'native_source_sha256': sha(ROOT / 'mactrim' / 'native' / 'storage.c'),
                   'signing': 'ad-hoc; not Apple Developer signed or notarized',
                   'dependencies': actual}
         destination = ROOT / 'dist'
