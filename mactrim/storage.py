@@ -19,6 +19,12 @@ from .regions import check_cancel
 PAGE_SIZE = 500
 FRONT_DOORS = {'/Users', '/Applications', '/Library', '/private', '/usr', '/System', '/bin', '/sbin', '/opt'}
 LAZY_DETAILS = frozenset({'node_modules', '.venv', 'venv', '.tox', '.nox', '__pypackages__'})
+LAZY_DEPTH = 8
+
+
+def _defer_details(node, scope):
+    return node.path != str(scope) and (node.name in LAZY_DETAILS or
+            len(Path(node.path).relative_to(scope).parts) > LAZY_DEPTH)
 
 
 @dataclass
@@ -168,7 +174,7 @@ def complete(path, cancel=None, progress=None, exclusions=(), reuse=None, view=N
         account()
         finish_current()
         node, expected, device, branch, aggregate = queue.popleft()
-        if aggregate is None and lazy and node is not root and node.name in LAZY_DETAILS:
+        if aggregate is None and lazy and _defer_details(node, path):
             aggregate = node
             node.details_deferred = True
         current, accounted = node, (0, 0, 0)
@@ -329,7 +335,7 @@ def complete(path, cancel=None, progress=None, exclusions=(), reuse=None, view=N
                 root.status = 'cancelled'
                 break
             node = pending.pop()
-            if node.name in LAZY_DETAILS:
+            if _defer_details(node, path):
                 node.details_deferred = True
                 node.own_logical, node.own_allocated = node.logical, node.allocated
                 node.children = []

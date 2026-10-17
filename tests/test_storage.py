@@ -19,7 +19,7 @@ class CompleteStorageTests(unittest.TestCase):
                 deep /= 'd'
                 deep.mkdir()
             (deep / 'payload').write_bytes(b'x' * 8192)
-            result = complete(root)
+            result = complete(root, lazy=False)
             self.assertEqual(result.status, 'measured', result.issues)
             self.assertGreater(result.entries, 50000)
             self.assertEqual(len(result.children), 1)

@@ -570,7 +570,10 @@ class MacTrimApp(App):
             return
         if not full and not refresh and (self.storage_measuring or (target != self.storage_path and self.storage_inventory is not None)):
             source = self.storage_progress if self.storage_measuring else self.storage_inventory
-            remembered = find_directory(source, target) if source is not None else None
+            if self.storage_measuring:
+                remembered = find_directory(source, target) if source is not None else None
+            else:
+                remembered = self.observed_directory(target)
             if remembered is None and self.storage_measuring and self.storage_node is not None:
                 remembered = find_directory(self.storage_node, target)
             if remembered is None and (not self.storage_measuring or not within(target, self.storage_scan_path)):
@@ -630,7 +633,8 @@ class MacTrimApp(App):
             node = inventory(path, None, config, cancel=cancel, progress=progress)
             self.call_from_thread(self.storage_update, node, generation, True, True)
         except Exception as exc:
-            self.call_from_thread(self.storage_error, generation, clean(exc))
+            if self.is_running:
+                self.call_from_thread(self.storage_error, generation, clean(exc))
 
     @work(thread=True, group='storage', exclusive=True)
     def storage_worker(self, path, cancel, generation, config, full=False):
@@ -655,9 +659,12 @@ class MacTrimApp(App):
                 except Exception as exc:
                     self.call_from_thread(self.history_captured, None, clean(exc))
         except Exception as exc:
-            self.call_from_thread(self.storage_error, generation, clean(exc))
+            if self.is_running:
+                self.call_from_thread(self.storage_error, generation, clean(exc))
 
     def capacity_update(self, rows, generation=None):
+        if not self.is_running:
+            return
         if generation is not None and generation != self.storage_generation:
             return
         self.capacity_rows = rows
@@ -671,12 +678,12 @@ class MacTrimApp(App):
         self.query_main('#capacity', Static).update(text)
 
     def storage_error(self, generation, error):
-        if generation == self.storage_generation:
+        if self.is_running and generation == self.storage_generation:
             self.storage_measuring = False
             self.query_main('#storage-status', Static).update(Text('Measurement failed: ' + error))
 
     def storage_update(self, node, generation, done, detail=False):
-        if generation != self.storage_generation:
+        if not self.is_running or generation != self.storage_generation:
             return
         self.storage_progress = node
         selected = (getattr(node, 'view', None) if not done else find_directory(node, self.storage_path))
@@ -1010,6 +1017,8 @@ class MacTrimApp(App):
         self.refresh_history()
 
     def history_captured(self, result, error):
+        if not self.is_running:
+            return
         if error:
             self.query_main('#history-status', Static).update(Text('History capture unavailable: ' + error + ' · browser remains usable'))
         else:
