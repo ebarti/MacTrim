@@ -30,6 +30,23 @@ def signed_size(value):
     return ('−' if value < 0 else '+') + human(abs(value))
 
 
+def highlighted_path(table):
+    if table.row_count:
+        return str(table.coordinate_to_cell_key(Coordinate(table.cursor_row, 0)).row_key.value)
+    return None
+
+
+def highlight_chart(chart, path):
+    # Synchronizing a widget is presentation, not another navigation event.
+    with chart.prevent(OptionList.OptionHighlighted):
+        chart.highlighted = next((index for index, option in enumerate(chart.options) if option.id == path), None)
+
+
+def current_chart_event(event):
+    chart = event.control
+    return chart.highlighted is not None and chart.get_option_at_index(chart.highlighted) is event.option
+
+
 PALETTE = ('#67e8f9', '#a78bfa', '#fbbf24', '#34d399', '#fb7185', '#93c5fd')
 STATUS_COLOR = {'measured': '#34d399', 'partial': '#fbbf24', 'denied': '#fb7185',
                 'skipped': '#94a3b8', 'unknown': '#94a3b8', 'cancelled': '#fbbf24', 'scanning': '#67e8f9'}
@@ -522,24 +539,29 @@ class MacTrimApp(App):
         node = self.storage_node
         self.storage_nodes = sorted(list(self.storage_page_rows if not self.storage_measuring else node.children[:PAGE_SIZE]), key=(lambda row: (-getattr(row, metric), row.name)) if self.storage_sort == 'size' else lambda row: row.name)
         table = self.query_one('#storage-table', DataTable)
-        old_index = table.cursor_row
-        table.clear()
+        old_index, old_path = table.cursor_row, highlighted_path(table)
         chart = self.query_one('#chart', OptionList)
-        chart.clear_options()
-        root_accounting = accounting(node, self.capacity_rows)
-        total = (root_accounting['filesystem_used_denominator'] if node.path == '/' and metric == 'allocated' else None) or getattr(node, metric)
-        graph_rows = sorted(node.children, key=lambda row: -getattr(row, metric))[:15]
-        for index, child in enumerate(self.storage_nodes):
-            table.add_row(Text(child.status.upper(), style=STATUS_COLOR.get(child.status, '#94a3b8')), human(getattr(child, metric)), Text(clean(child.name) + ('/' if child.kind == 'directory' else '')), key=child.path)
-        for index, child in enumerate(graph_rows):
-            fraction = getattr(child, metric) / total if total else 0
-            bar = '━' * round(fraction * 24)
-            text = Text('%2d  ' % (index + 1))
-            text.append(bar.ljust(24), style=PALETTE[index % len(PALETTE)])
-            text.append(' %5.1f%%  %s\n    %s · %s' % (fraction * 100, clean(child.name), human(getattr(child, metric)), child.status.upper()))
-            chart.add_option(Option(text, id=child.path))
+        with table.prevent(DataTable.RowHighlighted), chart.prevent(OptionList.OptionHighlighted):
+            table.clear()
+            chart.clear_options()
+            root_accounting = accounting(node, self.capacity_rows)
+            total = (root_accounting['filesystem_used_denominator'] if node.path == '/' and metric == 'allocated' else None) or getattr(node, metric)
+            graph_rows = sorted(node.children, key=lambda row: -getattr(row, metric))[:15]
+            for index, child in enumerate(self.storage_nodes):
+                table.add_row(Text(child.status.upper(), style=STATUS_COLOR.get(child.status, '#94a3b8')), human(getattr(child, metric)), Text(clean(child.name) + ('/' if child.kind == 'directory' else '')), key=child.path)
+            for index, child in enumerate(graph_rows):
+                fraction = getattr(child, metric) / total if total else 0
+                bar = '━' * round(fraction * 24)
+                text = Text('%2d  ' % (index + 1))
+                text.append(bar.ljust(24), style=PALETTE[index % len(PALETTE)])
+                text.append(' %5.1f%%  %s\n    %s · %s' % (fraction * 100, clean(child.name), human(getattr(child, metric)), child.status.upper()))
+                chart.add_option(Option(text, id=child.path))
+            if self.storage_nodes:
+                index = next((i for i, row in enumerate(self.storage_nodes) if row.path == old_path), min(old_index, len(self.storage_nodes) - 1))
+                table.move_cursor(row=index)
+                highlight_chart(chart, self.storage_nodes[index].path)
         if self.storage_nodes:
-            table.move_cursor(row=min(old_index, len(self.storage_nodes) - 1))
+            self.storage_selected(highlighted_path(table))
         refresh = getattr(node, 'refresh', {})
         cache = refresh.get('cache', {})
         refresh_note = '%s · visited %s / reused %s · %s' % (refresh.get('mode', 'scanning').upper(), getattr(node, 'counters', {}).get('visited', refresh.get('visited', 0)), getattr(node, 'counters', {}).get('reused', refresh.get('reused_entries', 0)), refresh.get('reason', ''))
@@ -589,21 +611,21 @@ class MacTrimApp(App):
     @on(DataTable.RowHighlighted, '#storage-table')
     def storage_highlight(self, event):
         path = str(event.row_key.value)
+        if path != highlighted_path(event.control):
+            return
         self.storage_selected(path)
-        chart = self.query_one('#chart', OptionList)
-        try:
-            chart.highlighted = chart.get_option_index(path)
-        except Exception:
-            pass
+        highlight_chart(self.query_one('#chart', OptionList), path)
 
     @on(OptionList.OptionHighlighted, '#chart')
     def chart_highlight(self, event):
+        if not current_chart_event(event):
+            return
         path = event.option.id
         node = self.storage_selected(path)
         if node:
             index = next(i for i, row in enumerate(self.storage_nodes) if row.path == path)
             table = self.query_one('#storage-table', DataTable)
-            if table.cursor_row != index:
+            with table.prevent(DataTable.RowHighlighted):
                 table.move_cursor(row=index)
 
     @on(DataTable.RowSelected, '#storage-table')
@@ -718,20 +740,28 @@ class MacTrimApp(App):
         key = (lambda row: (row['delta'] is None, -(row['delta'] or 0), row['path'])) if self.history_sort == 'growth' else (lambda row: (row['delta'] is None, row['delta'] or 0, row['path'])) if self.history_sort == 'shrink' else lambda row: row['path']
         self.history_rows = sorted(result.get('rows', []), key=key)
         table = self.query_one('#history-table', DataTable)
-        table.clear()
+        old_index, old_path = table.cursor_row, highlighted_path(table)
         chart = self.query_one('#history-chart', OptionList)
-        chart.clear_options()
-        scale = max((abs(row['delta']) for row in self.history_rows if row['delta'] is not None), default=1) or 1
-        for index, row in enumerate(self.history_rows):
-            delta = row['delta']
-            color = '#fbbf24' if delta is None else '#fb7185' if delta > 0 else '#34d399' if delta < 0 else '#94a3b8'
-            change = 'unknown' if delta is None else ('+' if delta > 0 else '') + human(delta)
-            percent = '—' if row['percent'] is None else '%+.1f%%' % row['percent']
-            table.add_row(Text(row['status'], style=color), Text(change, style=color), percent, Text(clean(row['path'])), key=row['path'])
-            if index < 15:
-                bar = '━' * round(abs(delta or 0) / scale * 24)
-                text = Text(bar.ljust(24) + ' ' + change + '\n' + clean(row['path']), style=color)
-                chart.add_option(Option(text, id=row['path']))
+        with table.prevent(DataTable.RowHighlighted), chart.prevent(OptionList.OptionHighlighted):
+            table.clear()
+            chart.clear_options()
+            scale = max((abs(row['delta']) for row in self.history_rows if row['delta'] is not None), default=1) or 1
+            for index, row in enumerate(self.history_rows):
+                delta = row['delta']
+                color = '#fbbf24' if delta is None else '#fb7185' if delta > 0 else '#34d399' if delta < 0 else '#94a3b8'
+                change = 'unknown' if delta is None else ('+' if delta > 0 else '') + human(delta)
+                percent = '—' if row['percent'] is None else '%+.1f%%' % row['percent']
+                table.add_row(Text(row['status'], style=color), Text(change, style=color), percent, Text(clean(row['path'])), key=row['path'])
+                if index < 15:
+                    bar = '━' * round(abs(delta or 0) / scale * 24)
+                    text = Text(bar.ljust(24) + ' ' + change + '\n' + clean(row['path']), style=color)
+                    chart.add_option(Option(text, id=row['path']))
+            if self.history_rows:
+                index = next((i for i, row in enumerate(self.history_rows) if row['path'] == old_path), min(old_index, len(self.history_rows) - 1))
+                table.move_cursor(row=index)
+                highlight_chart(chart, self.history_rows[index]['path'])
+        if self.history_rows:
+            self.history_detail(highlighted_path(table))
         times = ''
         if result.get('earlier_at'):
             times = datetime.fromtimestamp(result['earlier_at']).strftime('%Y-%m-%d %H:%M') + ' → ' + datetime.fromtimestamp(result['later_at']).strftime('%Y-%m-%d %H:%M')
@@ -795,21 +825,21 @@ class MacTrimApp(App):
     @on(DataTable.RowHighlighted, '#history-table')
     def history_highlight(self, event):
         path = str(event.row_key.value)
+        if path != highlighted_path(event.control):
+            return
         self.history_detail(path)
-        chart = self.query_one('#history-chart', OptionList)
-        try:
-            chart.highlighted = chart.get_option_index(path)
-        except Exception:
-            pass
+        highlight_chart(self.query_one('#history-chart', OptionList), path)
 
     @on(OptionList.OptionHighlighted, '#history-chart')
     def history_chart_highlight(self, event):
+        if not current_chart_event(event):
+            return
         path = event.option.id
         self.history_detail(path)
         index = next((i for i, row in enumerate(self.history_rows) if row['path'] == path), None)
         if index is not None:
             table = self.query_one('#history-table', DataTable)
-            if table.cursor_row != index:
+            with table.prevent(DataTable.RowHighlighted):
                 table.move_cursor(row=index)
 
     @on(DataTable.RowSelected, '#history-table')
