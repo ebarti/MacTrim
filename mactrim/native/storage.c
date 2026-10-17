@@ -199,7 +199,9 @@ static Frame *enter(Scan *s,FTSENT *p) {
         f->r.flags|=REUSED; s->reused+=f->r.entries;
     }
     if(skip || f->r.status!=MEASURED || (f->r.flags & REUSED)) fts_set(s->fts,p,FTS_SKIP);
-    else {
+    else if(!p->fts_statp) {
+        error(s,f,EIO,f->path); fts_set(s->fts,p,FTS_SKIP);
+    } else {
         f->r.logical=f->r.own_logical=f->r.stat_size;
         f->r.allocated=f->r.own_allocated=(uint64_t)p->fts_statp->st_blocks*512;
         f->r.entries=1;
