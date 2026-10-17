@@ -20,7 +20,8 @@ from textual.widgets.option_list import Option
 from .config import defaults
 from .executor import Executor, selection
 from .measurement import capacities
-from .storage import page, accounting, PAGE_SIZE, find_directory, StorageNode
+from .storage import page, page_offset, directory_page, storage_order, accounting, PAGE_SIZE, find_directory, StorageNode
+from .regions import Cancelled
 from .incremental import inventory
 from .history import History
 from .safety import SafetyError, canonical, clean, within
@@ -281,6 +282,12 @@ class MacTrimApp(App):
         self.storage_scan_path = self.storage_path
         self.storage_details = {}
         self.storage_has_more = False
+        self.storage_page_cancel = threading.Event()
+        self.storage_page_generation = 0
+        self.storage_page_loading = False
+        self.storage_page_issue = None
+        self.storage_rendered_view = None
+        self.storage_page_user_selected = False
         self.render_dirty = False
         self.capacity_rows = []
         self.storage_measuring = False
@@ -371,6 +378,7 @@ class MacTrimApp(App):
         self.load_history()
 
     def on_unmount(self):
+        self.storage_page_cancel.set()
         self.scan_cancel.set()
         self.storage_cancel.set()
 
@@ -725,21 +733,26 @@ class MacTrimApp(App):
         if done and not detail and node.status != 'cancelled' and self.storage_node.details_deferred:
             self.start_details(self.storage_path)
 
-    def refresh_storage(self):
+    def refresh_storage(self, selected_path=None):
         if self.storage_node is None:
             return
         metric = self.storage_metric
         node = self.storage_node
-        self.storage_nodes = sorted(list(self.storage_page_rows if not self.storage_measuring else node.children[:PAGE_SIZE]), key=(lambda row: (-getattr(row, metric), row.name)) if self.storage_sort == 'size' else lambda row: row.name)
+        self.storage_nodes = (list(self.storage_page_rows) if not self.storage_measuring else
+                              directory_page(node, metric=metric, order=self.storage_sort)[0])
         table = self.query_main('#storage-table', DataTable)
-        old_index, old_path = table.cursor_row, highlighted_path(table)
+        rendering = (node.path, self.storage_offset, metric, self.storage_sort)
+        changed_scope = self.storage_rendered_view != rendering
+        old_index, old_path = (0, None) if changed_scope else (table.cursor_row, highlighted_path(table))
+        old_path = selected_path or old_path
+        self.storage_rendered_view = rendering
         chart = self.query_main('#chart', OptionList)
         with table.prevent(DataTable.RowHighlighted), chart.prevent(OptionList.OptionHighlighted):
             table.clear()
             chart.clear_options()
             root_accounting = accounting(node, self.capacity_rows)
             total = (root_accounting['filesystem_used_denominator'] if node.path == '/' and metric == 'allocated' else None) or getattr(node, metric)
-            graph_rows = sorted(node.children, key=lambda row: -getattr(row, metric))[:15]
+            graph_rows = directory_page(node, limit=15, metric=metric)[0]
             for index, child in enumerate(self.storage_nodes):
                 table.add_row(Text(child.status.upper() + (' · LAZY' if getattr(child, 'details_deferred', False) else ''), style=STATUS_COLOR.get(child.status, '#94a3b8')), storage_size(child, metric), Text(clean(child.name) + ('/' if child.kind == 'directory' else '')), key=child.path)
             for index, child in enumerate(graph_rows):
@@ -754,11 +767,16 @@ class MacTrimApp(App):
                 index = next((i for i, row in enumerate(self.storage_nodes) if row.path == old_path), min(old_index, len(self.storage_nodes) - 1))
                 table.move_cursor(row=index)
                 highlight_chart(chart, self.storage_nodes[index].path)
+            if changed_scope and selected_path is None:
+                table.scroll_home(animate=False, immediate=True)
+                chart.scroll_home(animate=False, immediate=True)
         if self.storage_nodes:
             self.storage_selected(highlighted_path(table))
         refresh = getattr(node, 'refresh', {})
         cache = refresh.get('cache', {})
         refresh_note = '%s · visited %s / reused %s · %s' % (refresh.get('mode', 'scanning').upper(), getattr(node, 'counters', {}).get('visited', refresh.get('visited', 0)), getattr(node, 'counters', {}).get('reused', refresh.get('reused_entries', 0)), refresh.get('reason', ''))
+        if not refresh and not self.storage_measuring:
+            refresh_note = 'CACHED · directory observation; Refresh verifies current changes'
         if refresh.get('last_verified'):
             refresh_note += ' · verified ' + datetime.fromtimestamp(refresh['last_verified']).strftime('%b %d %H:%M:%S')
         if cache:
@@ -790,8 +808,12 @@ class MacTrimApp(App):
                 refresh_note += ' · discovering level %s (scan root = 0)' % discovery.get('depth', 0)
             elif discovery.get('traversal') == 'native':
                 refresh_note += ' · native size scan; completed folder totals stream as measured'
-            refresh_note += ' · live rows: first %s immediate directories; totals include all observations' % PAGE_SIZE
+            refresh_note += ' · live rows: largest %s observed directories; totals include all observations' % PAGE_SIZE
             refresh_note += ' · scan root: ' + self.storage_scan_path
+        if self.storage_page_loading and not self.storage_measuring:
+            refresh_note += ' · loading current entries'
+        if self.storage_page_issue:
+            refresh_note += ' · ' + self.storage_page_issue
         if getattr(node, 'details_deferred', False):
             refresh_note += ' · recursive size included; internal browsing details load when opened'
         lifecycle = ('CANCELLING; observed lower bounds' if self.storage_cancel.is_set() else 'SCANNING; observed lower bounds') if self.storage_measuring else node.status.upper()
@@ -808,24 +830,70 @@ class MacTrimApp(App):
         except Exception as exc:
             self.call_from_thread(self.query_main('#storage-status', Static).update, Text('Cache preserved: ' + clean(exc)))
 
-    def load_storage_page(self):
+    def load_storage_page(self, target=None):
         if self.storage_node is None:
             return
+        self.storage_page_cancel.set()
+        self.storage_page_cancel = threading.Event()
+        self.storage_page_generation += 1
+        self.storage_page_issue = None
+        self.storage_page_user_selected = False
+        node = self.storage_node
+        if target:
+            selected = next((child for child in node.children if child.path == target), None)
+            if selected:
+                key = storage_order(self.storage_metric, self.storage_sort)
+                rank = sum(key(child) < key(selected) for child in node.children)
+                self.storage_offset = rank // PAGE_SIZE * PAGE_SIZE
+        self.storage_page_rows, self.storage_has_more = directory_page(
+            node, self.storage_offset, metric=self.storage_metric, order=self.storage_sort)
+        self.storage_page_loading = not node.details_deferred
+        if self.storage_page_loading:
+            self.storage_page_worker(node, self.storage_offset, self.storage_metric, self.storage_sort,
+                                     self.storage_page_cancel, self.storage_page_generation,
+                                     self.storage_generation, target)
+
+    @work(thread=True, group='storage-page', exclusive=True)
+    def storage_page_worker(self, node, offset, metric, order, cancel, generation, scan_generation, target):
         try:
-            self.storage_page_rows, self.storage_has_more = page(self.storage_node, self.storage_offset)
-        except (OSError, SafetyError):
-            self.storage_page_rows = self.storage_node.children[self.storage_offset:self.storage_offset + PAGE_SIZE]
-            self.storage_has_more = len(self.storage_node.children) > self.storage_offset + PAGE_SIZE
+            if target:
+                offset = page_offset(node, target, metric, order, cancel)
+            rows, more = page(node, offset, metric=metric, order=order, cancel=cancel)
+            issue = None
+        except Cancelled:
+            return
+        except (OSError, SafetyError) as exc:
+            rows, more = directory_page(node, offset, metric=metric, order=order)
+            issue = 'Cached folders shown; current file listing unavailable: ' + clean(exc)
+        if not cancel.is_set() and self.is_running:
+            self.call_from_thread(self.storage_page_update, node.path, offset, rows, more, issue,
+                                  generation, scan_generation, target)
+
+    def storage_page_update(self, path, offset, rows, more, issue, generation, scan_generation, target=None):
+        if (not self.is_running or generation != self.storage_page_generation or
+                scan_generation != self.storage_generation or self.storage_measuring or path != self.storage_path):
+            return
+        self.storage_offset = offset
+        self.storage_page_rows, self.storage_has_more = rows, more
+        self.storage_page_loading = False
+        self.storage_page_issue = issue
+        selected = target or (rows[0].path if rows and not self.storage_page_user_selected else None)
+        self.refresh_storage(selected_path=selected)
 
     @on(Select.Changed, '#metric')
     @on(Select.Changed, '#storage-sort')
     def storage_settings(self):
         self.storage_metric = self.query_main('#metric', Select).value
         self.storage_sort = self.query_main('#storage-sort', Select).value
+        self.storage_offset = 0
+        if self.storage_node is not None and not self.storage_measuring:
+            self.load_storage_page()
         self.refresh_storage()
 
     def storage_selected(self, path):
         node = next((node for node in self.storage_nodes if node.path == path), None)
+        if node is None and self.storage_node is not None:
+            node = next((child for child in self.storage_node.children if child.path == path), None)
         if node:
             self.query_main('#storage-detail', Static).update(Text('%s\n%s logical · %s allocated · %s · %s\n%s' % (clean(node.path), storage_size(node, 'logical'), storage_size(node, 'allocated'), node.status.upper(), 'protected: read-only' if node.protected else 'read-only metadata', ('Recursive size included; internal browsing details load when opened. ' if getattr(node, 'details_deferred', False) else '') + ('; '.join(node.issues) or 'No content read'))))
         return node
@@ -835,6 +903,7 @@ class MacTrimApp(App):
         path = str(event.row_key.value)
         if path != highlighted_path(event.control):
             return
+        self.storage_page_user_selected = True
         self.storage_selected(path)
         highlight_chart(self.query_main('#chart', OptionList), path)
 
@@ -843,9 +912,15 @@ class MacTrimApp(App):
         if not current_chart_event(event):
             return
         path = event.option.id
+        self.storage_page_user_selected = True
         node = self.storage_selected(path)
         if node:
-            index = next(i for i, row in enumerate(self.storage_nodes) if row.path == path)
+            index = next((i for i, row in enumerate(self.storage_nodes) if row.path == path), None)
+            if index is None:
+                if not self.storage_measuring:
+                    self.load_storage_page(target=path)
+                    self.refresh_storage(selected_path=path)
+                return
             table = self.query_main('#storage-table', DataTable)
             with table.prevent(DataTable.RowHighlighted):
                 table.move_cursor(row=index)
@@ -861,7 +936,10 @@ class MacTrimApp(App):
     def drill(self, path):
         node = self.storage_selected(path)
         if node and node.kind == 'directory' and node.status not in {'denied', 'skipped'}:
-            self.start_storage(path)
+            if not isinstance(node, StorageNode) and self.storage_inventory is not None and within(path, self.storage_inventory.path):
+                self.start_details(path)
+            else:
+                self.start_storage(path)
 
     def cancel_storage(self):
         self.storage_cancel.set()

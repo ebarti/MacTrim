@@ -147,6 +147,21 @@ def main():
         comparison = json.loads(run(prefix + ['history', 'compare', first['id'], second['id'], '--metric', 'logical']).stdout)
         assert next(row for row in comparison['rows'] if row['path'] == str(data / 'growing'))['delta'] == 250
         report['history_allocated_bytes'] = catalog['allocated_bytes']
+        # More than one page: the largest directory must survive global
+        # ranking even when it is last in native filesystem enumeration.
+        wide = root / 'wide-directory'; wide.mkdir()
+        for i in range(505): (wide / ('folder-%04d' % i)).mkdir()
+        with os.scandir(wide) as entries:
+            largest = wide / list(entries)[-1].name
+        (largest / 'payload').write_bytes(b'x' * 16384)
+        wide_result = json.loads(run(['--state', root / 'wide-state', '--config', config,
+                                      'storage', wide, '--json', '--full']).stdout)['measurement']
+        assert wide_result['children'][0]['name'] == largest.name
+        assert len(wide_result['children']) == 500
+        assert wide_result['children'][0]['allocated'] >= 16384
+        report['global_directory_order'] = {'immediate_folders': 505,
+                                            'largest_source_position': 505,
+                                            'largest_in_first_page': True}
         demo = root / 'demo'
         run(['demo', demo])
         demo_config = demo / 'config.json'
