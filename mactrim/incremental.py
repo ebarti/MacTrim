@@ -109,7 +109,7 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
         return changed, lost, boundary
 
     reason, mode = 'Complete initial inventory', 'full'
-    current_policy = policy(config, path, 'storage.complete.v1')
+    current_policy = policy(config, path, 'storage.on-demand.v2')
     # Measurement-owned stores are explicitly excluded and accounted separately.
     current_policy = dict(current_policy, measurement_state=[str(value) for value in excluded])
     # Journal source changes require a new index baseline, without changing
@@ -179,7 +179,7 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
                 progress(snapshot, current)
             def reuse(node, st):
                 old = nodes.get(node.path)
-                if not old or old.status != 'measured' or old.signature != _signature(st):
+                if not old or old.status not in {'measured', 'deferred'} or old.signature != _signature(st):
                     return None
                 if regions.intersects(node.path):
                     return None
@@ -251,7 +251,7 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
                     if time.monotonic() - updated >= .15:
                         phase('Classifying unsettled directories')
                         updated = time.monotonic()
-                    if row.status == 'measured' and (lost or after_index.intersects(row.path)):
+                    if row.status in {'measured', 'deferred'} and (lost or after_index.intersects(row.path)):
                         row.status = 'partial'
                         row.issues.append('Unsettled filesystem events; growth for this scope remains unknown')
                 # Save the observation even when continuity is lost. It remains
@@ -294,7 +294,7 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
                     node.status = 'cancelled'
                     node.issues.append('Cancelled while classifying receiver failure; previous saved index preserved')
                     break
-                if row.status == 'measured':
+                if row.status in {'measured', 'deferred'}:
                     row.status = 'partial'
                     row.issues.append('Unsettled filesystem events; receiver failed, reconciliation required')
         node.counters['visited'] = node.metadata_visits = visits

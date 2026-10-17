@@ -103,7 +103,8 @@ def main():
         assert not quiet['refresh']['warnings'], quiet['refresh']
         assert quiet['logical'] == baseline['logical'] and quiet['allocated'] == baseline['allocated']
         summary = next(row for row in baseline['children'] if row['name'] == 'node_modules')
-        assert summary['details_deferred'] and summary['logical'] >= 8192
+        assert summary['details_deferred'] and summary['size_state'] == 'unmeasured'
+        assert summary['status'] == 'deferred'
         index = state / 'storage-cache' / 'index.json.gz'
         saved_index = index.read_bytes()
         assert saved_index.startswith(b'MACTRIM-INDEX-3\n')
@@ -117,17 +118,16 @@ def main():
             assert depth <= 9
             if depth == 9:
                 assert row[-1] is True
-                expected = folder.stat().st_size + sum(entry.stat().st_size for entry in folder.rglob('*'))
-                assert row[2] == expected, 'Deferred depth total omitted descendant metadata'
+                assert row[2] == 0 and row[9] == 'deferred', 'Unopened depth boundary was measured'
                 deferred += 1
         assert deferred > 0
-        report['lazy_depth_boundary'] = {'detailed_levels': 8, 'deferred_level': 9, 'deep_size_included': True}
+        report['lazy_depth_boundary'] = {'detailed_levels': 8, 'unopened_level': 9, 'interior_unmeasured': True}
         detail = json.loads(run(['--state', root / 'detail-state', '--config', config,
                                  'storage', dependency, '--json']).stdout)['measurement']
         assert not detail['details_deferred'] and detail['children']
-        assert detail['logical'] == summary['logical']
+        assert detail['logical'] >= 8192 and detail['status'] == 'measured'
         assert index.read_bytes() == saved_index
-        report['lazy_dependency_details'] = {'summary_measured': True, 'explicit_details_loaded': True,
+        report['lazy_dependency_details'] = {'summary_unmeasured': True, 'explicit_details_loaded': True,
                                               'main_index_preserved': True}
         assert quiet['counters']['visited'] < baseline['counters']['visited']
         first = json.loads(run(prefix + ['history', 'capture', data]).stdout)

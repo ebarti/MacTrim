@@ -86,7 +86,7 @@ class FullRepairTests(unittest.TestCase):
                                     issues=['[Errno 1] Operation not permitted'])]
         report = coverage_report(root)
         self.assertFalse(report['complete'])
-        self.assertEqual(report['counts'], {'permissions': 1, 'changes': 0, 'tracking': 0, 'other': 0})
+        self.assertEqual(report['counts'], {'permissions': 1, 'changes': 0, 'tracking': 0, 'other': 0, 'deferred': 0})
         self.assertEqual(report['examples']['permissions'][0]['path'], '/fixture/protected')
 
 
