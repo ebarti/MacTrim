@@ -10,7 +10,7 @@ import threading
 import time
 
 from .regions import check_cancel
-from .safety import SafetyError, clean, within
+from .safety import SafetyError, canonical, clean, within
 
 # At most one second of delivery delay is acceptable for interval-based storage
 # measurements. Explicit drains settle this window before flushing the stream.
@@ -19,8 +19,34 @@ DELIVERY_LATENCY = 1.0
 # every required invalidation instead of silently losing paths at these bounds.
 PENDING_BYTES = 2 * 1024 * 1024
 DIRTY_BYTES = 2 * 1024 * 1024
-LOSS_FLAGS = 2 | 4 | 8 | 32 | 64 | 128  # SDK User/KernelDropped, wrapped, root, mounts
+LOSS_FLAGS = 2 | 4 | 8 | 32  # SDK User/KernelDropped, wrapped, watched root changed
+MOUNT_FLAGS = 64 | 128
 HISTORY_DONE = 16
+
+
+def device_scope(root):
+    """Bind history to the measured device and map volume-relative paths.
+
+    A host stream also consults histories of other mounted volumes, including
+    excluded volumes, whose gaps cannot invalidate this device's observation.
+    """
+    root = canonical(root)
+    device = os.lstat(root).st_dev
+    data = Path('/System/Volumes/Data')
+    if root == Path('/') and data.is_dir() and os.lstat(data).st_dev != device:
+        # Separate System/Data devices: immutable System namespace is checked
+        # by volume_identity; writable Data events use the visible root paths.
+        if not os.statvfs(root).f_flag & os.ST_RDONLY:
+            raise SafetyError('Multiple writable root devices require complete reconciliation')
+        return os.lstat(data).st_dev, '/', ''
+    if within(root, data) and data.is_dir() and os.lstat(data).st_dev == device:
+        relative = str(root.relative_to(data))
+        return device, str(data), '' if relative == '.' else relative
+    mount = root
+    while mount != Path('/') and os.lstat(mount.parent).st_dev == device:
+        mount = mount.parent
+    relative = str(root.relative_to(mount))
+    return device, str(mount), '' if relative == '.' else relative
 
 
 class EventCollector:
@@ -34,11 +60,14 @@ class EventCollector:
         self.pending, self.pending_bytes = deque(), 0
         self.paths, self.issues, self.dirty_bytes = set(), [], 0
         self.failure, self.stream = None, None
+        self.device_mount = None
+        self.device_root = None
         self.latest = self.since
         self.diagnostics = dict(callbacks=0, events=0, callback_max_ms=0.0,
                                 pending_peak_bytes=0, dirty_peak_regions=0,
                                 coarsened_batches=0, coarsened_regions=0,
                                 drop_signals=0, last_drop_flags=0,
+                                mount_signals=0,
                                 latency_seconds=DELIVERY_LATENCY)
         self.thread = threading.Thread(target=self._run, name='mactrim-fsevents', daemon=True)
         self.processor = threading.Thread(target=self._process_loop, name='mactrim-event-processing', daemon=True)
@@ -58,8 +87,11 @@ class EventCollector:
             def callback(stream, info, count, paths, flags, ids):
                 self._record(paths, flags, ids)
             flags = F.kFSEventStreamCreateFlagUseCFTypes | F.kFSEventStreamCreateFlagWatchRoot
-            self.stream = F.FSEventStreamCreate(None, callback, None, [self.root], self.since,
-                                               DELIVERY_LATENCY, flags)
+            device, self.device_mount, relative = device_scope(self.root)
+            self.device_root = relative
+            self.diagnostics.update(source='device-journal', device=device, mount=self.device_mount)
+            self.stream = F.FSEventStreamCreateRelativeToDevice(None, callback, None, device,
+                                                               [relative], self.since, DELIVERY_LATENCY, flags)
             if not self.stream:
                 raise SafetyError('Cannot create FSEvents stream')
             F.FSEventStreamScheduleWithRunLoop(self.stream, C.CFRunLoopGetCurrent(), C.kCFRunLoopDefaultMode)
@@ -96,8 +128,9 @@ class EventCollector:
                     for flag in batch[1]: combined |= flag
                     latest = max(latest, max(batch[2], default=latest))
                 self.pending.clear()
-                paths, flags, ids = (self.root,), (combined | 1,), (latest,)
-                size = len(self.root) * 4 + 128
+                root = self.device_root if self.device_root is not None else self.root
+                paths, flags, ids = (root,), (combined | 1,), (latest,)
+                size = len(root) * 4 + 128
                 self.pending_bytes = 0
                 self.diagnostics['coarsened_batches'] += 1
             self.pending.append((paths, flags, ids))
@@ -137,8 +170,19 @@ class EventCollector:
                     # A coarsened batch can include both a sentinel and changes.
                     if flag == HISTORY_DONE:
                         continue
-                    path = str(Path(path))
+                    # Device callbacks name paths relative to the volume root,
+                    # including an empty path for a volume mount notification.
+                    path = str(canonical(Path(self.device_mount) / str(path).lstrip('/'))) if self.device_mount is not None else str(Path(path))
+                    if flag & MOUNT_FLAGS:
+                        with self.lock:
+                            self.diagnostics['mount_signals'] += 1
+                        if within(self.root, path):
+                            # Remounting an ancestor replaces this scope's
+                            # namespace even if its device UUID remains equal.
+                            path = self.root
                     if not within(path, self.root):
+                        if flag & MOUNT_FLAGS:
+                            continue
                         with self.lock:
                             if len(self.issues) < 16: self.issues.append('FSEvents path escaped watched scope')
                         continue
@@ -150,7 +194,9 @@ class EventCollector:
                     dirty = path if directory else str(Path(path).parent)
                     with self.lock:
                         self._add_dirty(dirty)
-                        if flag & (0x100 | 0x200 | 0x800): self._add_dirty(str(Path(path).parent))
+                        if flag & (0x100 | 0x200 | 0x800 | MOUNT_FLAGS):
+                            parent = str(Path(path).parent)
+                            if within(parent, self.root): self._add_dirty(parent)
 
     def _add_dirty(self, path):
         if self.root in self.paths or path in self.paths:
