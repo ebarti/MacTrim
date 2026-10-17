@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+import stat
 
 from .safety import canonical, clean, within
 
@@ -25,6 +26,7 @@ class Activity:
     captured_at: float = field(default_factory=time.time)
     commands: dict = field(default_factory=dict, repr=False)
     attempts: int = 1
+    _scanner_parent: int = field(default=0, init=False, repr=False)
 
     def blockers(self, root):
         blockers = list(self.issues) if not self.complete else []
@@ -33,7 +35,7 @@ class Activity:
                 blockers.append("Active PID %s (%s), %s: %s" % (pid, clean(command), clean(descriptor), clean(path)))
         scoped = str(canonical(root))
         for pid, command_line in self.commands.items():
-            if pid == os.getpid() and _own_scanner_invocation():
+            if pid in {os.getpid(), self._scanner_parent} and _own_scanner_invocation():
                 # CLI root flags authorize inspection and are not evidence of
                 # self-use. Actual cwd/open handles still apply; preserve an env
                 # in which MacTrim itself is running, even if Python is a symlink.
@@ -70,6 +72,79 @@ def _pids():
         if uid == os.getuid() and b"Z" not in fields[2] and pid != process.pid:
             pids[pid] = fields[3].decode(errors="surrogateescape")
     return pids
+
+
+def _verified_onefile_parent(observed):
+    """Prove a direct onefile bootloader parent; exempt only its scanner argv.
+
+    This extra scoped observation never changes coverage or path blockers. Any
+    mismatch retains the ordinary conservative parent argv interpretation.
+    """
+    if not observed.complete or not getattr(sys, 'frozen', False) or not _own_scanner_invocation():
+        return 0
+    own, parent = os.getpid(), os.getppid()
+    expected_command = ' '.join([sys.executable] + sys.argv[1:])
+    if observed.commands.get(own) != expected_command or observed.commands.get(parent) != expected_command:
+        return 0
+    try:
+        executable = canonical(sys.executable)
+        original = os.lstat(executable)
+        if not stat.S_ISREG(original.st_mode) or original.st_uid != os.getuid():
+            return 0
+        def inventory():
+            result = subprocess.run(['/bin/ps', '-ww', '-p', '%s,%s' % (own, parent),
+                                     '-o', 'pid=,ppid=,uid=,command='], capture_output=True, timeout=3)
+            if result.returncode or result.stderr or len(result.stdout) > 65536:
+                raise ValueError('Unknown onefile process inventory')
+            records = {}
+            for line in result.stdout.splitlines():
+                fields = line.split(None, 3)
+                if len(fields) != 4:
+                    raise ValueError('Malformed onefile process inventory')
+                pid, ppid, uid = map(int, fields[:3])
+                records[pid] = (ppid, uid, fields[3].decode(errors='surrogateescape'))
+            if set(records) != {own, parent} or records[own] != (parent, os.getuid(), expected_command) or records[parent][1:] != (os.getuid(), expected_command):
+                raise ValueError('Onefile parent ancestry/argv changed')
+            return records
+        before = inventory()
+        result = subprocess.run(['/usr/sbin/lsof', '-nP', '-a', '-p', '%s,%s' % (own, parent),
+                                 '-d', 'txt', '-F0pftDin'], capture_output=True, timeout=3)
+        if result.returncode or result.stderr or not result.stdout.endswith(b'\n') or len(result.stdout) > 65536:
+            return 0
+        pid, record, matched = None, {}, set()
+        def finish():
+            if not record:
+                return
+            if set(record) != {'f', 't', 'D', 'i', 'n'} or record['f'] != 'txt' or record['t'] != 'REG' or not record['n'].startswith('/'):
+                raise ValueError('Unknown executable descriptor')
+            if canonical(record['n']) == executable:
+                if int(record['D'], 16) != original.st_dev or int(record['i']) != original.st_ino:
+                    raise ValueError('Executable identity mismatch')
+                matched.add(pid)
+        for field in result.stdout.split(b'\0'):
+            field = field.lstrip(b'\n')
+            if not field:
+                continue
+            key, value = chr(field[0]), field[1:].decode(errors='surrogateescape')
+            if key == 'p':
+                finish()
+                pid, record = int(value), {}
+                if pid not in {own, parent}:
+                    return 0
+            elif key == 'f':
+                finish()
+                record = {'f': value}
+            elif key in {'t', 'D', 'i', 'n'} and pid is not None and 'f' in record and key not in record:
+                record[key] = value
+            else:
+                return 0
+        finish()
+        current = os.lstat(executable)
+        if matched != {own, parent} or inventory() != before or os.getppid() != parent or (current.st_dev, current.st_ino, current.st_mode, current.st_uid) != (original.st_dev, original.st_ino, original.st_mode, original.st_uid):
+            return 0
+        return parent
+    except (OSError, ValueError, KeyError, subprocess.TimeoutExpired):
+        return 0
 
 
 def parse_lsof(data, expected, stderr=b"", returncode=0):
@@ -174,6 +249,7 @@ def snapshot():
             observed.paths = list(dict.fromkeys(paths))
             observed.commands = surviving if isinstance(surviving, dict) else {}
             if observed.complete:
+                observed._scanner_parent = _verified_onefile_parent(observed)
                 return observed
         return observed
     except (OSError, subprocess.TimeoutExpired, ValueError) as exc:

@@ -96,3 +96,25 @@ An installed/shared/running/uncertain owner still blocks this declaration. Store
 ```
 
 Tests create and remove only owned disposable fixtures. They cover original changed-content/credentials/activity/journal/keeper/restore/purge invariants; typed worktrees, hostile hooks/environment/filters, registry and pointer races/crashes; app helpers/services/incomplete metadata; independent quotas and cancellation; APFS alias/storage budgets; compact history comparison/retention/input races; and native Textual Pilot interactions. The demo's Git init/commit stays inside its disposable repository; no remote publication or real cleanup occurs. Real CLI activity evidence may leave all demo actions blocked; fixture-injected activity tests are separate evidence and there is no production bypass.
+
+## Standalone macOS binary
+
+The native arm64 onefile build produces `dist/mactrim`; execution requires no separately installed Python or project environment. Copy that executable to a user-owned location and run its absolute path, or `./mactrim` from its containing directory. The existing source launcher remains available.
+
+Build on an arm64 Mac with CPython 3.12.12:
+
+```sh
+.venv/bin/python scripts/build_binary.py
+./dist/mactrim --version
+./dist/mactrim
+```
+
+The script requires a clean committed checkout, installs hash-pinned build/runtime wheels only in `build/binary-venv`, and emits `dist/mactrim.build.json` with source revision, dependency pins, architecture, artifact hash and size. It uses optimization level 0. Only required code, interpreter/libraries and Textual/Rich version metadata are collected; project runtime state, evidence, fixtures and tests are excluded. This is a pinned build procedure, not a promise of byte-identical results across toolchains or Macs.
+
+The delivered configuration targets Apple Silicon arm64. Intel or universal builds require appropriate Python/library architectures and a separately configured and verified build; they are not covered by this delivery. The executable is locally ad-hoc signed, not Apple Developer signed or notarized. See [PyInstaller's architecture/signing notes](https://pyinstaller.org/en/stable/feature-notes.html#macos-multi-arch-support).
+
+[Onefile startup](https://pyinstaller.org/en/stable/operating-mode.html#how-the-one-file-program-works) extracts bundled libraries to a temporary `_MEI…` directory, so it needs temporary disk space and starts more slowly than the source launcher. Normal exit removes its extraction directory; a crash or forced termination can leave remnants. Inspect a remnant's ownership and association with an exited process before manual removal; do not clear shared temporary directories. MacTrim state and bounded History remain separate from extraction and are never bundled. Git evidence and activity still require the macOS system tools; unavailable evidence stays fail-closed.
+
+The native build measured about 14 MiB for the executable and 19 MiB during extraction; repeated `--version` launches took roughly 0.3–0.7 seconds on the build Mac. These observations vary with hardware and filesystem caches. Run the disposable outside-repository checks with `.venv/bin/python scripts/verify_binary.py dist/mactrim --report evidence/binary-smoke.json`. The harness removes only its owned fixtures, executes the binary with no Python on PATH, poisons Python environment paths, opens the real three-tab terminal UI, and records real activity refusals without replacing the production activity provider.
+
+The onefile parent repeats scanner arguments. MacTrim excludes only that argv evidence after proving a direct parent in fresh same-user process inventories, identical full scanner arguments, and both executable descriptors matching the running binary's device/inode. Actual cwd/open/executable paths, interpreter scope, unrelated processes and incomplete coverage still block actions; missing proof keeps the conservative blocker.
