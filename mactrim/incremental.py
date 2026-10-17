@@ -30,9 +30,11 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
     excluded = (state.path / 'storage-cache', state.path / 'history') if state else ()
     warnings, dirty, previous, nodes, cached = [], set(), None, {}, None
     visits = 0
-    node, watcher = None, None
+    node = None
     identity, checkpoint, reuse_allowed = None, 0, True
     repair = {'attempted': False}
+    diagnostics = {'mode': 'journal', 'replay_attempts': 0, 'recovered_replays': 0}
+    accounting_scopes = []
     save_blocker = 'No private state configured' if state is None else 'Directory index disabled in configuration'
     def phase(value):
         check_cancel(cancel)
@@ -41,6 +43,51 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
             snapshot.counters['visited'] = visits
             snapshot.metadata_visits = visits
             progress(snapshot, snapshot)
+
+    def read_journal(since):
+        # This boundary precedes both replay and the following measurement.
+        # Events arriving after replay closes must remain in the next interval.
+        boundary = events.current_id()
+        if boundary < since or volume_identity(path) != identity:
+            raise SafetyError('Filesystem event identity changed; journal checkpoint cannot be trusted')
+        for attempt in range(2):
+            check_cancel(cancel)
+            reader = backend(path, since, excluded)
+            if hasattr(reader, 'cancel'):
+                reader.cancel = cancel
+            diagnostics['replay_attempts'] += 1
+            try:
+                with reader:
+                    phase('Checking filesystem events')
+                    check_cancel(cancel)
+                    changed, lost, delivered = reader.drain()
+                if volume_identity(path) != identity:
+                    raise SafetyError('Filesystem event identity changed during journal replay')
+            except (ImportError, OSError, SafetyError) as exc:
+                warnings.append('Journal replay failed: ' + clean(exc))
+                if attempt:
+                    raise
+                continue
+            finally:
+                for key, value in getattr(reader, 'diagnostics', {}).items():
+                    if key in {'callbacks', 'events', 'drop_signals', 'coarsened_batches', 'coarsened_regions'}:
+                        diagnostics[key] = diagnostics.get(key, 0) + value
+                    elif key in {'callback_max_ms', 'pending_peak_bytes', 'dirty_peak_regions'}:
+                        diagnostics[key] = max(diagnostics.get(key, 0), value)
+                    else:
+                        diagnostics[key] = value
+            if not lost:
+                if attempt:
+                    diagnostics['recovered_replays'] += 1
+                # The flush returned every event through this delivered ID.
+                # It is safe to cover those events in the following walk,
+                # even when delivery lag assigned IDs after reader startup.
+                return changed, [], max(boundary, delivered)
+            warnings.extend('Journal replay gap: ' + issue for issue in lost)
+            # A dropped delivery does not prove that persisted history is lost.
+            # Retry with a NEW reader at the SAME checkpoint before any rescan.
+        return changed, lost, boundary
+
     reason, mode = 'Complete initial inventory', 'full'
     current_policy = policy(config, path, 'storage.complete.v1')
     # Measurement-owned stores are explicitly excluded and accounted separately.
@@ -64,57 +111,54 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
             reason = 'Explicit full reconciliation'
         elif previous and not compatible:
             reason = 'Index/policy/volume/event continuity or periodic reconciliation requires a full scan'
-        since = previous['checkpoint'] if compatible and not full else now_id
-        # Watching precedes every walk, so changes during enumeration can be
-        # observed. A checkpoint precedes the observation interval; it is never
-        # advanced past unmeasured events.
-        watcher = backend(path, since, excluded)
-        if hasattr(watcher, 'cancel'):
-            watcher.cancel = cancel
-        with watcher:
-            dirty, lost, _ = watcher.drain()
+        checkpoint = now_id
+        if compatible and not full:
+            try:
+                dirty, lost, checkpoint = read_journal(previous['checkpoint'])
+            except (ImportError, OSError, SafetyError):
+                dirty, lost = set(), ['Pre-scan journal unavailable']
             if lost:
                 warnings.extend('Before scan: ' + issue for issue in lost); compatible = False
                 reason = 'Full reconciliation after a pre-scan FSEvents gap'
-            if compatible and not full:
-                mode = 'incremental'
-                reason = 'Persistent FSEvents replay; changed directories measured, unchanged subtrees reused'
-            accounting_scopes = previous.get('reconcile_scopes', [str(path)] if previous.get('requires_reconcile') else []) if previous else []
-            dirty_index = Regions(dirty, cancel)
-            if dirty_index.intersects_any(accounting_scopes, cancel):
-                compatible = False; mode = 'full'
-                reason = 'Hardlink/alias accounting spans directories; full reconciliation'
-            def walk(regions, allow_reuse):
-                nonlocal visits
-                regions = Regions(regions, cancel)
-                def walk_progress(snapshot, current):
-                    snapshot.counters['visited'] += visits
-                    snapshot.metadata_visits += visits
-                    if repair['attempted']:
-                        prefix = 'Full repair' if repair['full'] else 'Targeted repair'
-                        snapshot.progress['phase'] = prefix + ' · ' + snapshot.progress['phase']
-                    progress(snapshot, current)
-                def reuse(node, st):
-                    old = nodes.get(node.path)
-                    if not old or old.status != 'measured' or old.signature != _signature(st):
-                        return None
-                    if regions.intersects(node.path):
-                        return None
-                    return old
-                result = complete(path, cancel=cancel, progress=walk_progress if progress else None, exclusions=excluded,
-                                  reuse=reuse if allow_reuse else None)
-                visits += result.counters['visited']
-                return result
-            # Capture the boundary BEFORE the walk. Later events get remeasured
-            # below or replayed next time; checkpoint persistence is transactional.
-            checkpoint = events.current_id()
-            node = walk(dirty, compatible and not full)
-            phase('Checking filesystem events')
-            after, lost, _ = watcher.drain()
+        if compatible and not full:
+            mode = 'incremental'
+            reason = 'Persistent journal replay; changed directories measured, unchanged subtrees reused'
+        accounting_scopes = previous.get('reconcile_scopes', [str(path)] if previous.get('requires_reconcile') else []) if previous else []
+        dirty_index = Regions(dirty, cancel)
+        if dirty_index.intersects_any(accounting_scopes, cancel):
+            compatible = False; mode = 'full'
+            reason = 'Hardlink/alias accounting spans directories; full reconciliation'
+        def walk(regions, allow_reuse):
+            nonlocal visits
+            regions = Regions(regions, cancel)
+            def walk_progress(snapshot, current):
+                snapshot.counters['visited'] += visits
+                snapshot.metadata_visits += visits
+                if repair['attempted']:
+                    prefix = 'Full repair' if repair['full'] else 'Targeted repair'
+                    snapshot.progress['phase'] = prefix + ' · ' + snapshot.progress['phase']
+                progress(snapshot, current)
+            def reuse(node, st):
+                old = nodes.get(node.path)
+                if not old or old.status != 'measured' or old.signature != _signature(st):
+                    return None
+                if regions.intersects(node.path):
+                    return None
+                return old
+            result = complete(path, cancel=cancel, progress=walk_progress if progress else None, exclusions=excluded,
+                              reuse=reuse if allow_reuse else None)
+            visits += result.counters['visited']
+            return result
+        # No native receiver is alive during enumeration. Replay persistent
+        # history after the walk, replacing affected sizes rather than adding
+        # event deltas. Changes already seen by the walk are harmless overlap.
+        node = walk(dirty, compatible and not full)
+        if node.status != 'cancelled':
+            after, lost, replay_boundary = read_journal(checkpoint)
             if node.counters['reused'] and getattr(node, 'requires_reconcile', False):
                 checkpoint = events.current_id()
                 node = walk(set(), False)
-                after, lost, _ = watcher.drain()
+                after, lost, replay_boundary = read_journal(checkpoint)
                 mode, reason = 'full', 'New multiply-linked file requires global accounting reconciliation'
             unstable = set()
             for row in iter_nodes(node):
@@ -144,15 +188,17 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
                     # A global repair cannot reuse this observation. Release
                     # its tree before allocating another whole-disk tree.
                     node = None
-                checkpoint = events.current_id()
+                # Reuse can skip edits between the end of replay and this
+                # walk. Keep the earlier replay boundary to catch those edits.
+                checkpoint = events.current_id() if global_repair else replay_boundary
                 node = walk(after, not global_repair)
                 if global_repair:
                     mode, reason = 'full', 'Full reconciliation: ' + repair['reason']
-                after, lost, _ = watcher.drain()
+                after, lost, replay_boundary = read_journal(checkpoint)
                 if node.counters['reused'] and getattr(node, 'requires_reconcile', False):
                     checkpoint = events.current_id()
                     node = walk(set(), False)
-                    after, lost, _ = watcher.drain()
+                    after, lost, replay_boundary = read_journal(checkpoint)
                     mode, reason = 'full', 'New hardlink during reconciliation requires global accounting'
             if after or lost:
                 warnings.extend(lost)
@@ -173,10 +219,14 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
                 # explicitly ineligible for reuse until a fresh scan repairs it.
                 if lost:
                     reuse_allowed = False
-            node.counters['visited'] = node.metadata_visits = visits
-            node.refresh = {'mode': mode, 'reason': reason, 'dirty_regions': len(dirty),
-                            'visited': node.counters['visited'], 'reused_entries': node.counters['reused'],
-                            'last_verified': node.completed_at, 'warnings': warnings}
+            else:
+                # A quiet replay certifies the finished measurement through
+                # its barrier. Never advance this far for pending regions.
+                checkpoint = replay_boundary
+        node.counters['visited'] = node.metadata_visits = visits
+        node.refresh = {'mode': mode, 'reason': reason, 'dirty_regions': len(dirty),
+                        'visited': node.counters['visited'], 'reused_entries': node.counters['reused'],
+                        'last_verified': node.completed_at, 'warnings': warnings}
     except Cancelled:
         if node is None:
             node = complete(path, cancel=cancel, exclusions=excluded)
@@ -209,9 +259,9 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
         node.refresh = {'mode': mode, 'reason': reason,
                         'visited': visits, 'reused_entries': node.counters['reused'],
                         'last_verified': node.completed_at, 'warnings': warnings}
-    diagnostics = dict(getattr(watcher, 'diagnostics', {}))
     if not reuse_allowed and warnings:
         diagnostics['tracking_error'] = warnings[-1][:1024]
+    diagnostics['checkpoint'] = checkpoint
     node.refresh['events'] = diagnostics
     if node.status != 'cancelled':
         try:

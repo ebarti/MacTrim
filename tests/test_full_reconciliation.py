@@ -28,17 +28,18 @@ class FullRepairTests(unittest.TestCase):
         self.ids.stop(); self.identity.stop(); self.temporary.cleanup()
 
     def scan(self, batches, **kwargs):
+        batches = iter(batches)
         class Events:
-            def __init__(self, *args): self.batches = iter(batches)
+            def __init__(self, *args): pass
             def __enter__(self): return self
             def __exit__(self, *args): pass
-            def drain(self): return next(self.batches, (set(), [], 100))
+            def drain(self): return next(batches, (set(), [], 100))
         return inventory(self.data, self.state, defaults(), backend=Events, full=True, **kwargs)
 
     def test_one_dropped_interval_gets_full_repair_in_same_scan(self):
         phases = []
         with patch('mactrim.incremental.complete', wraps=complete) as walker:
-            observed = self.scan([(set(), [], 100), (set(), ['UserDropped'], 100)],
+            observed = self.scan([(set(), ['UserDropped'], 100)] * 2,
                                  progress=lambda snapshot, current: phases.append(snapshot.progress['phase']))
         self.assertEqual(walker.call_count, 2)
         self.assertIsNone(walker.call_args.kwargs['reuse'])
@@ -51,7 +52,7 @@ class FullRepairTests(unittest.TestCase):
 
     def test_repeated_drops_finish_uncertain_without_infinite_restart(self):
         with patch('mactrim.incremental.complete', wraps=complete) as walker:
-            observed = self.scan([(set(), [], 100), (set(), ['first drop'], 100), (set(), ['second drop'], 100)])
+            observed = self.scan([(set(), ['unrecoverable journal gap'], 100)] * 4)
         self.assertEqual(walker.call_count, 2)
         self.assertEqual(observed.status, 'partial')
         self.assertFalse(observed.refresh['cache']['reusable'])
@@ -61,7 +62,7 @@ class FullRepairTests(unittest.TestCase):
     def test_unrelated_changes_are_repaired_despite_existing_hardlinks(self):
         os.link(self.data / 'a' / 'file', self.data / 'b' / 'alias')
         with patch('mactrim.incremental.complete', wraps=complete) as walker:
-            observed = self.scan([(set(), [], 100), ({str(self.data / 'c')}, [], 100)])
+            observed = self.scan([({str(self.data / 'c')}, [], 100)])
         self.assertEqual(walker.call_count, 2)
         self.assertIsNotNone(walker.call_args.kwargs['reuse'])
         self.assertFalse(observed.refresh['reconciliation']['full'])
@@ -71,7 +72,7 @@ class FullRepairTests(unittest.TestCase):
     def test_changes_to_link_accounting_get_globally_counted_repair(self):
         os.link(self.data / 'a' / 'file', self.data / 'b' / 'alias')
         with patch('mactrim.incremental.complete', wraps=complete) as walker:
-            observed = self.scan([(set(), [], 100), ({str(self.data / 'a')}, [], 100)])
+            observed = self.scan([({str(self.data / 'a')}, [], 100)])
         self.assertEqual(walker.call_count, 2)
         self.assertIsNone(walker.call_args.kwargs['reuse'])
         self.assertTrue(observed.refresh['reconciliation']['full'])

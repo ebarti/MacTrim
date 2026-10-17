@@ -25,6 +25,7 @@ class BatchTests(unittest.TestCase):
         import FSEvents as F
         events = EventCollector('/fixture', 10)
         events.stream = object()
+        events.history_done.set()
         events._record(['/fixture'], [F.kFSEventStreamEventFlagMustScanSubDirs | F.kFSEventStreamEventFlagUserDropped], [11])
         events._record(['/fixture/changed/file'], [F.kFSEventStreamEventFlagItemIsFile], [12])
         with patch.object(events.stop, 'wait'), patch.object(F, 'FSEventStreamFlushSync'):
@@ -75,11 +76,12 @@ class GapSavingTests(unittest.TestCase):
         self.ids.stop(); self.identity.stop(); self.temporary.cleanup()
 
     def scan(self, batches=(), **kwargs):
+        batches = iter(copy.deepcopy(batches))
         class Events:
-            def __init__(self, *args): self.batches = iter(copy.deepcopy(batches))
+            def __init__(self, *args): pass
             def __enter__(self): return self
             def __exit__(self, *args): pass
-            def drain(self): return next(self.batches, (set(), [], 100))
+            def drain(self): return next(batches, (set(), [], 100))
         return inventory(self.data, self.state, self.config, backend=Events, **kwargs)
 
     def cache(self):
@@ -101,8 +103,7 @@ class GapSavingTests(unittest.TestCase):
     def test_loss_during_walk_saves_observation_without_reusing_it(self):
         initial = self.scan()
         before = self.cache()[0]['created_at']
-        observed = self.scan([(set(), [], 100), (set(), ['live drop'], 100),
-                              (set(), ['repeated drop'], 100)], full=True)
+        observed = self.scan([(set(), ['journal gap'], 100)] * 4, full=True)
         self.assertEqual(observed.status, 'partial')
         self.assertTrue(observed.refresh['cache']['stored'])
         self.assertFalse(observed.refresh['cache']['reusable'])
@@ -157,8 +158,7 @@ class GapSavingTests(unittest.TestCase):
             def __exit__(self, *args): pass
             def drain(self):
                 self.drains += 1
-                if self.drains > 1: raise OSError('receiver died')
-                return set(), [], 100
+                raise OSError('receiver died')
         with patch('mactrim.incremental.complete', wraps=complete) as walker:
             result = inventory(self.data, self.state, self.config, backend=Broken)
         self.assertEqual(walker.call_count, 1)
@@ -166,7 +166,7 @@ class GapSavingTests(unittest.TestCase):
         self.assertEqual(result.status, 'partial')
         self.assertTrue(result.refresh['cache']['stored'])
         self.assertFalse(result.refresh['cache']['reusable'])
-        self.assertEqual(result.refresh['events']['callbacks'], 7)
+        self.assertEqual(result.refresh['events']['callbacks'], 14)
         self.assertIn('receiver died', result.refresh['events']['tracking_error'])
         body, root, nodes = self.cache()
         self.assertEqual(root.logical, result.logical)
@@ -201,10 +201,8 @@ class GapSavingTests(unittest.TestCase):
             def __exit__(self, *args): pass
             def drain(self):
                 self.drains += 1
-                if self.drains > 1:
-                    cancel.set()
-                    raise OSError('receiver died while cancelling')
-                return set(), [], 100
+                cancel.set()
+                raise OSError('receiver died while cancelling')
         result = inventory(self.data, self.state, self.config, backend=Broken, full=True, cancel=cancel)
         self.assertEqual(result.status, 'cancelled')
         self.assertFalse(result.refresh['cache']['stored'])
