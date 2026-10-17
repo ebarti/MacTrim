@@ -464,16 +464,18 @@ class MacTrimApp(App):
 
     @work(thread=True, group='storage', exclusive=True)
     def storage_worker(self, path, cancel, generation, config, full=False):
-        last = [0.0]
+        last, last_phase = [0.0], [None]
         def progress(node, child):
             now = time.monotonic()
-            if now - last[0] >= .15 and not cancel.is_set():
+            phase = getattr(node, 'progress', {}).get('phase')
+            if (now - last[0] >= .15 or phase != last_phase[0]) and not cancel.is_set():
+                last_phase[0] = phase
                 last[0] = now
                 self.call_from_thread(self.storage_update, node, generation, False)
         try:
             capacity = capacities('/')
+            self.call_from_thread(self.capacity_update, capacity, generation)
             node = inventory(path, self.state, config, cancel=cancel, progress=progress, full=full)
-            self.call_from_thread(self.capacity_update, capacity)
             self.call_from_thread(self.storage_update, node, generation, True)
             if self.state is not None and not cancel.is_set() and node.entries > 1:
                 try:
@@ -484,7 +486,9 @@ class MacTrimApp(App):
         except Exception as exc:
             self.call_from_thread(self.storage_error, generation, clean(exc))
 
-    def capacity_update(self, rows):
+    def capacity_update(self, rows, generation=None):
+        if generation is not None and generation != self.storage_generation:
+            return
         self.capacity_rows = rows
         text = Text()
         for row in rows:
@@ -509,7 +513,7 @@ class MacTrimApp(App):
             self.storage_inventory = node
             self.load_storage_page()
         self.refresh_storage()
-        self.query_one('#storage-status', Static).update(Text('%s · %s metadata visits · %s' % (node.status.upper(), getattr(node, 'counters', {}).get('visited', node.entries), '; '.join(node.issues[:2]) if done else 'Measurement running; navigation and cancellation available'), style=STATUS_COLOR.get(node.status, '#fbbf24')))
+        self.query_one('#storage-status', Static).update(Text('%s · %s metadata visits · %s' % (node.status.upper(), getattr(node, 'counters', {}).get('visited', node.entries), '; '.join(node.issues[:2]) if done else ('%s · %s' % (getattr(node, 'progress', {}).get('phase', 'Measuring'), clean(getattr(node, 'progress', {}).get('path', node.path))))), style=STATUS_COLOR.get(node.status, '#fbbf24')))
 
     def refresh_storage(self):
         if self.storage_node is None:
@@ -527,7 +531,7 @@ class MacTrimApp(App):
         graph_rows = sorted(node.children, key=lambda row: -getattr(row, metric))[:15]
         for index, child in enumerate(self.storage_nodes):
             table.add_row(Text(child.status.upper(), style=STATUS_COLOR.get(child.status, '#94a3b8')), human(getattr(child, metric)), Text(clean(child.name) + ('/' if child.kind == 'directory' else '')), key=child.path)
-        for index, child in enumerate(graph_rows if not self.storage_measuring else []):
+        for index, child in enumerate(graph_rows):
             fraction = getattr(child, metric) / total if total else 0
             bar = '━' * round(fraction * 24)
             text = Text('%2d  ' % (index + 1))
@@ -538,7 +542,7 @@ class MacTrimApp(App):
             table.move_cursor(row=min(old_index, len(self.storage_nodes) - 1))
         refresh = getattr(node, 'refresh', {})
         cache = refresh.get('cache', {})
-        refresh_note = '%s · visited %s / reused %s · %s' % (refresh.get('mode', 'scanning').upper(), refresh.get('visited', 0), refresh.get('reused_entries', 0), refresh.get('reason', ''))
+        refresh_note = '%s · visited %s / reused %s · %s' % (refresh.get('mode', 'scanning').upper(), getattr(node, 'counters', {}).get('visited', refresh.get('visited', 0)), getattr(node, 'counters', {}).get('reused', refresh.get('reused_entries', 0)), refresh.get('reason', ''))
         if refresh.get('last_verified'):
             refresh_note += ' · verified ' + datetime.fromtimestamp(refresh['last_verified']).strftime('%b %d %H:%M:%S')
         if cache:
@@ -547,7 +551,9 @@ class MacTrimApp(App):
             refresh_note += ' · ' + '; '.join(refresh['warnings'][:2])
         difference = accounting(node, self.capacity_rows)['difference'] if node.path == '/' else None
         note = (' · signed filesystem difference %s (APFS/excluded/inaccessible)' % signed_size(difference)) if difference is not None else ''
-        self.query_one('#storage-summary', Static).update(Text('%s %s · %s · page %s%s\nGraph: top 15 directories / filesystem used at root (allocated), otherwise scope estimate; partial scope totals are lower bounds. Inaccessible scopes are unknown. Full rescan has no entry/depth cap.' % (human(getattr(node, metric)), metric, 'SCANNING; unfinished totals' if self.storage_measuring else node.status.upper(), self.storage_offset // PAGE_SIZE + 1, note) + '\n' + refresh_note))
+        if self.storage_measuring:
+            refresh_note += ' · live rows: first %s immediate directories; totals include all observations' % PAGE_SIZE
+        self.query_one('#storage-summary', Static).update(Text('%s %s · %s · page %s%s\nGraph: top 15 directories / filesystem used at root (allocated), otherwise scope estimate; partial scope totals are lower bounds. Inaccessible scopes are unknown. Full rescan has no entry/depth cap.' % (human(getattr(node, metric)), metric, 'SCANNING; observed lower bounds' if self.storage_measuring else node.status.upper(), self.storage_offset // PAGE_SIZE + 1, note) + '\n' + refresh_note))
 
     @work(thread=True, group='storage-cache', exclusive=True)
     def clear_storage_cache(self):
@@ -613,9 +619,13 @@ class MacTrimApp(App):
         if node and node.kind == 'directory' and node.status not in {'denied', 'skipped'}:
             self.start_storage(path)
 
+    def cancel_storage(self):
+        self.storage_cancel.set()
+        self.query_one('#storage-status', Static).update('Cancellation requested; waiting for the current operation to return…')
+
     def action_cancel(self):
         if self.query_one('#tabs', TabbedContent).active == 'storage':
-            self.storage_cancel.set()
+            self.cancel_storage()
         elif self.scanning:
             self.scan_cancel.set()
             self.message('Cancellation requested; already discovered reports remain visible')
@@ -648,7 +658,7 @@ class MacTrimApp(App):
         elif identifier == 'storage-refresh':
             self.start_storage(self.storage_path)
         elif identifier == 'cancel-storage':
-            self.storage_cancel.set()
+            self.cancel_storage()
         elif identifier == 'storage-full':
             self.start_storage(self.storage_path, full=True)
         elif identifier == 'storage-clear' and not self.storage_measuring and self.state is not None:
@@ -718,7 +728,7 @@ class MacTrimApp(App):
             change = 'unknown' if delta is None else ('+' if delta > 0 else '') + human(delta)
             percent = '—' if row['percent'] is None else '%+.1f%%' % row['percent']
             table.add_row(Text(row['status'], style=color), Text(change, style=color), percent, Text(clean(row['path'])), key=row['path'])
-        for index, child in enumerate(graph_rows if not self.storage_measuring else []):
+            if index < 15:
                 bar = '━' * round(abs(delta or 0) / scale * 24)
                 text = Text(bar.ljust(24) + ' ' + change + '\n' + clean(row['path']), style=color)
                 chart.add_option(Option(text, id=row['path']))

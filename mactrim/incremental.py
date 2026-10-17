@@ -4,7 +4,9 @@ from pathlib import Path
 import time
 from . import events
 from .history import policy
-from .safety import SafetyError, canonical, clean, within
+from .safety import SafetyError, canonical, clean
+from .regions import Regions, Cancelled, check_cancel
+from .storage import progress_snapshot
 from .storage import complete, _signature
 from .storage_cache import Cache, SCHEMA, flatten
 
@@ -28,6 +30,14 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
     excluded = (state.path / 'storage-cache', state.path / 'history') if state else ()
     warnings, dirty, previous, nodes, cached = [], set(), None, {}, None
     visits = 0
+    node = None
+    def phase(value):
+        check_cancel(cancel)
+        if progress and node is not None:
+            snapshot = progress_snapshot(node, value, node.path)
+            snapshot.counters['visited'] = visits
+            snapshot.metadata_visits = visits
+            progress(snapshot, snapshot)
     reason, mode = 'Complete initial inventory', 'full'
     current_policy = policy(config, path, 'storage.complete.v1')
     # Measurement-owned stores are explicitly excluded and accounted separately.
@@ -62,19 +72,25 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
                 mode = 'incremental'
                 reason = 'Persistent FSEvents replay; changed directories measured, unchanged subtrees reused'
             accounting_scopes = previous.get('reconcile_scopes', [str(path)] if previous.get('requires_reconcile') else []) if previous else []
-            if any(within(region, scope) or within(scope, region) for region in dirty for scope in accounting_scopes):
+            dirty_index = Regions(dirty, cancel)
+            if dirty_index.intersects_any(accounting_scopes, cancel):
                 compatible = False; mode = 'full'
                 reason = 'Hardlink/alias accounting spans directories; full reconciliation'
             def walk(regions, allow_reuse):
                 nonlocal visits
+                regions = Regions(regions, cancel)
+                def walk_progress(snapshot, current):
+                    snapshot.counters['visited'] += visits
+                    snapshot.metadata_visits += visits
+                    progress(snapshot, current)
                 def reuse(node, st):
                     old = nodes.get(node.path)
                     if not old or old.status != 'measured' or old.signature != _signature(st):
                         return None
-                    if any(within(node.path, value) or within(value, node.path) for value in regions):
+                    if regions.intersects(node.path):
                         return None
                     return old
-                result = complete(path, cancel=cancel, progress=progress, exclusions=excluded,
+                result = complete(path, cancel=cancel, progress=walk_progress if progress else None, exclusions=excluded,
                                   reuse=reuse if allow_reuse else None)
                 visits += result.counters['visited']
                 return result
@@ -82,6 +98,7 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
             # below or replayed next time; checkpoint persistence is transactional.
             checkpoint = events.current_id()
             node = walk(dirty, compatible and not full)
+            phase('Checking filesystem events')
             after, lost, _ = watcher.drain()
             if node.counters['reused'] and getattr(node, 'requires_reconcile', False):
                 checkpoint = events.current_id()
@@ -90,9 +107,12 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
                 mode, reason = 'full', 'New multiply-linked file requires global accounting reconciliation'
             if after and not lost and node.status != 'cancelled' and not getattr(node, 'requires_reconcile', False):
                 # One bounded reconciliation round avoids chasing hot writers.
-                nodes = {row.path: row for row in iter_nodes(node)}
-                compatible = not any(within(region, scope) or within(scope, region)
-                                     for region in after for scope in accounting_scopes)
+                phase('Reconciling changed directories')
+                nodes = {}
+                for row in iter_nodes(node):
+                    check_cancel(cancel)
+                    nodes[row.path] = row
+                compatible = not Regions(after, cancel).intersects_any(accounting_scopes, cancel)
                 checkpoint = events.current_id()
                 node = walk(after, compatible)
                 after, lost, _ = watcher.drain()
@@ -105,8 +125,15 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
                 warnings.extend(lost)
                 node.status = 'partial' if node.status != 'cancelled' else node.status
                 node.issues.append('Filesystem still changing or event continuity uncertain; pending regions: ' + ', '.join(sorted(after)[:8]))
+                phase('Classifying unsettled directories')
+                after_index = Regions(after, cancel)
+                updated = time.monotonic()
                 for row in iter_nodes(node):
-                    if row.status == 'measured' and (lost or any(within(row.path, value) or within(value, row.path) for value in after)):
+                    check_cancel(cancel)
+                    if time.monotonic() - updated >= .15:
+                        phase('Classifying unsettled directories')
+                        updated = time.monotonic()
+                    if row.status == 'measured' and (lost or after_index.intersects(row.path)):
                         row.status = 'partial'
                         row.issues.append('Unsettled filesystem events; growth for this scope remains unknown')
                 # Retain the pre-walk checkpoint so unsettled changes replay next time.
@@ -118,15 +145,26 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
                             'visited': node.counters['visited'], 'reused_entries': node.counters['reused'],
                             'last_verified': node.completed_at, 'warnings': warnings}
             if cache and node.status != 'cancelled':
+                phase('Saving directory index')
+                directories = flatten(node, cancel=cancel)
+                check_cancel(cancel)
                 body = {'schema': SCHEMA, 'scope': str(path), 'policy': current_policy, 'volume': identity,
                         'checkpoint': checkpoint, 'previous_checkpoint': previous['checkpoint'] if previous else None,
                         'created_at': node.completed_at, 'full_at': previous['full_at'] if mode == 'incremental' else node.completed_at,
                         'complete_index': True, 'reconcile_scopes': sorted(set(getattr(node, 'reconcile_scopes', [])) | (set(accounting_scopes) if mode == 'incremental' else set())), 'requires_reconcile': bool(getattr(node, 'requires_reconcile', False) or (mode == 'incremental' and previous.get('requires_reconcile'))),
-                        'directories': flatten(node)}
+                        'directories': directories}
                 try:
-                    node.refresh['cache'] = cache.write(body)
+                    node.refresh['cache'] = cache.write(body, cancel=cancel)
                 except (OSError, SafetyError) as exc:
                     warnings.append(clean(exc))
+    except Cancelled:
+        if node is None:
+            node = complete(path, cancel=cancel, exclusions=excluded)
+        node.status = 'cancelled'
+        node.issues.append('Cancelled during reconciliation; cache checkpoint preserved')
+        node.counters['visited'] = node.metadata_visits = visits or node.counters['visited']
+        node.refresh = {'mode': mode, 'reason': reason, 'visited': node.counters['visited'],
+                        'reused_entries': node.counters['reused'], 'warnings': warnings}
     except (ImportError, OSError, SafetyError) as exc:
         warnings.append(clean(exc))
         node = complete(path, cancel=cancel, progress=progress, exclusions=excluded)

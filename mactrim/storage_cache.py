@@ -11,6 +11,7 @@ import stat
 import time
 from .safety import SafetyError, canonical, directory_fd, json_bytes, within, rename_exclusive
 from .storage import StorageNode
+from .regions import check_cancel
 
 MAX_BYTES = 16 * 1024 * 1024
 MAX_DECODED = 64 * 1024 * 1024
@@ -20,9 +21,10 @@ def metadata(st):
     return (st.st_dev, st.st_ino, st.st_mode, st.st_uid, st.st_nlink, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
 
-def flatten(root):
+def flatten(root, cancel=None):
     rows, pending = [], [root]
     while pending:
+        check_cancel(cancel)
         node = pending.pop()
         row = dict(node.summary(), path=node.path, name=node.name, protected=node.protected,
                    own_logical=node.own_logical, own_allocated=node.own_allocated,
@@ -160,7 +162,8 @@ class Cache:
         self.read_metadata, self.read_digest = st, hashlib.sha256(encoded).digest()
         return body, root, nodes
 
-    def write(self, body):
+    def write(self, body, cancel=None):
+        check_cancel(cancel)
         self.prepare()
         encoded = gzip.compress(json_bytes(self.state.sign(body)), mtime=0)
         footprint = self.footprint()
@@ -174,6 +177,7 @@ class Cache:
             reserve = ((len(encoded) + self.unit - 1) // self.unit) * self.unit + 4 * self.unit
         if footprint + reserve > self.limit:
             return {'stored': False, 'reason': 'Cache cap too small for atomic replacement; next scan measures fully', 'allocated_bytes': footprint, 'limit_bytes': self.limit}
+        check_cancel(cancel)
         with self.state.lock(), directory_fd(self.path) as fd:
             expected = self.read_digest
             current = self.read()
@@ -188,6 +192,7 @@ class Cache:
             # covers commit, never filesystem traversal.
             if body.get('previous_checkpoint') is not None and current and current[0]['checkpoint'] != body['previous_checkpoint']:
                 raise SafetyError('Concurrent cache refresh won; candidate preserved in memory')
+            check_cancel(cancel)
             name = '.pending-' + secrets.token_hex(8)
             out = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
             try:
