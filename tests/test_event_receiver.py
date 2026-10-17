@@ -113,3 +113,88 @@ class IsolatedNativeTests(unittest.TestCase):
         finally:
             if process.poll() is None: process.kill(); process.wait()
             for stream in (process.stdout, process.stderr): stream.close()
+
+class ProtocolDeadlineTests(unittest.TestCase):
+    def test_partial_response_cannot_block_past_deadline(self):
+        receiver = NativeEvents('/fixture')
+        receiver.process = subprocess.Popen([sys.executable, '-c',
+            "import sys,time; sys.stdin.buffer.readline(); sys.stdout.write('{'); sys.stdout.flush(); time.sleep(30)"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
+        try:
+            with self.assertRaisesRegex(SafetyError, 'timed out'):
+                receiver._request({'command': 'drain'}, timeout=.1)
+        finally:
+            receiver.__exit__()
+        self.assertIsNotNone(receiver.process.poll())
+
+    def test_cancel_interrupts_an_in_flight_response(self):
+        receiver = NativeEvents('/fixture')
+        receiver.process = subprocess.Popen([sys.executable, '-c',
+            'import sys,time; sys.stdin.buffer.readline(); time.sleep(30)'],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
+        receiver.cancel = threading.Event()
+        timer = threading.Timer(.1, receiver.cancel.set)
+        timer.start()
+        try:
+            with self.assertRaises(Cancelled): receiver._request({'command': 'drain'})
+        finally:
+            timer.cancel(); receiver.__exit__()
+        self.assertIsNotNone(receiver.process.poll())
+
+    def test_actual_receiver_death_after_measurement_preserves_saved_tree(self):
+        if sys.platform != 'darwin': self.skipTest('native macOS FSEvents')
+        from mactrim.incremental import inventory
+        from mactrim.config import defaults
+        from mactrim.state import State
+        from mactrim.storage import complete
+        from mactrim.storage_cache import Cache
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            data = root / 'data'; data.mkdir()
+            (data / 'file').write_bytes(b'saved measurement')
+            state = State(root / 'state').prepare()
+            receiver = None
+            def backend(*args):
+                nonlocal receiver
+                receiver = NativeEvents(*args)
+                return receiver
+            def progress(snapshot, _):
+                if snapshot.progress['phase'] == 'Checking filesystem events':
+                    receiver.process.kill(); receiver.process.wait(timeout=2)
+            with patch('mactrim.incremental.complete', wraps=complete) as walker:
+                observed = inventory(data, state, defaults(), backend=backend, progress=progress)
+            self.assertEqual(walker.call_count, 1)
+            self.assertEqual(observed.logical, complete(data).logical)
+            self.assertEqual(observed.status, 'partial')
+            self.assertTrue(observed.refresh['cache']['stored'])
+            self.assertFalse(observed.refresh['cache']['reusable'])
+            self.assertEqual(Cache(state, defaults()['storage_cache']).read()[1].logical, observed.logical)
+            self.assertIsNotNone(receiver.process.poll())
+
+    def test_eof_reaps_helper_even_when_native_drain_stalls(self):
+        program = '''
+import sys,time
+import mactrim.event_receiver as receiver
+class Stalled:
+    diagnostics = {}
+    def __init__(self,*args): pass
+    def __enter__(self): return self
+    def __exit__(self,*args): pass
+    def drain(self):
+        print('draining', flush=True)
+        time.sleep(30)
+receiver.EventCollector = Stalled
+raise SystemExit(receiver.main())
+'''
+        process = subprocess.Popen([sys.executable, '-c', program], stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            process.stdin.write(b'{"root":"/fixture","since":1,"exclusions":[]}\n'); process.stdin.flush()
+            self.assertTrue(json.loads(process.stdout.readline())['ready'])
+            process.stdin.write(b'{"command":"drain"}\n'); process.stdin.flush()
+            self.assertEqual(process.stdout.readline().strip(), b'draining')
+            process.stdin.close()
+            self.assertEqual(process.wait(timeout=5), 0)
+        finally:
+            if process.poll() is None: process.kill(); process.wait()
+            for stream in (process.stdout, process.stderr): stream.close()

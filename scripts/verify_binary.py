@@ -85,6 +85,13 @@ def main():
         baseline = json.loads(run(prefix + ['storage', data, '--json', '--full']).stdout)['measurement']
         quiet = json.loads(run(prefix + ['storage', data, '--json']).stdout)['measurement']
         assert quiet['refresh']['mode'] == 'incremental', quiet['refresh']
+        for observed in (baseline, quiet):
+            diagnostics = observed['refresh']['events']
+            assert diagnostics['receiver_pid'] > 0, diagnostics
+            assert diagnostics['latency_seconds'] == 1.0, diagnostics
+            assert diagnostics['callbacks'] > 0, diagnostics
+            assert not diagnostics.get('tracking_error'), diagnostics
+        report['event_receiver'] = quiet['refresh']['events']
         assert not quiet['refresh']['warnings'], quiet['refresh']
         assert quiet['logical'] == baseline['logical'] and quiet['allocated'] == baseline['allocated']
         assert quiet['counters']['visited'] < baseline['counters']['visited']
@@ -219,6 +226,8 @@ def main():
             text = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', transcript.decode(errors='replace'))
             args.report.with_suffix('.ansi').write_bytes(transcript)
             assert all(label in text for label in ('Cleanup', 'Storage', 'History / Growth'))
+            assert 'Receiver:' in text, 'Receiver diagnostics did not render in Storage'
+            report['receiver_diagnostics_rendered'] = True
             missing = [content for content in ('quarantine frees 0 bytes', 'Root /', 'Previous compatible', 'Latest observation') if content not in text]
             assert not missing, 'Tab content did not render: ' + repr(missing)
             assert 'Traceback' not in text and 'ModuleNotFoundError' not in text
