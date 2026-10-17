@@ -37,14 +37,14 @@ class RegionTests(unittest.TestCase):
 
 
 class ProgressTests(unittest.TestCase):
-    def test_browsable_levels_are_discovered_without_visiting_deferred_interiors(self):
+    def test_completed_directory_totals_are_visible_before_whole_scan_finishes(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
             for name in ('node_modules/package/deep', 'a/child/leaf', 'z/child/leaf'):
                 (root / name).mkdir(parents=True)
                 (root / name / 'payload').write_bytes(b'x' * 8192)
             order, snapshots = [], []
-            clock = iter(range(1000000))
+            clock = iter(range(1, 1000000))
             def progress(snapshot, current):
                 if current.path not in order:
                     order.append(current.path)
@@ -54,11 +54,10 @@ class ProgressTests(unittest.TestCase):
             visible = [str(root / name) for name in ('a', 'z', 'a/child', 'z/child', 'a/child/leaf', 'z/child/leaf')]
             self.assertTrue(all(path in order for path in visible))
             self.assertNotIn(str(root / 'node_modules/package'), order)
-            depths = [len(Path(path).relative_to(root).parts) for path in order if path in visible]
-            self.assertEqual(depths, sorted(depths))
+            self.assertTrue({'a', 'z', 'node_modules'} <= {row.name for row in snapshots[0].children})
             self.assertTrue({'a', 'z', 'node_modules'} <= {row.name for row in snapshots[-1].children})
-            self.assertTrue(all(child.status != 'measured' for row in snapshots for child in row.children))
-            self.assertLess(result.logical, complete(root, lazy=False).logical)
+            self.assertTrue(any(row.status == 'scanning' and any(child.status == 'measured' and child.logical >= 8192 for child in row.children) for row in snapshots))
+            self.assertEqual(result.logical, complete(root, lazy=False).logical)
 
     def test_selected_directory_sizes_include_deep_observations_before_final_aggregation(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -67,10 +66,10 @@ class ProgressTests(unittest.TestCase):
             payload.parent.mkdir(parents=True)
             payload.write_bytes(b'x' * 8192)
             seen = []
-            clock = iter(range(1000000))
+            clock = iter(range(1, 1000000))
             with patch('mactrim.storage.time.monotonic', side_effect=lambda: next(clock)):
                 result = complete(root, progress=lambda snapshot, _: seen.append(snapshot), view=lambda: root / 'a')
-            running = [row.view for row in seen if hasattr(row, 'view') and row.progress['phase'] == 'Enumerating metadata']
+            running = [row.view for row in seen if hasattr(row, 'view') and row.progress['phase'] == 'Native size scan']
             self.assertGreaterEqual(running[-1].logical, 8192)
             self.assertGreaterEqual(running[-1].children[0].logical, 8192)
             self.assertEqual(running[-1].logical, result.children[0].logical)
@@ -85,7 +84,7 @@ class ProgressTests(unittest.TestCase):
             baseline = complete(root)
             quiet = next(child for child in baseline.children[0].children if child.name == 'quiet')
             seen = []
-            clock = iter(range(1000000))
+            clock = iter(range(1, 1000000))
             with patch('mactrim.storage.time.monotonic', side_effect=lambda: next(clock)):
                 result = complete(root, progress=lambda snapshot, _: seen.append(snapshot), view=lambda: root / 'a',
                                   reuse=lambda node, _: quiet if node.path == quiet.path else None)
@@ -106,7 +105,7 @@ class ProgressTests(unittest.TestCase):
             (root / 'visible/child').mkdir(parents=True)
             (root / 'visible/child/payload').write_bytes(b'x' * 8192)
             cancel = threading.Event()
-            clock = iter(range(1000000))
+            clock = iter(range(1, 1000000))
             def progress(snapshot, _):
                 if any(child.logical >= 8192 for child in snapshot.children):
                     cancel.set()
@@ -139,7 +138,7 @@ class ProgressTests(unittest.TestCase):
                 nodes = {child.path: child for child in baseline.children}
                 seen = []
                 # Force progress at every notification to exercise accounting mid-directory.
-                clock = iter(range(1000000))
+                clock = iter(range(1, 1000000))
                 with patch('mactrim.storage.time.monotonic', side_effect=lambda: next(clock)):
                     result = complete(root, progress=lambda snapshot, _: seen.append(snapshot),
                                       reuse=(lambda node, _: nodes.get(node.path)) if reuse else None)
@@ -150,9 +149,8 @@ class ProgressTests(unittest.TestCase):
                 self.assertEqual([row.logical for row in seen], sorted(row.logical for row in seen))
                 self.assertLess(seen[0].logical, result.logical)  # early snapshots stay stable
                 self.assertTrue(any(row.logical >= 8192 for row in seen[1:]))
-                self.assertTrue(all(row.status == 'scanning' for row in seen))
-                self.assertTrue(all(child.status != 'measured' for row in seen for child in row.children)
-                                if not reuse else True)
+                self.assertTrue(all(row.status == ('measured' if row.progress['scope_finished'] else 'scanning') for row in seen))
+                self.assertEqual(seen[-1].status, 'measured')
                 self.assertEqual(sum(child.logical for child in seen[-1].children) + result.own_logical, result.logical)
 
     def test_hot_regions_preserve_unaffected_measurements_and_cancel_without_commit(self):
@@ -187,7 +185,7 @@ class ProgressTests(unittest.TestCase):
                     result = inventory(data, state, config, cancel=cancel, progress=progress, full=True, backend=HotEvents)
                     self.assertEqual(result.status, 'cancelled', stop_phase)
                     self.assertEqual(cache_path.read_bytes(), old)
-                    measured = [row for row in seen if row.progress['phase'] != 'Enumerating metadata']
+                    measured = [row for row in seen if row.progress['phase'] != 'Native size scan']
                     self.assertTrue(measured)
                     self.assertGreater(measured[0].allocated, 0)
                     self.assertGreater(measured[0].counters['visited'], 0)

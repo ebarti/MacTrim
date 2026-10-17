@@ -34,27 +34,22 @@ class LazyStorageTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
-    def test_dependency_interiors_are_never_opened_until_selected(self):
-        original = os.scandir
-        boundary_inodes = {path.stat().st_ino for path in (self.dependencies, self.data / '.venv')}
-        def guarded_scandir(fd):
-            self.assertNotIn(os.fstat(fd).st_ino, boundary_inodes, 'Unopened dependency folder was enumerated')
-            return original(fd)
-        with patch('mactrim.storage.os.scandir', side_effect=guarded_scandir):
-            compact = complete(self.data)
+    def test_dependency_sizes_are_measured_but_browsing_details_are_collapsed(self):
+        compact = complete(self.data)
         self.assertEqual(len(compact.children), 2)
-        self.assertEqual(compact.status, 'deferred')
+        self.assertEqual(compact.status, 'measured')
         for child in compact.children:
             self.assertTrue(child.details_deferred)
             self.assertFalse(child.children)
-            self.assertEqual(child.summary()['size_state'], 'unmeasured')
-            self.assertEqual(child.status, 'deferred')
+            self.assertEqual(child.summary()['size_state'], 'measured')
+            self.assertEqual(child.status, 'measured')
+            self.assertGreaterEqual(child.logical, 4096)
             self.assertEqual(page(child), ([], False))
         details = complete(self.dependencies)
         self.assertFalse(details.details_deferred)
         self.assertTrue(details.children)
         self.assertGreaterEqual(details.logical, 8192)
-        self.assertEqual(details.status, 'measured')
+        self.assertEqual(details.logical, find_directory(compact, self.dependencies).logical)
         self.assertFalse(next(row for row in aggregates(compact) if row['path'] == str(self.dependencies))['children_complete'])
 
     def test_hardlinks_sparse_files_and_permission_errors_preserve_accounting(self):
@@ -72,7 +67,7 @@ class LazyStorageTests(unittest.TestCase):
         cancel = threading.Event(); cancel.set()
         self.assertEqual(complete(self.data,cancel=cancel).status,'cancelled')
 
-    def test_native_restart_reuses_deferred_index_and_open_detects_deep_edit(self):
+    def test_native_restart_reuses_summary_index_and_remeasures_deep_edit(self):
         first = inventory(self.data,self.state,defaults())
         cache = Cache(self.state,defaults()['storage_cache'])
         _, tree, nodes = cache.read()
@@ -83,8 +78,8 @@ class LazyStorageTests(unittest.TestCase):
         payload = self.dependencies / 'package' / 'lib' / 'payload'
         payload.write_bytes(b'z' * 24000)
         changed = inventory(self.data,self.state,defaults())
-        self.assertEqual(changed.logical, first.logical)
-        self.assertTrue(all(child.status == 'deferred' for child in changed.children))
+        self.assertGreater(changed.logical, first.logical)
+        self.assertTrue(all(child.status == 'measured' for child in changed.children))
         opened = inventory(self.dependencies, None, defaults())
         self.assertGreaterEqual(opened.logical, 24000)
         self.assertTrue(changed.refresh['cache']['reusable'])
@@ -105,37 +100,34 @@ class LazyStorageTests(unittest.TestCase):
         self.assertEqual(compact.logical,old.logical)
         self.assertTrue(all(n.details_deferred and not n.children for n in compact.children))
 
-    def test_on_demand_history_does_not_claim_growth_against_recursive_baseline(self):
+    def test_native_history_does_not_compare_against_legacy_unmeasured_policy(self):
         history = History(self.state, defaults())
-        old = history.capture(complete(self.data, lazy=False), [])
+        legacy = complete(self.data)
+        legacy.collector = 'storage.on-demand.v2'
+        old = history.capture(legacy, [])
         new = history.capture(complete(self.data), [])
         result = history.compare(old['id'], new['id'])
         self.assertEqual(result['rows'], [])
         self.assertIn('Incompatible', result['issues'][0])
 
-    def test_depth_nine_is_not_enumerated_until_opened(self):
+    def test_depth_nine_keeps_recursive_bytes_without_retaining_inner_nodes(self):
         paths = [self.data]
         for depth in range(1, 20):
             paths.append(paths[-1] / ('level-%s' % depth))
             paths[-1].mkdir()
         (paths[-1] / 'payload').write_bytes(b'deep' * 4096)
-        original = os.scandir
-        boundary_inode = paths[LAZY_DEPTH + 1].stat().st_ino
-        def guarded_scandir(fd):
-            self.assertNotEqual(os.fstat(fd).st_ino, boundary_inode)
-            return original(fd)
-        with patch('mactrim.storage.os.scandir', side_effect=guarded_scandir):
-            compact = complete(self.data)
+        compact = complete(self.data)
         self.assertFalse(find_directory(compact, paths[LAZY_DEPTH]).details_deferred)
         summary = find_directory(compact, paths[LAZY_DEPTH + 1])
         self.assertTrue(summary.details_deferred)
         self.assertFalse(summary.children)
         self.assertIsNone(find_directory(compact, paths[LAZY_DEPTH + 2]))
-        self.assertEqual(summary.summary()['size_state'], 'unmeasured')
+        self.assertEqual(summary.summary()['size_state'], 'measured')
         detail = complete(paths[LAZY_DEPTH + 1])
+        self.assertEqual(detail.logical, summary.logical)
         self.assertFalse(detail.details_deferred)
         self.assertTrue(find_directory(detail, paths[18]).details_deferred)
-        self.assertEqual(find_directory(detail, paths[18]).summary()['size_state'], 'unmeasured')
+        self.assertEqual(find_directory(detail, paths[18]).summary()['size_state'], 'measured')
         self.assertGreaterEqual(complete(paths[18]).logical, 16384)
         self.assertFalse(next(row for row in aggregates(compact) if row['path'] == summary.path)['children_complete'])
 
@@ -169,8 +161,8 @@ class LazyStorageTests(unittest.TestCase):
         self.assertTrue(quiet.refresh['cache']['reusable'])
         payload.write_bytes(b'changed deep file' * 4096)
         changed = inventory(self.data, self.state, defaults())
-        self.assertEqual(changed.logical, first.logical)
-        self.assertEqual(changed.status, 'deferred')
+        self.assertGreater(changed.logical, first.logical)
+        self.assertEqual(changed.status, 'measured')
         _, tree, nodes = Cache(self.state, defaults()['storage_cache']).read()
         self.assertTrue(changed.refresh['cache']['reusable'])
         self.assertTrue(all(len(Path(node.path).relative_to(self.data).parts) <= 9 for node in nodes.values()))

@@ -103,8 +103,10 @@ def main():
         assert not quiet['refresh']['warnings'], quiet['refresh']
         assert quiet['logical'] == baseline['logical'] and quiet['allocated'] == baseline['allocated']
         summary = next(row for row in baseline['children'] if row['name'] == 'node_modules')
-        assert summary['details_deferred'] and summary['size_state'] == 'unmeasured'
-        assert summary['status'] == 'deferred'
+        assert summary['details_deferred'] and summary['size_state'] == 'measured'
+        assert summary['status'] == 'measured'
+        assert summary['logical'] >= 8192
+        assert baseline['native']['backend'] == 'system-fts'
         index = state / 'storage-cache' / 'index.json.gz'
         saved_index = index.read_bytes()
         assert saved_index.startswith(b'MACTRIM-INDEX-3\n')
@@ -118,16 +120,16 @@ def main():
             assert depth <= 9
             if depth == 9:
                 assert row[-1] is True
-                assert row[2] == 0 and row[9] == 'deferred', 'Unopened depth boundary was measured'
+                assert row[2] >= len(b'beyond depth eight') and row[9] == 'measured', 'Collapsed depth boundary lost recursive bytes'
                 deferred += 1
         assert deferred > 0
-        report['lazy_depth_boundary'] = {'detailed_levels': 8, 'unopened_level': 9, 'interior_unmeasured': True}
+        report['lazy_depth_boundary'] = {'detailed_levels': 8, 'unopened_level': 9, 'aggregate_measured': True}
         detail = json.loads(run(['--state', root / 'detail-state', '--config', config,
                                  'storage', dependency, '--json']).stdout)['measurement']
         assert not detail['details_deferred'] and detail['children']
-        assert detail['logical'] >= 8192 and detail['status'] == 'measured'
+        assert detail['logical'] == summary['logical'] and detail['status'] == 'measured'
         assert index.read_bytes() == saved_index
-        report['lazy_dependency_details'] = {'summary_unmeasured': True, 'explicit_details_loaded': True,
+        report['lazy_dependency_details'] = {'aggregate_measured': True, 'explicit_details_loaded': True,
                                               'main_index_preserved': True}
         assert quiet['counters']['visited'] < baseline['counters']['visited']
         first = json.loads(run(prefix + ['history', 'capture', data]).stdout)
