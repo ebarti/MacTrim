@@ -17,6 +17,8 @@ The executable launcher works from a fresh shell and any working directory; it u
 
 Cleanup, Storage, and History / Growth are separate tabs. Discovery and measurement run in background workers, publish partial results, and support cancellation. Keyboard shortcuts appear in the footer. Cleanup offers search, status filter, sorting, category counts, full evidence/blockers, selected totals, fresh validation, and an exact typed approval dialog. Reports cannot be selected. Storage's chart and sortable list share measured nodes: Enter drills down; Parent, Root, Refresh, logical/allocated mode and breadcrumbs support navigation. Storage measures every accessible entry with no entry/depth cutoff. Full rescan forces a fresh baseline; Refresh uses native filesystem events. Directory/file rows are paged independently of measurement. History retains up to 5000 directory aggregates. Storage and History never grant cleanup authority.
 
+Scan cancellation uses **Ctrl+X** on the Cleanup or Storage tab, or that tab's Cancel button. A confirmation names the target scan (and Storage path): **Y** stops it; **N**, **Esc**, or the default No button keeps it running. Esc alone never cancels a scan. Cleanup and Storage can run independently; cancelling one leaves the other running. Interrupted Storage progress is not saved; its previous saved index is preserved.
+
 ```sh
 ./mactrim-launch tui
 ./mactrim-launch storage /

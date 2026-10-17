@@ -180,6 +180,32 @@ def main():
             report['extraction_allocated_bytes'] = sum(path.stat().st_blocks * 512 for path in files)
             report['extraction_files'] = len(files)
             assert not any('.venv' in path.parts or 'evidence' in path.parts or 'tests' in path.parts for path in files)
+            # Exercise cancellation through the frozen app's real terminal input.
+            # Native replay's settling window keeps this fixture refresh active
+            # while the user answers; no source injection or whole-Mac scan.
+            def terminal_text(start=0):
+                return re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', transcript[start:].decode(errors='replace'))
+            os.write(master, b'r')
+            read_for(.15)
+            os.write(master, b'\x1b')
+            read_for(.1)
+            prompt_start = len(transcript)
+            os.write(master, b'\x18')  # Ctrl+X
+            read_for(.25)
+            assert 'Cancel the Storage scan? [y/n]' in terminal_text(prompt_start), terminal_text(prompt_start)
+            os.write(master, b'n')
+            read_for(.1)
+            prompt_start = len(transcript)
+            os.write(master, b'\x18')
+            read_for(.25)
+            assert 'Cancel the Storage scan? [y/n]' in terminal_text(prompt_start), terminal_text(prompt_start)
+            cancelled_start = len(transcript)
+            os.write(master, b'y')
+            read_for(3)
+            assert 'Storage stopped' in terminal_text(cancelled_start), terminal_text(cancelled_start)
+            report['actual_pty_cancellation'] = {'escape_does_not_cancel': True, 'confirmation': 'Ctrl+X then N/Y', 'stopped': True}
+            os.write(master, b'r')
+            read_for(3)
             # Mouse clicks on Textual's real tab strip (row2), then quit from a
             # non-input widget. Labels/content must arrive in terminal output.
             for x in (6, 14, 27):
