@@ -54,5 +54,10 @@
     "max_snapshots": 60,
     "max_days": 60,
     "auto_interval_seconds": 3600
+  },
+  "storage_cache": {
+    "enabled": true,
+    "max_bytes": 16777216,
+    "reconcile_seconds": 604800
   }
 }

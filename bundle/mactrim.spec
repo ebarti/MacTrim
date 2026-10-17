@@ -14,7 +14,7 @@ a = Analysis(
     pathex=[str(ROOT)],
     binaries=[],
     datas=copy_metadata('textual') + copy_metadata('rich'),
-    hiddenimports=['mactrim.ui'] + ['textual.widgets._' + name for name in WIDGETS],
+    hiddenimports=['mactrim.ui', 'FSEvents', 'CoreFoundation', 'Foundation', 'objc'] + ['textual.widgets._' + name for name in WIDGETS],
     hookspath=[], hooksconfig={}, runtime_hooks=[],
     excludes=['tests', 'unittest', 'pytest', 'pip', 'setuptools', 'tkinter'],
     noarchive=False, optimize=0,

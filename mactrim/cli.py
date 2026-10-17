@@ -39,6 +39,10 @@ def parser():
     storage.add_argument("path", nargs="?", default="/", type=Path)
     storage.add_argument("--json", action="store_true", help="Print complete metadata totals without a terminal")
     storage.add_argument("--max-files", type=int, help="Opt into bounded preview; never used by default Storage")
+    storage.add_argument('--full', action='store_true', help='Force complete reconciliation instead of incremental refresh')
+    storage.add_argument('--no-cache', action='store_true', help='Measure without reading/writing the disposable index')
+    storage.add_argument('--clear-cache', action='store_true', help='Clear only the verified owned Storage index')
+    storage.add_argument('--capture-history', action='store_true', help='Save this complete JSON observation to bounded history without another scan')
     storage.add_argument("--max-depth", type=int, help="Opt into bounded preview depth")
     history = children.add_parser("history", help="Tiny local directory history; capture/list/compare/clear")
     history_sub = history.add_subparsers(dest="history_action", required=True)
@@ -163,15 +167,30 @@ def main(argv=None):
             from .storage import complete, accounting
             preview = arguments.max_files is not None or arguments.max_depth is not None
             if preview:
+                if arguments.capture_history or arguments.clear_cache or arguments.full:
+                    raise SafetyError('Full/cache/history controls require complete Storage, not bounded preview')
                 files, depth = arguments.max_files or 50000, arguments.max_depth or 16
                 if not 1 <= files <= 1000000 or not 1 <= depth <= 64:
                     raise SafetyError("Preview bounds must be positive (files <= 1000000; depth <= 64)")
                 node = measure(arguments.path, files, depth, storage=True,
                                independent_children=canonical(arguments.path) == Path("/"))
             else:
-                node = complete(arguments.path)
+                from .incremental import inventory
+                config = read_config(arguments.config, arguments.state)
+                if arguments.no_cache:
+                    config['storage_cache']['enabled'] = False
+                state = State(arguments.state).prepare()
+                if arguments.clear_cache:
+                    from .storage_cache import Cache
+                    output_json(Cache(state, config['storage_cache']).clear())
+                    return 0
+                node = inventory(arguments.path, state, config, full=arguments.full)
             capacity = capacities('/')
-            output_json({"measurement": node.export(), "filesystems": capacity,
+            snapshot = None
+            if arguments.capture_history:
+                from .history import History
+                snapshot = History(state, config).capture(node, capacity)
+            output_json({"history_snapshot": snapshot, "measurement": node.export(), "filesystems": capacity,
                          "accounting": accounting(node, capacity), "preview": preview,
                          "note": "Metadata only; denied scopes remain unknown; no deletion rights"})
             return 0
@@ -182,8 +201,12 @@ def main(argv=None):
             config = read_config(arguments.config, arguments.state, validate_now=False)
             if arguments.max_files is not None or arguments.max_depth is not None:
                 raise SafetyError("Bounded preview is available with storage --json; interactive Storage is complete")
+            if arguments.no_cache:
+                config['storage_cache']['enabled'] = False
+            if arguments.clear_cache:
+                raise SafetyError('Use storage --json --clear-cache to clear the owned cache')
             config = validate(config, arguments.state)
-            return review(None, State(arguments.state).prepare(), config=config, storage_root=arguments.path, initial_tab="storage")
+            return review(None, State(arguments.state).prepare(), config=config, storage_root=arguments.path, initial_tab="storage", initial_full=arguments.full)
         state = State(arguments.state).prepare()
         if arguments.command == "history":
             from .history import History
@@ -200,8 +223,8 @@ def main(argv=None):
                     node = measure(arguments.path, config['storage_max_files'], config['storage_max_depth'], storage=True,
                                    independent_children=canonical(arguments.path) == Path('/'))
                 else:
-                    from .storage import complete
-                    node = complete(arguments.path)
+                    from .incremental import inventory
+                    node = inventory(arguments.path, state, config)
                 output_json(history.capture(node, capacities('/')))
             elif arguments.history_action == "list":
                 output_json(history.list())

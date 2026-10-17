@@ -140,7 +140,8 @@ class History:
         expected_policy = {'collector', 'scope', 'max_files', 'max_depth', 'root_child_budgets', 'follow_symlinks', 'dataless', 'hardlinks', 'data_alias', 'virtual'}
         complete_policy = body['policy'].get('collector') == 'storage.complete.v1'
         if complete_policy:
-            valid_policy = body['policy'] == policy(self.config, body['scope'], 'storage.complete.v1')
+            base = policy(self.config, body['scope'], 'storage.complete.v1')
+            valid_policy = body['policy'] == base or body['policy'] == dict(base, measurement_state=[str(self.state.path / 'storage-cache'), str(self.state.path / 'history')])
         else:
             valid_policy = (set(body['policy']) == expected_policy and body['policy']['collector'] in {'metadata.v2', 'metadata.v3'} and type(body['policy']['max_files']) is int and 1 <= body['policy']['max_files'] <= 1000000 and type(body['policy']['max_depth']) is int and 1 <= body['policy']['max_depth'] <= 64)
         if not valid_policy:
@@ -216,7 +217,7 @@ class History:
             raise SafetyError('Cancelled/non-directory observations are unsuitable for history')
         now = time.time() if now is None else now
         body = {'schema': SCHEMA, 'id': secrets.token_hex(16), 'created_at': now,
-                'scope': node.path, 'policy': policy(self.config, node.path, getattr(node, 'collector', None)),
+                'scope': node.path, 'policy': getattr(node, 'policy', None) or policy(self.config, node.path, getattr(node, 'collector', None)),
                 'directories': aggregates(node), 'capacity': capacity,
                 'coverage': {'status': node.status, 'entries': node.entries, 'issues': [clean(issue) for issue in node.issues[:16]], 'aggregate_limit': MAX_ENTRIES}}
         self.validate(body, body['id'])

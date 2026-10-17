@@ -29,10 +29,11 @@ class StorageNode(Node):
     page: int = 0
     own_logical: int = 0
     own_allocated: int = 0
+    signature: tuple = ()
 
     def summary(self):
         return dict(super().summary(), collector=self.collector, started_at=self.started_at,
-                    completed_at=self.completed_at, counters=self.counters, exclusions=self.exclusions,
+                    completed_at=self.completed_at, refresh=getattr(self, 'refresh', {}), counters=self.counters, exclusions=self.exclusions,
                     direct_files=self.direct_files, page_size=PAGE_SIZE)
 
     def export(self):
@@ -63,6 +64,8 @@ def complete(path, cancel=None, progress=None, exclusions=(), reuse=None):
     root = StorageNode(str(path), path.name or '/', kind='directory', protected=bool(protected(path)),
                        started_at=time.time(), status='scanning')
     records, directory_inodes, links = [], {}, {}
+    reused = set()
+    reconcile_scopes = set()
     queue = deque([(root, None, None)])
     now, last_progress = time.time(), 0.0
     own_exclusions = tuple(canonical(value) for value in exclusions)
@@ -107,6 +110,7 @@ def complete(path, cancel=None, progress=None, exclusions=(), reuse=None):
                     continue
                 if node.identity in directory_inodes:
                     node.alias_of = directory_inodes[node.identity]
+                    reconcile_scopes.update((node.path, node.alias_of))
                     excluded(node, 'Already accounted directory/firmlink inode')
                     continue
                 directory_inodes[node.identity] = node.path
@@ -117,6 +121,14 @@ def complete(path, cancel=None, progress=None, exclusions=(), reuse=None):
                 initial = os.fstat(fd)
                 if _signature(initial) != _signature(st):
                     raise SafetyError('Directory changed before enumeration')
+                node.signature = _signature(st)
+                cached = reuse(node, st) if reuse else None
+                if cached is not None:
+                    for key in ('logical', 'allocated', 'entries', 'newest_ns', 'direct_files', 'own_logical', 'own_allocated', 'signature', 'recent', 'status', 'issues', 'children', 'kind'):
+                        setattr(node, key, getattr(cached, key))
+                    reused.add(node.path)
+                    root.counters['reused'] += node.entries
+                    continue
                 node.own_logical = st.st_size
                 node.own_allocated = st.st_blocks * 512
                 node.entries = 1
@@ -147,6 +159,7 @@ def complete(path, cancel=None, progress=None, exclusions=(), reuse=None):
                                 continue
                             identity = (child_st.st_dev, child_st.st_ino)
                             if child_st.st_nlink > 1:
+                                reconcile_scopes.add(node.path)
                                 if identity in links:
                                     root.counters['excluded'] += 1
                                     root.exclusions['Already accounted hardlink'] = root.exclusions.get('Already accounted hardlink', 0) + 1
@@ -163,7 +176,8 @@ def complete(path, cancel=None, progress=None, exclusions=(), reuse=None):
                                 node.recent['created_7d'] += allocated
                         except OSError as exc:
                             node.status = 'partial'
-                            node.issues.append('Unobserved entry %s: %s' % (clean(entry.name), clean(exc)))
+                            if len(node.issues) < 16:
+                                node.issues.append('Unobserved entry %s: %s' % (clean(entry.name), clean(exc)))
                             root.counters['denied'] += 1
                         notify(node)
                 final = os.fstat(fd)
@@ -180,6 +194,8 @@ def complete(path, cancel=None, progress=None, exclusions=(), reuse=None):
         notify(node)
     # Reverse breadth-first order propagates directory totals without recursion.
     for node in reversed(records):
+        if node.path in reused:
+            continue
         node.logical = node.own_logical + sum(child.logical for child in node.children)
         node.allocated = node.own_allocated + sum(child.allocated for child in node.children)
         node.entries += sum(child.entries for child in node.children)
@@ -192,6 +208,8 @@ def complete(path, cancel=None, progress=None, exclusions=(), reuse=None):
     if cancel.is_set():
         root.status = 'cancelled'
         root.issues.append('Cancelled; unvisited scopes remain unknown')
+    root.reconcile_scopes = sorted(reconcile_scopes)
+    root.requires_reconcile = bool(reconcile_scopes)
     root.completed_at = time.time()
     if root.counters['denied']:
         root.issues.append('%s inaccessible/replaced entries; estimates are lower bounds' % root.counters['denied'])
@@ -219,7 +237,12 @@ def page(node, offset=0, limit=PAGE_SIZE):
             if entry.name in directories:
                 rows.append(directories[entry.name])
             else:
-                st = os.stat(entry.name, dir_fd=fd, follow_symlinks=False)
+                try:
+                    st = os.stat(entry.name, dir_fd=fd, follow_symlinks=False)
+                except OSError as exc:
+                    rows.append(Node(str(Path(node.path) / entry.name), entry.name, status='denied', issues=[clean(exc)]))
+                    seen += 1
+                    continue
                 rows.append(Node(str(Path(node.path) / entry.name), entry.name, logical=st.st_size,
                                  allocated=st.st_blocks * 512, status='measured',
                                  kind='file' if stat.S_ISREG(st.st_mode) else 'symlink' if stat.S_ISLNK(st.st_mode) else 'special',

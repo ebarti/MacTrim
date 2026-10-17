@@ -7,7 +7,7 @@ name = "mactrim"
 version = "0.2.0"
 description = "Evidence-led, reversible Mac cleanup"
 requires-python = ">=3.9"
-dependencies = ["textual==8.2.8", "rich>=14,<15"]
+dependencies = ["textual==8.2.8", "rich>=14,<15", "pyobjc-core==11.1; sys_platform == 'darwin'", "pyobjc-framework-Cocoa==11.1; sys_platform == 'darwin'", "pyobjc-framework-FSEvents==11.1; sys_platform == 'darwin'"]
 
 [project.scripts]
 mactrim = "mactrim.cli:main"
