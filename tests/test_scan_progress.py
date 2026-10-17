@@ -37,6 +37,84 @@ class RegionTests(unittest.TestCase):
 
 
 class ProgressTests(unittest.TestCase):
+    def test_browsable_levels_are_discovered_without_visiting_deferred_interiors(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            for name in ('node_modules/package/deep', 'a/child/leaf', 'z/child/leaf'):
+                (root / name).mkdir(parents=True)
+                (root / name / 'payload').write_bytes(b'x' * 8192)
+            order, snapshots = [], []
+            clock = iter(range(1000000))
+            def progress(snapshot, current):
+                if current.path not in order:
+                    order.append(current.path)
+                snapshots.append(snapshot)
+            with patch('mactrim.storage.time.monotonic', side_effect=lambda: next(clock)):
+                result = complete(root, progress=progress)
+            visible = [str(root / name) for name in ('a', 'z', 'a/child', 'z/child', 'a/child/leaf', 'z/child/leaf')]
+            self.assertTrue(all(path in order for path in visible))
+            self.assertNotIn(str(root / 'node_modules/package'), order)
+            depths = [len(Path(path).relative_to(root).parts) for path in order if path in visible]
+            self.assertEqual(depths, sorted(depths))
+            self.assertTrue({'a', 'z', 'node_modules'} <= {row.name for row in snapshots[-1].children})
+            self.assertTrue(all(child.status != 'measured' for row in snapshots for child in row.children))
+            self.assertLess(result.logical, complete(root, lazy=False).logical)
+
+    def test_selected_directory_sizes_include_deep_observations_before_final_aggregation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            payload = root / 'a/child/leaf/payload'
+            payload.parent.mkdir(parents=True)
+            payload.write_bytes(b'x' * 8192)
+            seen = []
+            clock = iter(range(1000000))
+            with patch('mactrim.storage.time.monotonic', side_effect=lambda: next(clock)):
+                result = complete(root, progress=lambda snapshot, _: seen.append(snapshot), view=lambda: root / 'a')
+            running = [row.view for row in seen if hasattr(row, 'view') and row.progress['phase'] == 'Enumerating metadata']
+            self.assertGreaterEqual(running[-1].logical, 8192)
+            self.assertGreaterEqual(running[-1].children[0].logical, 8192)
+            self.assertEqual(running[-1].logical, result.children[0].logical)
+            self.assertLess(running[0].logical, running[-1].logical)
+
+    def test_live_ancestor_totals_count_reused_subtrees_once(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            for name in ('a/quiet/leaf', 'a/hot/leaf'):
+                (root / name).mkdir(parents=True)
+                (root / name / 'payload').write_bytes(b'x' * 8192)
+            baseline = complete(root)
+            quiet = next(child for child in baseline.children[0].children if child.name == 'quiet')
+            seen = []
+            clock = iter(range(1000000))
+            with patch('mactrim.storage.time.monotonic', side_effect=lambda: next(clock)):
+                result = complete(root, progress=lambda snapshot, _: seen.append(snapshot), view=lambda: root / 'a',
+                                  reuse=lambda node, _: quiet if node.path == quiet.path else None)
+            self.assertEqual(result.logical, baseline.logical)
+            self.assertEqual(seen[-1].logical, baseline.logical)
+            self.assertEqual(seen[-1].view.logical, baseline.children[0].logical)
+            self.assertGreater(result.counters['reused'], 0)
+            pending = [result]
+            while pending:
+                node = pending.pop()
+                self.assertNotIn('_scan_parent', node.__dict__)
+                pending.extend(node.children)
+
+    def test_cancel_during_level_discovery_preserves_visible_observations(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / 'node_modules/package').mkdir(parents=True)
+            (root / 'visible/child').mkdir(parents=True)
+            (root / 'visible/child/payload').write_bytes(b'x' * 8192)
+            cancel = threading.Event()
+            clock = iter(range(1000000))
+            def progress(snapshot, _):
+                if any(child.logical >= 8192 for child in snapshot.children):
+                    cancel.set()
+            with patch('mactrim.storage.time.monotonic', side_effect=lambda: next(clock)):
+                result = complete(root, cancel=cancel, progress=progress)
+            self.assertEqual(result.status, 'cancelled')
+            self.assertGreaterEqual(next(child for child in result.children if child.name == 'visible').logical, 8192)
+
     def test_progress_presentation_is_bounded_without_truncating_measurement(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()

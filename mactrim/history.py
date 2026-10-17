@@ -23,7 +23,7 @@ NAME = re.compile(r'(?:\.([a-f0-9]{32})\.(?:pending|[a-f0-9]{16}\.retiring)|([a-
 
 
 def policy(config, scope, collector=None):
-    if collector == 'storage.complete.v1':
+    if collector in {'storage.complete.v1', 'storage.on-demand.v2'}:
         return {'collector': collector, 'scope': str(canonical(scope)),
                 'follow_symlinks': False, 'dataless': 'skip', 'hardlinks': 'inode-first',
                 'data_alias': 'skip', 'virtual': 'skip', 'directory_bytes': True}
@@ -138,9 +138,9 @@ class History:
             if capacity['status'] == 'measured' and any(type(capacity.get(key)) is not int or not 0 <= capacity[key] <= 2**64 for key in ('total', 'used', 'available')):
                 raise SafetyError('Invalid filesystem capacity bytes')
         expected_policy = {'collector', 'scope', 'max_files', 'max_depth', 'root_child_budgets', 'follow_symlinks', 'dataless', 'hardlinks', 'data_alias', 'virtual'}
-        complete_policy = body['policy'].get('collector') == 'storage.complete.v1'
+        complete_policy = body['policy'].get('collector') in {'storage.complete.v1', 'storage.on-demand.v2'}
         if complete_policy:
-            base = policy(self.config, body['scope'], 'storage.complete.v1')
+            base = policy(self.config, body['scope'], body['policy']['collector'])
             valid_policy = body['policy'] == base or body['policy'] == dict(base, measurement_state=[str(self.state.path / 'storage-cache'), str(self.state.path / 'history')])
         else:
             valid_policy = (set(body['policy']) == expected_policy and body['policy']['collector'] in {'metadata.v2', 'metadata.v3'} and type(body['policy']['max_files']) is int and 1 <= body['policy']['max_files'] <= 1000000 and type(body['policy']['max_depth']) is int and 1 <= body['policy']['max_depth'] <= 64)
@@ -157,7 +157,7 @@ class History:
             if not isinstance(path, str) or str(canonical(path)) != path or path in seen or not (path == body['scope'] or body['scope'] == '/' or path.startswith(body['scope'] + '/')):
                 raise SafetyError('Duplicate or escaped history directory')
             seen.add(path)
-            if any(type(row[key]) is not int or not 0 <= row[key] <= 2**64 for key in ('logical', 'allocated')) or row['status'] not in {'measured', 'partial', 'denied', 'unknown', 'skipped', 'cancelled'} or type(row['children_complete']) is not bool:
+            if any(type(row[key]) is not int or not 0 <= row[key] <= 2**64 for key in ('logical', 'allocated')) or row['status'] not in {'measured', 'partial', 'denied', 'unknown', 'skipped', 'cancelled', 'deferred'} or type(row['children_complete']) is not bool:
                 raise SafetyError('Invalid directory size/status')
             if not isinstance(row['identity'], list) or len(row['identity']) not in (0, 2) or any(type(number) is not int for number in row['identity']) or not isinstance(row['recent'], dict) or set(row['recent']) != {'modified_7d', 'modified_30d', 'created_7d'} or any(type(number) is not int or not 0 <= number <= 2**64 for number in row['recent'].values()):
                 raise SafetyError('Invalid directory identity/recent activity')

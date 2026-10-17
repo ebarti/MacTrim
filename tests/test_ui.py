@@ -192,7 +192,7 @@ class NativeUITests(unittest.IsolatedAsyncioTestCase):
         original_budget = self.plan['config']['storage_max_files']
         async with app.run_test(size=(140, 44)) as pilot:
             await self.wait_for(pilot, lambda: not app.storage_measuring)
-            self.assertEqual(app.storage_node.collector, 'storage.complete.v1')
+            self.assertEqual(app.storage_node.collector, 'storage.on-demand.v2')
             generation = app.storage_generation
             await pilot.click('#storage-full')
             await self.wait_for(pilot, lambda: app.storage_generation > generation and not app.storage_measuring)

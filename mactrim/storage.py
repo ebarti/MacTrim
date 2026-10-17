@@ -1,4 +1,4 @@
-"""Complete streaming Storage metadata, separate from bounded cleanup evidence.
+"""Progressive on-demand Storage metadata, separate from cleanup evidence.
 
 Only directories and multiply-linked file exceptions are retained. Presentation
 is paged independently of measurement. No contents are opened or hashed.
@@ -29,7 +29,7 @@ def _defer_details(node, scope):
 
 @dataclass
 class StorageNode(Node):
-    collector: str = 'storage.complete.v1'
+    collector: str = 'storage.on-demand.v2'
     started_at: float = 0.0
     completed_at: float = 0.0
     counters: dict = field(default_factory=lambda: {'visited': 0, 'denied': 0, 'excluded': 0, 'changed': 0, 'reused': 0})
@@ -44,7 +44,9 @@ class StorageNode(Node):
     def summary(self):
         return dict(super().summary(), collector=self.collector, started_at=self.started_at,
                     completed_at=self.completed_at, refresh=getattr(self, 'refresh', {}), counters=self.counters, exclusions=self.exclusions,
-                    direct_files=self.direct_files, page_size=PAGE_SIZE, details_deferred=self.details_deferred)
+                    direct_files=self.direct_files, page_size=PAGE_SIZE, details_deferred=self.details_deferred,
+                    size_state='unmeasured' if self.details_deferred and self.status != 'measured' else
+                    'measured' if self.status == 'measured' else 'lower-bound')
 
     def export(self):
         # No recursive per-file JSON tree. Current-directory pages are separate
@@ -54,7 +56,7 @@ class StorageNode(Node):
                               for child in self.children[:PAGE_SIZE]],
                     presentation={'limit': PAGE_SIZE, 'directory_rows': len(self.children),
                                   'file_rows_available': self.direct_files,
-                                  'note': 'Presentation is bounded; measurement is complete under the declared policy'})
+                                  'note': 'Deferred interiors are not measured until opened; unfinished totals are lower bounds'})
 
 
 def _signature(st):
@@ -77,6 +79,7 @@ def find_directory(root, path):
 def progress_snapshot(root, phase, current_path, totals=None, branches=None, reused=()):
     """Stable, shallow UI observation. Unfinished directory totals are lower bounds."""
     snapshot = copy(root)
+    snapshot.__dict__.pop('_scan_parent', None)
     snapshot.status = 'scanning'
     snapshot.counters = dict(root.counters)
     snapshot.issues = list(root.issues)
@@ -92,6 +95,7 @@ def progress_snapshot(root, phase, current_path, totals=None, branches=None, reu
     # Totals above still include every observed directory and file.
     for child in root.children[:PAGE_SIZE]:
         row = copy(child)
+        row.__dict__.pop('_scan_parent', None)
         row.issues = list(child.issues)
         row.children = []
         row.logical = max(row.logical, child.own_logical)
@@ -105,26 +109,27 @@ def progress_snapshot(root, phase, current_path, totals=None, branches=None, reu
 
 
 def complete(path, cancel=None, progress=None, exclusions=(), reuse=None, view=None, lazy=True):
-    """Iterative no-follow full walk; quotas/depth never determine completion.
+    """Iterative level-first no-follow walk, with explicit unopened boundaries.
 
     Each directory is opened from verified ancestors with a captured inode;
     queued replacement/denial/change remains explicit. Regular-file identities
     are retained only for nlink>1. Totals include directory metadata allocation
     and apparent bytes; symlinks/cloud/virtual/external mounts are exclusions.
+    Lazy interiors are never enumerated unless selected as the scan root.
     """
     path = canonical(path)
     cancel = cancel or threading.Event()
     root = StorageNode(str(path), path.name or '/', kind='directory', protected=bool(protected(path)),
-                       started_at=time.time(), status='scanning')
+                       started_at=time.time(), status='scanning',
+                       collector='storage.on-demand.v2' if lazy else 'storage.complete.v1')
     records, directory_inodes, links = [], {}, {}
     reused = set()
     reconcile_scopes = set()
-    queue = deque([(root, None, None, None, None)])
+    queue = deque([(root, None, None, None)])
     now, last_progress = time.time(), 0.0
     own_exclusions = tuple(canonical(value) for value in exclusions)
     totals, branches = [0, 0, 0], {}
     current, branch, accounted = None, None, (0, 0, 0)
-    aggregate = None
     selected_view = [None, None]
     def account():
         nonlocal accounted
@@ -134,36 +139,34 @@ def complete(path, cancel=None, progress=None, exclusions=(), reuse=None, view=N
         delta = [value - old for value, old in zip(values, accounted)]
         for index in range(3):
             totals[index] += delta[index]
-        if aggregate is not None and aggregate is not current:
-            aggregate.own_logical += delta[0]
-            aggregate.own_allocated += delta[1]
-            aggregate.entries += delta[2]
         if branch is not None:
             values_by_branch = branches.setdefault(branch.path, [0, 0, 0])
             for index in range(3):
                 values_by_branch[index] += delta[index]
+        # Update retained ancestors as bytes arrive so drilling into a live
+        # directory includes its observed descendants, not just direct files.
+        # The retained chain is bounded by the lazy detail depth.
+        if delta[0] or delta[1]:
+            ancestor = current
+            while ancestor is not None:
+                if ancestor is not current or current.path not in reused:
+                    ancestor.logical += delta[0]
+                    ancestor.allocated += delta[1]
+                ancestor = getattr(ancestor, '_scan_parent', None)
         accounted = values
-    def finish_current():
-        if current is None or aggregate is None or aggregate is current:
-            return
-        aggregate.newest_ns = max(aggregate.newest_ns, current.newest_ns)
-        for key in aggregate.recent:
-            aggregate.recent[key] += current.recent[key]
-        if current.status not in {'measured', 'skipped'}:
-            aggregate.status = 'partial'
-            if len(aggregate.issues) < 16:
-                aggregate.issues.append('%s: %s' % (clean(current.path), '; '.join(current.issues)))
     def notify(node, force=False, phase='Enumerating metadata'):
         nonlocal last_progress
         if progress and (force or time.monotonic() - last_progress >= .15):
             account()
             last_progress = time.monotonic()
             snapshot = progress_snapshot(root, phase, node.path, totals, branches, reused)
+            snapshot.progress.update(depth=len(Path(node.path).relative_to(path).parts), traversal='levels')
             target = str(canonical(view())) if view else root.path
             if target != selected_view[0] or selected_view[1] is None:
                 selected_view[:] = [target, find_directory(root, target)]
             if target != root.path and selected_view[1] is not None:
                 snapshot.view = progress_snapshot(selected_view[1], phase, node.path)
+                snapshot.view.progress = dict(snapshot.progress)
             progress(snapshot, copy(node))
     def excluded(node, reason):
         node.status = 'skipped'
@@ -172,14 +175,11 @@ def complete(path, cancel=None, progress=None, exclusions=(), reuse=None, view=N
         root.exclusions[reason] = root.exclusions.get(reason, 0) + 1
     while queue and not cancel.is_set():
         account()
-        finish_current()
-        node, expected, device, branch, aggregate = queue.popleft()
-        if aggregate is None and lazy and _defer_details(node, path):
-            aggregate = node
+        node, expected, device, branch = queue.popleft()
+        if lazy and _defer_details(node, path):
             node.details_deferred = True
         current, accounted = node, (0, 0, 0)
-        if aggregate is None or aggregate is node:
-            records.append(node)
+        records.append(node)
         notify(node)
         try:
             with directory_fd(Path(node.path).parent if node.path != '/' else '/') as parent:
@@ -209,10 +209,19 @@ def complete(path, cancel=None, progress=None, exclusions=(), reuse=None, view=N
                     continue
                 if node.identity in directory_inodes:
                     node.alias_of = directory_inodes[node.identity]
-                    reconcile_scopes.update((aggregate.path if aggregate else node.path, node.alias_of))
+                    reconcile_scopes.update((node.path, node.alias_of))
                     excluded(node, 'Already accounted directory/firmlink inode')
                     continue
-                directory_inodes[node.identity] = aggregate.path if aggregate else node.path
+                directory_inodes[node.identity] = node.path
+                if node.details_deferred:
+                    # A boundary is identified by its own metadata only. Never
+                    # open or enumerate its interior until it becomes the
+                    # explicitly selected scan root.
+                    node.signature = _signature(st)
+                    node.entries = 1
+                    node.status = 'deferred'
+                    node.issues.append('Interior not measured; open this folder to scan it')
+                    continue
                 if not st.st_mode & 0o444 or not st.st_mode & 0o111:
                     raise PermissionError('Directory metadata inaccessible')
                 fd = os.open(Path(node.path).name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent) if node.path != '/' else os.dup(parent)
@@ -221,7 +230,7 @@ def complete(path, cancel=None, progress=None, exclusions=(), reuse=None, view=N
                 if _signature(initial) != _signature(st):
                     raise SafetyError('Directory changed before enumeration')
                 node.signature = _signature(st)
-                cached = reuse(node, st) if reuse and (aggregate is None or aggregate is node) else None
+                cached = reuse(node, st) if reuse else None
                 if cached is not None:
                     for key in ('logical', 'allocated', 'entries', 'newest_ns', 'direct_files', 'own_logical', 'own_allocated', 'signature', 'recent', 'status', 'issues', 'children', 'kind'):
                         setattr(node, key, getattr(cached, key))
@@ -248,14 +257,12 @@ def complete(path, cancel=None, progress=None, exclusions=(), reuse=None, view=N
                             if kind == 'directory':
                                 absolute = str(Path(node.path) / entry.name)
                                 child = StorageNode(absolute, entry.name, identity=(child_st.st_dev, child_st.st_ino),
-                                                    kind=kind, protected=bool(protected(absolute)), status='scanning')
-                                if aggregate is None:
-                                    node.children.append(child)
-                                item = (child, child.identity, st.st_dev, child if node is root else branch, aggregate)
-                                if aggregate is None:
-                                    queue.append(item)
-                                else:
-                                    queue.appendleft(item)
+                                                    kind=kind, protected=bool(protected(absolute)), status='scanning',
+                                                    collector=root.collector)
+                                child.details_deferred = lazy and _defer_details(child, path)
+                                node.children.append(child)
+                                child._scan_parent = node
+                                queue.append((child, child.identity, st.st_dev, child if node is root else branch))
                                 continue
                             node.entries += 1
                             node.direct_files += 1
@@ -266,7 +273,7 @@ def complete(path, cancel=None, progress=None, exclusions=(), reuse=None, view=N
                                 continue
                             identity = (child_st.st_dev, child_st.st_ino)
                             if child_st.st_nlink > 1:
-                                reconcile_scopes.add(aggregate.path if aggregate else node.path)
+                                reconcile_scopes.add(node.path)
                                 if identity in links:
                                     root.counters['excluded'] += 1
                                     root.exclusions['Already accounted hardlink'] = root.exclusions.get('Already accounted hardlink', 0) + 1
@@ -301,9 +308,8 @@ def complete(path, cancel=None, progress=None, exclusions=(), reuse=None, view=N
             root.counters['denied'] += 1
         notify(node)
     account()
-    finish_current()
     notify(current or root, force=True, phase='Aggregating directory totals')
-    # Reverse breadth-first order propagates directory totals without recursion.
+    # Parents precede retained children; reversing visits aggregates without recursion.
     for node in reversed(records):
         if node.path in reused:
             continue
@@ -312,10 +318,12 @@ def complete(path, cancel=None, progress=None, exclusions=(), reuse=None, view=N
         node.entries += sum(child.entries for child in node.children)
         for key in node.recent:
             node.recent[key] += sum(child.recent[key] for child in node.children)
-        unknown = [child for child in node.children if child.status not in {'measured', 'skipped'}]
+        unknown = [child for child in node.children if child.status not in {'measured', 'skipped', 'deferred'}]
         if unknown and node.status == 'measured':
             node.status = 'partial'
             node.issues.append('%s descendant scopes incomplete; inspect coverage reasons' % len(unknown))
+        elif node.status == 'measured' and any(child.status == 'deferred' for child in node.children):
+            node.status = 'deferred'
     if cancel.is_set():
         root.status = 'cancelled'
         root.issues.append('Cancelled; unvisited scopes remain unknown')
@@ -341,12 +349,16 @@ def complete(path, cancel=None, progress=None, exclusions=(), reuse=None, view=N
                 node.children = []
             else:
                 pending.extend(node.children)
+    for node in records:
+        node.__dict__.pop('_scan_parent', None)
+    for item in queue:
+        item[0].__dict__.pop('_scan_parent', None)
     return root
 
 
 def coverage_report(root, limit=8, cancel=None):
     """Explain actual incomplete scopes; presentation limits never limit scans."""
-    counts = dict(permissions=0, changes=0, tracking=0, other=0)
+    counts = dict(permissions=0, changes=0, tracking=0, other=0, deferred=0)
     examples = {key: [] for key in counts}
     pending = [root]
     while pending:
@@ -361,7 +373,8 @@ def coverage_report(root, limit=8, cancel=None):
         grouped = {}
         for issue in local:
             lower = issue.lower()
-            category = ('permissions' if any(value in lower for value in
+            category = ('deferred' if issue.startswith('Interior not measured;') else
+                        'permissions' if any(value in lower for value in
                          ('operation not permitted', 'permission denied', 'metadata inaccessible')) else
                         'tracking' if 'unsettled filesystem events' in lower else
                         'changes' if any(value in lower for value in
@@ -373,7 +386,8 @@ def coverage_report(root, limit=8, cancel=None):
                 examples[category].append({'path': node.path, 'reason': issue})
     return {'scope': root.path, 'complete': root.status == 'measured', 'counts': counts,
             'examples': examples, 'examples_per_category': limit,
-            'note': 'Complete means all accessible metadata measured under the no-follow local-disk policy. '
+            'note': 'Deferred interiors are not enumerated until opened and are separate from access failures. '
+                    'Their sizes are unknown and parent totals are lower bounds. '
                     'Permission failures need access granted by macOS; active writers can leave interval uncertainty.'}
 
 

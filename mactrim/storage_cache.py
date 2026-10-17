@@ -79,7 +79,7 @@ def node_from_row(row, scope, nodes):
     path = row.get('path')
     if not isinstance(path, str) or str(canonical(path)) != path or not within(path, scope) or path in nodes:
         raise SafetyError('Escaped/duplicate cached directory')
-    if row.get('status') not in {'measured', 'partial', 'denied', 'skipped'}:
+    if row.get('status') not in {'measured', 'partial', 'denied', 'skipped', 'deferred'}:
         raise SafetyError('Invalid cache observation status')
     for key in ('logical', 'allocated', 'own_logical', 'own_allocated', 'entries', 'direct_files'):
         if type(row.get(key)) is not int or not 0 <= row[key] <= 2**64:
