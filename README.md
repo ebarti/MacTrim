@@ -1,101 +1,98 @@
 # MacTrim
 
-MacTrim helps review space on a Mac, with evidence explaining what can be regenerated or retained elsewhere. It offers a Python CLI and a keyboard review UI, a reversible same-volume quarantine, and a separately approved permanent purge.
+A colorful terminal app for evidence-led Mac cleanup, root storage exploration, and lightweight local storage history. Cleanup moves only explicitly selected, freshly validated items into same-volume quarantine. Nothing is selected initially. Quarantine frees **zero bytes**; permanent deletion requires a separate exact approval.
 
-**Quarantine frees zero bytes.** Logical and allocated sizes are estimates; APFS clones, compression, snapshots and other disk activity prevent a promised saving. MacTrim records the observed free-space delta rather than claiming it reclaimed the displayed size.
+## Run
 
-Python 3.9+ and the standard library are sufficient. Run from this directory with `python3 -m mactrim`; no global installation or dependencies are needed. Mutation requires macOS and its built-in `lsof`, `ps`, and Git for repository evidence. Help is available through `python3 -m mactrim --help` and each command's `--help`.
-
-## Try the disposable demo
-
-These commands create a **new, absent** fixture directory and scan only its contents. The Git repository created inside the demo is disposable, has no remote and only establishes source/reflog evidence.
+Python 3.9+ and macOS are required for cleanup activity evidence. Textual 8.2.8 and Rich power the native widgets. Install dependencies in the project environment:
 
 ```sh
-python3 -m mactrim demo ./demo
-python3 -m mactrim --state ./demo/state --config ./demo/config.json scan --output ./demo/plan.json
-python3 -m mactrim --state ./demo/state review ./demo/plan.json --tui
-python3 -m mactrim --state ./demo/state review ./demo/plan.json --details
+cd /path/to/MacTrim
+python3 -m venv .venv
+.venv/bin/python -m pip install -e .
+./mactrim-launch
 ```
 
-The demo contains an old ignored environment and bytecode, unique reports, a recognizable pip cache, uncertain app records, two versions of an app, duplicate copies with a fixed keeper, excluded hard links, and a protected database. It uses the **real activity collector**. On a Mac with missing live-process evidence or inaccessible descriptors, those items correctly stay report-only; there is no CLI override. Run the fixture tests to exercise mutation and recovery with injected complete activity snapshots.
+The executable launcher works from a fresh shell and any working directory; it uses this project's `.venv` without changing global packages or shell configuration. The installed environment in this delivery uses Python 3.12. Core CLI/reporting and safety tests also support Python 3.9. `./mactrim-launch --help` lists commands. `python3 -m mactrim` remains available; native UI commands need the project dependencies.
 
-TUI controls: `j/k` or arrows navigate, `Space` selects an actionable item, `s` sorts by size/path, `f` cycles all/actionable/report filters, `/` searches, `d` opens full details, `[` and `]` scroll the side detail, `v` validates selection, `a` requests the exact typed move approval, and `q` exits. Nothing is selected by default. Reports cannot be selected. The detail view shows full path, evidence, blockers, keeper, regeneration/review hints and fingerprint. The terminal must be at least 60 columns by 12 rows; 95+ columns adds the side pane. A non-interactive terminal gets a friendly error and can use textual review instead.
-
-## Scan boundaries and eligibility
-
-The default scan targets `~/Developer`, `~/Projects`, `~/src`, and `~/Github`, `~/Library/Caches`, and a bounded inventory of `/Applications`, `/System/Applications`, `~/Applications`, and app cache/preferences/support names. Missing default directories are reported/skipped. **Duplicates have no default roots and require explicit scope.** No broad home content hashing is performed. App plist reads provide bundle metadata; Git reads establish repository activity. Duplicate content is streamed only inside the explicit duplicate roots.
-
-Traversal never follows symlinks or crosses filesystem devices. The default shared budget is 100,000 enumerated entries, maximum depth 24, and repository discovery depth 4. Candidate fingerprint inspection counts toward the same scan budget. Permission failures, malformed app metadata, truncated evidence and budget exhaustion are visible; any incomplete scan prevents eligibility. Selection and execution have additional per-item inspection bounds. Some protected report-only inventories can remain incomplete.
+Cleanup, Storage, and History / Growth are separate tabs. Discovery and measurement run in background workers, publish partial results, and support cancellation. Keyboard shortcuts appear in the footer. Cleanup offers search, status filter, sorting, category counts, full evidence/blockers, selected totals, fresh validation, and an exact typed approval dialog. Reports cannot be selected. Storage's chart and sortable list share measured nodes: Enter drills down; Parent, Root, Refresh, logical/allocated mode and breadcrumbs support navigation. Entry and depth controls plus “Deeper ×10” provide larger cancellable captures (up to 1,000,000 entries per root subtree and depth 64); drill into a partial region for finer attribution. These are metadata limits, independent of History’s 5000 aggregate limit. Storage and History never grant cleanup authority.
 
 ```sh
-python3 -m mactrim --state ./private-state scan --no-defaults \
-  --repo-root "$HOME/Projects/example" \
-  --duplicate-root "$HOME/Downloads/review-this-folder" \
-  --max-files 20000 --max-depth 16 --output ./plan.json
-python3 -m mactrim --state ./private-state review ./plan.json --details
+./mactrim-launch tui
+./mactrim-launch storage /
+./mactrim-launch storage / --json --max-files 1000 --max-depth 8
+./mactrim-launch storage /private/tmp --max-files 1000000 --max-depth 64
+./mactrim-launch --config config-example.json scan --tui
 ```
 
-`--no-defaults` clears default roots unless explicitly present in the supplied JSON config. Root flags replace their corresponding root list; repeat flags to add scopes. Configuration is JSON, supports only the fields shown by `python3 -m mactrim config`, and rejects invalid values and overlapping roots within a detector. See [config-example.json](config-example.json). Its duplicate roots are deliberately empty. `--output` creates an absent file without overwriting an existing file or symlink.
+`NO_COLOR` is honored. A true-color terminal gives the richest appearance; semantic status labels remain available without colors. Small terminals retain native keyboard navigation and scrolling.
 
-| Detector | Required evidence / behavior |
-| --- | --- |
-| `.venv`, `venv` | Regular `pyvenv.cfg`, project dependency specification, Git ignored status, no tracked descendants, clean source/index, and source/reflog/artifact inactivity of at least 90 days. No observed process use of any part of the project. |
-| `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache` | Same repository inactivity/ignored/tracked/source checks, project dependency specification, plus an allowlisted regenerable artifact kind. |
-| `node_modules` | Same repository checks plus an npm/yarn/pnpm lockfile. Source and Git/worktree metadata are preserved. |
-| User download caches | At least 30 days old, current-user ownership, no observed usage, and known layout: pip's `http`, `http-v2`, `wheels`, `selfcheck`; uv's cache tag and versioned stores; npm root only when it exclusively contains `_cacache`. Unexpected records or npm diagnostic logs keep the whole root report-only. Prefer the package manager's own cache controls. |
-| Xcode DerivedData | Opt-in `--cache-root "$HOME/Library/Developer/Xcode/DerivedData"`; regular `info.plist` links to source inside configured repository roots; clean old source/reflog, old artifact, complete fresh app inventory, no project/cache use. Xcode recreates builds/indexes. |
-| Duplicate files | Regular, nonempty, single-link files; size grouping, streamed SHA-256 and stable identity. Lexicographically first full path is the **fixed visible keeper**; it cannot be selected and is rehashed before move/purge. Metadata can differ even when bytes match; review it. Tracked repository source is excluded. |
-| App remnants | Bundle ID absent from the bounded installed-app inventory is uncertain; external apps/plugins remain possible. Cache/preferences/support records stay report-only. |
-| Older apps | Same bundle ID with older observed version; version schemes may be incomparable. Manual review only; no application removal. |
-| Reports, screenshots, logs, arbitrary `dist`, `data`, `tmp` | Potentially unique evidence; report-only. Age and size are insufficient. |
-| `/Library/Updates`, Apple Content Caching | Report-only; use macOS controls. No update-staging removal. |
+## Cleanup evidence
 
-Cloud-managed paths/placeholders, credentials (including `.env` variants, `auth.json`, netrc/npmrc, private keys), Photos/library bundles, applications, backups, Git internals, databases, system paths, simulator device data, Docker disks and VM images are protected. Hard-linked candidates are refused, so their size is never counted twice. Symlinks *inside* a regenerable artifact may be inventoried and moved as links; their targets are never followed, hashed, restored over or purged. A candidate cannot encompass MacTrim's own state. Overlapping displayed candidates are withheld, and overlapping selections or selected duplicate keepers are refused.
+Repository artifacts require allowlisted regeneration, ignored/untracked contents, dependency specifications, clean source/index, source/reflog/artifact inactivity, owned no-follow paths, and complete current-user activity coverage. Recognized pip, uv and npm download caches require proven layouts and stale activity; npm logs are retained. Unknown reports, screenshots, logs, app data and update staging stay report-only. Credentials, databases, backups, cloud placeholders, protected scopes, hardlinks and special objects cannot become mutation targets merely because they are old.
 
-## Activity coverage
+Registered linked Git worktrees are a separate category, including default Codex worktree roots. A merged HEAD is stale independently of age. MacTrim proves ancestry against a resolved default target, or an authenticated GitHub merged PR with exact head and retained merge-commit proof. Local refs have explicit freshness limitations; unavailable/squash-mismatched evidence stays review-only. Primary/current, out-of-scope, dirty, untracked, meaningful ignored, active, locked, sparse, hidden-index, submodule and unique-commit worktrees are protected. Ignored Python environments need a tracked regeneration specification and recognized layout; unknown installed state is preserved. Git checkout/index/common-directory binding and common/admin identities and ancestors are checked afresh. Pointer recovery holds the captured admin descriptor and validates every remaining administrative entry, including the captured HEAD/branch, before replay writes; a replaced registry or changed metadata causes a conflict and remains intact.
 
-Before scanning and again before mutation, MacTrim compares fresh `ps` inventories with `lsof` cwd/open-file/executable records for the **current UID's live, non-zombie processes**. `ps` argv references also catch an environment's Python executable when a symlink resolves outside the project and startup files have already closed. MacTrim's own explicit scanner root flags are inspection requests and do not count as self-use; its actual cwd/open handles and interpreter environment still block cleanup. Other PIDs remain conservatively checked. Newly born live processes absent from `lsof` are blockers. Commands and environment variables are not exported; blockers contain a PID/app/fd or an indication that argv references the scope. The collector does not inspect environment variables.
+App ownership includes bundle IDs, helpers/extensions, current-user services, normalized `application.<bundle>.<instance>` labels, vendor families, and observed/explicit historical human aliases. Apple/system components do not become uninstall guesses. Missing/incomplete ownership stays uncertain; live helpers and shared families retain ownership. Equal or unknown versions are duplicate app copies, not “older” versions. Preferences/support remain manual unless configuration explicitly confirms the retired owner **and exact scope**; ownership is checked again before apply and purge. App bundles and macOS update/content-caching records remain manual reports. Prefer the app's uninstaller and [Apple's storage controls](https://support.apple.com/guide/mac-help/free-up-storage-space-mh26887/mac) or [Content Caching controls](https://support.apple.com/guide/mac-help/manage-content-caching-mchl9388ba1b/mac).
 
-System/other-user process visibility is outside this unprivileged check. This is a snapshot, not a guarantee against a process starting immediately afterward; use cleanup when the project/application is closed. Mutation only accepts current-user-owned objects and never elevates privileges. Unknown, inaccessible REG/DIR descriptors and missing cwd are blockers. Revoked CHR/KQUEUE descriptors are ignored only when their type is explicitly known; type resets at each descriptor. An unknown revoked handle stays blocked. `lsof` failure, stderr, timeout, malformed/truncated output, and incomplete enumeration all fail closed.
+Cheap metadata measurement is separate from eligible fingerprints and explicit duplicate hashing. Per-category/root/subtree budgets expose partial coverage without letting a large repository starve worktrees, caches, apps or duplicates. Unrelated partial roots do not veto a proven selected scope; cancelled plans and incomplete activity block actions. Explicit CLI overrides are applied before root validation. Storage defaults to 50,000 metadata visits per root subtree and fairly partitions its fixed budget across useful home/project/temp siblings and measures immediate files first. At `/`, up to 64 front-door children receive independent entry budgets; APFS aliases remain skipped. A large early subtree cannot consume later siblings’ reserved share. Unused quota then refines the largest partial regions, counting repeated visits against the same bound; it replaces earlier totals rather than adding them. A partial directory remains unknown for History deltas, even when refinement observes more bytes. Partial measurements describe observed bytes, not a complete disk breakdown. Increase the visible entry/depth controls or scope a smaller root when useful. Different collector/budget policies establish separate History baselines.
 
-If a blocker names an app with an inaccessible or revoked descriptor, close or restart that app **manually**, then rescan. MacTrim does not stop processes or relax checks. A process that hides its environment identity from both argv and visible filesystem handles cannot be identified by this collector; the tool cannot establish total machine-wide inactivity.
-
-## Exact approval and quarantine
-
-A plan is signed by a private local state key and bound to schema, roots, selected IDs and fingerprints. Imported/tampered plans and plans from other states are refused. Plans expire after 24 hours. Labels in JSON never grant authority: execution re-derives provenance, age, Git status, content equivalence, ownership, permissions, process use, ancestor safety, and volume identity. Changed descendants or changed/missing keepers require a new scan.
+## Scan and signed lifecycle
 
 ```sh
-python3 -m mactrim --state ./private-state dry-run ./plan.json --select CANDIDATE_ID
-python3 -m mactrim --state ./private-state apply ./plan.json --select CANDIDATE_ID
+./mactrim-launch --state /same-volume/private-state scan \
+  --no-defaults --repo-root /explicit/projects --worktree-root /explicit/worktrees \
+  --duplicate-root /explicit/duplicates --cache-root /explicit/caches \
+  --output /absent/plan.json
+./mactrim-launch --state /same-volume/private-state review /absent/plan.json --details
+./mactrim-launch --state /same-volume/private-state dry-run /absent/plan.json --select CANDIDATE_ID
+./mactrim-launch --state /same-volume/private-state apply /absent/plan.json \
+  --select CANDIDATE_ID --approve 'QUARANTINE 1 EXACT_TOKEN_FROM_DRY_RUN'
+./mactrim-launch --state /same-volume/private-state quarantine list
+./mactrim-launch --state /same-volume/private-state restore JOURNAL_ID
+./mactrim-launch --state /same-volume/private-state purge JOURNAL_ID --approve 'PURGE JOURNAL_ID EXACT_TOKEN'
 ```
 
-Use the actual ID shown by review. Repeated `--select` flags or comma-separated IDs select several items. `dry-run` validates the complete selection and prints an exact `QUARANTINE <count> <fingerprint-token>` phrase; it moves nothing. `apply` asks you to type that phrase exactly. For deliberate automation, `--approve` accepts the exact phrase; `yes`/`--force` is not an approval. A non-interactive invocation without it fails. The approval is specific to that plan and selection.
+Use the exact phrase printed by the command. Without `--approve`, an interactive terminal asks for it. Duplicate roots are opt-in, protected keepers are verified again, and overlapping selections are refused. Re-scan after upgrading old configuration/manifest contracts. Plans expire after 24 hours. Exports refuse existing paths; restore requires an absent original destination and never overwrites new data.
 
-State defaults to `~/Library/Application Support/MacTrim`. It uses owned 0700 directories and 0600 files; unsafe modes, symlink ancestors, hard-linked state files, and concurrent state locks are refused. To clean another volume, create a private state directory **on that source volume** and rescan with `--state`; cross-volume copying is unsupported. Root `/Volumes` remains a protected scope in this initial version, so external-volume cleanup is intentionally unavailable even with same-volume state. No fallback changes a safe rename into a copy or overwrite.
+State is private, owned, signed and locked. Mutations independently validate the manifest, scope, ownership, ancestors, descendants, activity, immutable approved inventories and keepers. Journals are fsynced before transitions and bounded for recovery. Failed multi-item actions report any safely journaled completed prefix and stop. Interrupted operations are reconciled on quarantine list; unexpected contents or ambiguous states remain intact for manual inspection.
 
-The executor first validates the whole selection, then rechecks before each item. Oversized journals are refused during full-selection preflight; the 32 MiB journal bound reserves 64 KiB for later completion outcomes and stores the inventory once. It writes and fsyncs per-item intent before an atomic exclusive `renameatx_np` on macOS, fsyncs both parent directories, verifies the moved object and records the result. Unrelated filesystem activity can change free space; the journal saves observed before/after values. If a multi-item operation later fails, the completed prefix stays safely quarantined and the remaining paths stay in place.
+Worktree lifecycle uses an exclusive descriptor-anchored rename to the **exact** quarantine/restore slot. A durable private administrative snapshot and retained `refs/mactrim/recovery/<journal-id>` protect the Git registry. The selected `.git` pointer must retain its captured admin resolution after relocation; unsupported relative layouts are refused. Only the captured admin `gitdir` back-pointer is reconciled: an exclusive move preserves displaced pointer bytes, then an identity/content-verified, separately fsynced replacement enters an absent slot. Git's common-registry repair traversal is not invoked, and unrelated `.git` files/registrations remain unchanged. Ambient `GIT_*` settings, project hooks, fsmonitor and executable filters are isolated/disabled for Git queries and recovery refs.
 
-## Restore, purge and interrupted operations
+Worktree purge deletes only the approved content inventory through held descriptors, then only the captured administrative inventory after a durable **content-purged** milestone. New/replaced entries are preserved; the admin snapshot remains private for recovery. Missing contents while merely purge-authorized are ambiguous and cannot trigger registration deletion. Branches, shared objects, recovery refs and unrelated registrations are retained; no broad prune or recursive Git removal runs. Administrative snapshots have a 64 MiB bound. Partial approved content deletion requires fresh second approval to continue; ambiguous/changed registry states require manual recovery.
+
+Activity coverage is limited to the current UID's non-zombie processes, cwd/open/executable paths and conservative argv scope references. Bounded before/after process inventories reconcile exits and retry surviving births; persistent unknown/revoked descriptors still block mutation. This is not full-machine coverage, and another UID can use data without being observed. If lsof reports a PID/app/fd with inaccessible or missing type/name, manually close/restart that app and rescan. MacTrim has no activity bypass, no sudo and no forced app termination. TOCTOU remains possible with hostile concurrent same-user writers; private state and every supported boundary preserve unexpected contents and refuse ambiguous actions.
+
+## Storage and small history
+
+Storage performs metadata-only, bounded no-follow traversal, including protected/system-owned directories read-only. It never reads/hashes file contents or hydrates dataless/cloud placeholders. Inode accounting prevents hardlink/firmlink double counting. Virtual `/dev` trees and the redundant `/System/Volumes/Data` traversal are skipped; `/Users` and `/Applications` remain visible across the System/Data device split. True nested mounts are bounded. Measured, partial, denied, skipped, cancelled and unknown are explicit; incomplete byte estimates are lower bounds. Directory allocation estimates differ from filesystem used/free capacity. APFS clones, compression, snapshots and shared volume capacity prevent promised physical savings. System and Data capacity observations are displayed separately and never added.
+
+History automatically captures suitable **already completed** Storage measurements, at most once per compatible scope/policy per hour. It does not schedule scans, launch services or send notifications. Manual capture runs one metadata walk; “Capture current” reuses the existing Storage dataset with no extra walk. Signed compressed snapshots retain directory aggregates only: no per-file inventories, file copies, content hashes or logs. Up to 5000 useful aggregates retain root/ancestors. Defaults cap history at **16 MiB total allocated**, including temporary files, 60 snapshots and 60 days. Config can reduce limits, disable capture or clear verified records. Pruning/reservation precede atomic writes; encoded/decompressed/entry bounds prevent unbounded input. Unknown, altered, symlink or unsafe records block writes/clear and are preserved. Valid interrupted writes are recoverable. History failures do not stop cleanup or browsing.
 
 ```sh
-python3 -m mactrim --state ./private-state quarantine list
-python3 -m mactrim --state ./private-state restore JOURNAL_ID
-python3 -m mactrim --state ./private-state purge JOURNAL_ID
+./mactrim-launch history capture / --max-files 10000 --max-depth 16
+./mactrim-launch history list
+./mactrim-launch history compare                 # latest compatible pair
+./mactrim-launch history compare EARLIER_ID LATER_ID --metric logical
+./mactrim-launch history clear                   # verified owned history records only
 ```
 
-Restore requires the exact verified item, safe ancestors, complete fresh activity, and an **absent original destination**; an existing file/directory/symlink is never overwritten. Purge requires a **second**, distinct exact `PURGE <journal-id> <fingerprint-token>` approval. It is restricted to the signed journal's private quarantine slot, checks original identities/content and duplicate keeper again, and only deletes approved inventory entries. Unexpected/replaced descendants are retained. No age-only or automatic purge exists.
+History shows dates, graph/list deltas, percentages, capacity trends, actual footprint/limit and drill-through to Storage. Only compatible scopes/policies and complete, stable directory observations establish deltas. Missing/partial observations are unknown. A directory is newly observed unless retained complete parent enumeration proves earlier absence; parent/child deltas overlap and must not be summed. Filesystem usage can trend while directory attribution remains incomplete. Current recently modified/created allocated bytes are **activity clues, not measured growth**. A first baseline cannot reconstruct previous directory usage or establish a cause for earlier growth.
 
-`quarantine list` reconciles an interrupted move or restore by checking both paths and fingerprints. A crash after rename but before journal completion is recoverable; an ambiguous state becomes `conflicted` and requires manual inspection, with no automatic deletion. An interrupted purge retains `purging` status; a new exact second approval is needed to resume a verified remaining subset. New/changed descendants block resumption. Keep the entire state directory and signing key to retain recovery access; manually discarding it loses the tool's journal and restore authority.
+Configuration is JSON: `./mactrim-launch config` prints all supported keys. See `config-example.json` for root/budget/history settings. `retired_apps` entries require `confirmed`, exact `paths`, and historical `aliases`; this is explicit authorization for those app scopes, not blanket root authorization. For example:
 
-The private state and filesystem ownership are the trust boundary: a hostile process running as your same account can read your key and alter private files. MacTrim does not claim protection from compromise of the account or filesystem. Inspection/rename/destructive syscalls cannot freeze applications or the filesystem. Use it on inactive, reviewed scopes and keep backups of unique data.
+```json
+{"retired_apps": {"net.vendor.RetiredTool": {"confirmed": true,
+ "paths": ["~/Library/Preferences/net.vendor.RetiredTool.plist"], "aliases": ["RetiredTool"]}}}
+```
 
-## Verification and references
+An installed/shared/running/uncertain owner still blocks this declaration. Store runtime state outside the source checkout; it is never uploaded with the project.
+
+## Disposable verification
 
 ```sh
-python3 -m unittest discover -s tests -v
-python3 -m compileall -q mactrim tests
+./mactrim-launch demo /new/absent/disposable-demo
+.venv/bin/python -m unittest discover -s tests -v
 ```
 
-Tests mutate only freshly created disposable fixtures below `evidence/`. They cover metadata/content changes with restored mtime, ancestor/symlink swaps, activity coverage and argv, Git tracked/ignored rules, credential/hardlink exclusions, exact approvals, overlap/keepers, scan budgets/permissions, exclusive rename, crash recovery, restore conflicts, immutable purge bounds and partial-purge resumption. Activity injection is internal to fixture tests and cannot be selected from the CLI. Actual macOS read-only activity and actual curses PTY checks are recorded separately in delivery evidence. No actual user data was cleaned during delivery and no global installation was performed.
-
-Use Apple's supported tools for managed storage: [Free up storage space on your Mac](https://support.apple.com/en-us/102624) and [Set up Content Caching](https://support.apple.com/guide/mac-help/set-up-content-caching-on-mac-mchl3b6c3720/mac). The UI uses Python's standard [curses](https://docs.python.org/3/library/curses.html) module.
+Tests create and remove only owned disposable fixtures. They cover original changed-content/credentials/activity/journal/keeper/restore/purge invariants; typed worktrees, hostile hooks/environment/filters, registry and pointer races/crashes; app helpers/services/incomplete metadata; independent quotas and cancellation; APFS alias/storage budgets; compact history comparison/retention/input races; and native Textual Pilot interactions. The demo's Git init/commit stays inside its disposable repository; no remote publication or real cleanup occurs. Real CLI activity evidence may leave all demo actions blocked; fixture-injected activity tests are separate evidence and there is no production bypass.

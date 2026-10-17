@@ -20,9 +20,10 @@ def parser():
     command.add_argument("--version", action="version", version="MacTrim " + __version__)
     command.add_argument("--state", type=Path, default=DEFAULT_STATE, help="Private state/quarantine directory on the source volume")
     command.add_argument("--config", type=Path, help="JSON configuration (see config-example.json)")
-    children = command.add_subparsers(dest="command", required=True)
+    children = command.add_subparsers(dest="command")
     scan = children.add_parser("scan", help="Bounded read-only discovery and optional signed JSON export")
     scan.add_argument("--repo-root", action="append", help="Replace default repository roots; may repeat")
+    scan.add_argument("--worktree-root", action="append", help="Replace default registered-worktree action roots")
     scan.add_argument("--duplicate-root", action="append", help="Explicit duplicate scope; may repeat; no implicit home hashing")
     scan.add_argument("--cache-root", action="append", help="Replace default cache roots; may repeat")
     scan.add_argument("--no-defaults", action="store_true", help="Scan only explicit flag/config scopes; no system/app default roots")
@@ -32,7 +33,25 @@ def parser():
     scan.add_argument("--max-depth", type=int, help="Traversal depth limit (default 24)")
     scan.add_argument("--output", type=Path, help="Create signed JSON manifest at an absent path")
     scan.add_argument("--json", action="store_true", help="Print signed JSON instead of table")
-    scan.add_argument("--tui", action="store_true", help="Open keyboard review after scanning")
+    scan.add_argument("--tui", action="store_true", help="Open native TUI with background discovery")
+    children.add_parser("tui", help="Open Cleanup and Storage tabs; background read-only discovery")
+    storage = children.add_parser("storage", help="Metadata-only root storage explorer; no cleanup authority")
+    storage.add_argument("path", nargs="?", default="/", type=Path)
+    storage.add_argument("--json", action="store_true", help="Print bounded metadata dataset without a terminal")
+    storage.add_argument("--max-files", type=int, default=50000, help="Metadata entries per root subtree (default 50000; max 1000000)")
+    storage.add_argument("--max-depth", type=int, default=16)
+    history = children.add_parser("history", help="Tiny local directory history; capture/list/compare/clear")
+    history_sub = history.add_subparsers(dest="history_action", required=True)
+    capture = history_sub.add_parser("capture", help="One metadata walk; directory-only compressed snapshot")
+    capture.add_argument("path", nargs="?", default="/", type=Path)
+    capture.add_argument("--max-files", type=int)
+    capture.add_argument("--max-depth", type=int)
+    history_sub.add_parser("list", help="List verified observations and actual allocated footprint")
+    comparison = history_sub.add_parser("compare", help="Compare explicit IDs or latest compatible observations")
+    comparison.add_argument("earlier", nargs="?")
+    comparison.add_argument("later", nargs="?")
+    comparison.add_argument("--metric", choices=["logical", "allocated"], default="allocated")
+    history_sub.add_parser("clear", help="Delete only verified owned history records; unknown entries block")
     read = children.add_parser("review", help="Read a signed manifest; open TUI or textual details")
     read.add_argument("manifest", type=Path)
     read.add_argument("--tui", action="store_true")
@@ -127,6 +146,7 @@ def selected(values):
 
 def main(argv=None):
     arguments = parser().parse_args(argv)
+    arguments.command = arguments.command or "tui"
     try:
         if arguments.command == "config":
             data = defaults()
@@ -138,23 +158,62 @@ def main(argv=None):
         if arguments.command == "demo":
             output_json(create(arguments.destination))
             return 0
+        if arguments.command == "storage" and arguments.json:
+            from .measurement import measure, capacities
+            if not 1 <= arguments.max_files <= 1000000 or not 1 <= arguments.max_depth <= 64:
+                raise SafetyError("Storage bounds must be positive (files <= 1000000; depth <= 64)")
+            node = measure(arguments.path, arguments.max_files, arguments.max_depth, storage=True,
+                           independent_children=canonical(arguments.path) == Path("/"))
+            output_json({"measurement": node.export(), "filesystems": capacities("/"), "note": "Metadata only; incomplete totals are lower bounds; no deletion rights"})
+            return 0
         # Reject a non-TTY TUI before scanning or creating state.
-        if getattr(arguments, "tui", False) and (not sys.stdin.isatty() or not sys.stdout.isatty()):
+        if (getattr(arguments, "tui", False) or arguments.command in {"tui", "storage"}) and (not sys.stdin.isatty() or not sys.stdout.isatty()):
             raise SafetyError("TUI requires an interactive terminal. Use textual review --details or scan --output.")
+        if arguments.command == "storage":
+            config = read_config(arguments.config, arguments.state, validate_now=False)
+            config["storage_max_files"] = arguments.max_files
+            config["storage_max_depth"] = arguments.max_depth
+            config = validate(config, arguments.state)
+            return review(None, State(arguments.state).prepare(), config=config, storage_root=arguments.path, initial_tab="storage")
         state = State(arguments.state).prepare()
-        if arguments.command == "scan":
+        if arguments.command == "history":
+            from .history import History
+            from .measurement import measure, capacities
+            config = read_config(arguments.config, state.path, validate_now=False)
+            if arguments.history_action == "capture":
+                for argument, key in (("max_files", "storage_max_files"), ("max_depth", "storage_max_depth")):
+                    if getattr(arguments, argument) is not None:
+                        config[key] = getattr(arguments, argument)
+            config = validate(config, state.path)
+            history = History(state, config)
+            if arguments.history_action == "capture":
+                node = measure(arguments.path, config['storage_max_files'], config['storage_max_depth'], storage=True,
+                               independent_children=canonical(arguments.path) == Path('/'))
+                output_json(history.capture(node, capacities('/')))
+            elif arguments.history_action == "list":
+                output_json(history.list())
+            elif arguments.history_action == "compare":
+                output_json(history.compare(arguments.earlier, arguments.later, arguments.metric))
+            else:
+                output_json(history.clear())
+            return 0
+        if arguments.command == "tui":
             config = read_config(arguments.config, state.path)
+            return review(None, state, config=config)
+        if arguments.command == "scan":
+            # Apply explicit replacements before validating default roots.
+            config = read_config(arguments.config, state.path, validate_now=False)
             if arguments.no_defaults:
                 supplied = {}
                 if arguments.config:
                     with open(arguments.config, "r", encoding="utf-8") as stream:
                         supplied = json.load(stream)
-                for key in ("repo_roots", "duplicate_roots", "cache_roots", "app_roots", "app_data_roots"):
+                for key in ("repo_roots", "worktree_roots", "duplicate_roots", "cache_roots", "app_roots", "app_data_roots"):
                     if key not in supplied:
                         config[key] = []
                 if "system_reports" not in supplied:
                     config["system_reports"] = False
-            for flag, key in (("repo_root", "repo_roots"), ("duplicate_root", "duplicate_roots"), ("cache_root", "cache_roots")):
+            for flag, key in (("repo_root", "repo_roots"), ("worktree_root", "worktree_roots"), ("duplicate_root", "duplicate_roots"), ("cache_root", "cache_roots")):
                 value = getattr(arguments, flag)
                 if value is not None:
                     config[key] = value
@@ -163,6 +222,8 @@ def main(argv=None):
                 if value is not None:
                     config[key] = value
             config = validate(config, state.path)
+            if arguments.tui:
+                return review(None, state, config=config, output=arguments.output)
             with state.lock():
                 plan = Scanner(config, state).run()
                 envelope = state.sign(plan)

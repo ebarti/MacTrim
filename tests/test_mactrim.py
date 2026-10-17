@@ -258,7 +258,8 @@ class Fixtures(unittest.TestCase):
         try:
             result = Scanner(self.config, self.state, COMPLETE).run()
             self.assertTrue(any(any(word in issue.lower() for word in ("incomplete", "inaccessible", "permission")) for issue in result["issues"]))
-            self.assertFalse(any(item["eligible"] for item in result["candidates"]))
+            self.assertFalse(any(item["eligible"] and item["path"] == str(cache.parent) for item in result["candidates"]))
+            self.assertTrue(any(item["eligible"] and item["kind"] == "duplicate" for item in result["candidates"]))
         finally:
             cache.chmod(0o700)
 
@@ -431,7 +432,7 @@ class Fixtures(unittest.TestCase):
         config = dict(self.config, repo_roots=[], duplicate_roots=[], app_roots=[], app_data_roots=[], cache_roots=[str(root)], max_files=3)
         scanner = Scanner(config, self.state, COMPLETE)
         plan = scanner.run()
-        self.assertGreater(scanner.budget.used, 3)
+        self.assertTrue(any(row.get("category") == "caches" and row.get("entries", 0) > 3 for row in plan["coverage"]))
         self.assertTrue(any("budget" in issue.lower() for issue in plan["issues"]))
         self.assertFalse(any(item["eligible"] for item in plan["candidates"]))
 
@@ -534,7 +535,7 @@ class ActivityParser(unittest.TestCase):
     def test_process_birth_is_not_hidden_by_stable_intersection(self):
         output = b"p10\0ctest\0\nfcwd\0tDIR\0n/fixture\0\n"
         result = subprocess.CompletedProcess([], 0, output, b"")
-        with patch("mactrim.activity.sys.platform", "darwin"), patch("mactrim.activity._pids", side_effect=[{10}, {10, 11}]), patch("mactrim.activity.subprocess.run", return_value=result):
+        with patch("mactrim.activity.sys.platform", "darwin"), patch("mactrim.activity._pids", side_effect=[{10}, {10, 11}, {10, 11}] * 3), patch("mactrim.activity.subprocess.run", return_value=result):
             observed = snapshot()
         self.assertFalse(observed.complete)
         self.assertTrue(any("missed" in issue for issue in observed.issues))
