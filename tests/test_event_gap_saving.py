@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from mactrim.config import defaults
-from mactrim.events import NativeEvents
+from mactrim.events import EventCollector
 from mactrim.incremental import inventory
 from mactrim.state import State
 from mactrim.storage import complete
@@ -23,7 +23,7 @@ except ImportError:
 class BatchTests(unittest.TestCase):
     def test_drop_is_consumed_once_and_next_events_are_recorded(self):
         import FSEvents as F
-        events = NativeEvents('/fixture', 10)
+        events = EventCollector('/fixture', 10)
         events.stream = object()
         events._record(['/fixture'], [F.kFSEventStreamEventFlagMustScanSubDirs | F.kFSEventStreamEventFlagUserDropped], [11])
         events._record(['/fixture/changed/file'], [F.kFSEventStreamEventFlagItemIsFile], [12])
@@ -38,19 +38,21 @@ class BatchTests(unittest.TestCase):
 
     def test_historical_drop_during_startup_does_not_abort_live_stream(self):
         import FSEvents as F
-        events = NativeEvents('/fixture', 10)
+        events = EventCollector('/fixture', 10)
         events.stream = object()
         events.ready.set(); events.history_done.set()
         events._record(['/fixture'], [F.kFSEventStreamEventFlagMustScanSubDirs | F.kFSEventStreamEventFlagUserDropped], [11])
-        with patch.object(events.thread, 'start'):
+        events._process_pending()
+        with patch.object(events.thread, 'start'), patch.object(events.processor, 'start'):
             self.assertIs(events.__enter__(), events)
         self.assertTrue(events.issues)  # first drain must still require full repair
         self.assertIsNone(events.failure)
 
     def test_coalescing_requires_named_subtree_without_poisoning_stream(self):
         import FSEvents as F
-        events = NativeEvents('/fixture', 10)
+        events = EventCollector('/fixture', 10)
         events._record(['/fixture/coalesced'], [F.kFSEventStreamEventFlagMustScanSubDirs], [11])
+        events._process_pending()
         self.assertEqual(events.paths, {'/fixture/coalesced'})
         self.assertEqual(events.issues, [])
 
