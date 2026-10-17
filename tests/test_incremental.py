@@ -104,15 +104,22 @@ class IncrementalTests(unittest.TestCase):
         self.assertEqual(result.refresh['mode'], 'full')
         self.assertIn('Simulated', ' '.join(result.refresh['warnings']))
 
-    def test_directory_index_eviction_preserves_complete_totals(self):
+    def test_explicit_budget_preserves_previous_tree_without_truncation(self):
+        self.scan()
+        path = self.state.path / 'storage-cache' / 'index.json.gz'
+        old = path.read_bytes()
         for index in range(1800): (self.data / ('directory-' + str(index))).mkdir()
-        self.config['storage_cache']['max_bytes'] = 32768
+        self.config['storage_cache']['max_bytes'] = 8192
         first = self.scan(); self.same(first)
-        self.assertFalse(first.refresh['cache']['complete_index'])
-        self.assertLessEqual(first.refresh['cache']['peak_allocated_bytes'], 32768)
+        self.assertFalse(first.refresh['cache']['stored'])
+        self.assertIn('previous index preserved', first.refresh['cache']['reason'])
+        self.assertGreater(first.refresh['cache']['required_bytes'], 8192)
+        self.assertEqual(path.read_bytes(), old)
+        self.assertEqual(set(p.name for p in path.parent.iterdir()), {'index.json.gz'})
+        self.config['storage_cache']['max_bytes'] = None
         second = self.scan(); self.same(second)
-        self.assertEqual(second.refresh['mode'], 'full')
-        self.assertGreater(second.counters['visited'], 1800)
+        self.assertTrue(second.refresh['cache']['complete_index'])
+        self.assertEqual(second.refresh['cache']['directory_count'], 1813)
 
     def test_change_during_walk_is_reconciled(self):
         changed = [False]

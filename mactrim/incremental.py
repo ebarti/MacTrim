@@ -45,17 +45,17 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
     current_policy = policy(config, path, 'storage.complete.v1')
     # Measurement-owned stores are explicitly excluded and accounted separately.
     current_policy = dict(current_policy, measurement_state=[str(value) for value in excluded])
-    if cache:
-        try:
-            observed = cache.read()
-            if observed:
-                previous, cached, nodes = observed
-                reason = 'Cached directory details omitted; full reconciliation'
-        except (OSError, SafetyError) as exc:
-            warnings.append(clean(exc)); cache = None
-            reason = 'Unsafe/unreadable cache preserved; full reconciliation'
-            save_blocker = reason
     try:
+        if cache:
+            try:
+                observed = cache.read(cancel=cancel, details=not full)
+                if observed:
+                    previous, cached, nodes = observed
+                    reason = 'Cached directory details omitted; full reconciliation'
+            except (OSError, SafetyError) as exc:
+                warnings.append(clean(exc)); cache = None
+                reason = 'Unsafe/unreadable cache preserved; full reconciliation'
+                save_blocker = reason
         identity, now_id = volume_identity(path), events.current_id()
         compatible = bool(previous and cached and previous['policy'] == current_policy and previous['volume'] == identity and
                           previous.get('reuse_allowed', True) and
