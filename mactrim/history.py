@@ -23,7 +23,7 @@ NAME = re.compile(r'(?:\.([a-f0-9]{32})\.(?:pending|[a-f0-9]{16}\.retiring)|([a-
 
 
 def policy(config, scope, collector=None):
-    if collector in {'storage.complete.v1', 'storage.on-demand.v2'}:
+    if collector in {'storage.complete.v1', 'storage.on-demand.v2', 'storage.native.v3'}:
         return {'collector': collector, 'scope': str(canonical(scope)),
                 'follow_symlinks': False, 'dataless': 'skip', 'hardlinks': 'inode-first',
                 'data_alias': 'skip', 'virtual': 'skip', 'directory_bytes': True}
@@ -138,7 +138,7 @@ class History:
             if capacity['status'] == 'measured' and any(type(capacity.get(key)) is not int or not 0 <= capacity[key] <= 2**64 for key in ('total', 'used', 'available')):
                 raise SafetyError('Invalid filesystem capacity bytes')
         expected_policy = {'collector', 'scope', 'max_files', 'max_depth', 'root_child_budgets', 'follow_symlinks', 'dataless', 'hardlinks', 'data_alias', 'virtual'}
-        complete_policy = body['policy'].get('collector') in {'storage.complete.v1', 'storage.on-demand.v2'}
+        complete_policy = body['policy'].get('collector') in {'storage.complete.v1', 'storage.on-demand.v2', 'storage.native.v3'}
         if complete_policy:
             base = policy(self.config, body['scope'], body['policy']['collector'])
             valid_policy = body['policy'] == base or body['policy'] == dict(base, measurement_state=[str(self.state.path / 'storage-cache'), str(self.state.path / 'history')])

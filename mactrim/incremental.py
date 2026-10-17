@@ -53,12 +53,12 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
     def phase(value):
         check_cancel(cancel)
         if progress and node is not None:
-            snapshot = progress_snapshot(node, value, node.path)
+            snapshot = progress_snapshot(node, value, node.path, reused={child.path for child in node.children[:500]})
             if view:
                 from .storage import find_directory
                 selected = find_directory(node, view())
                 if selected is not None and selected is not node:
-                    snapshot.view = progress_snapshot(selected, value, node.path)
+                    snapshot.view = progress_snapshot(selected, value, node.path, reused={child.path for child in selected.children[:500]})
             annotate(snapshot)
             snapshot.counters['visited'] = visits
             snapshot.metadata_visits = visits
@@ -109,7 +109,7 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
         return changed, lost, boundary
 
     reason, mode = 'Complete initial inventory', 'full'
-    current_policy = policy(config, path, 'storage.on-demand.v2')
+    current_policy = policy(config, path, 'storage.native.v3')
     # Measurement-owned stores are explicitly excluded and accounted separately.
     current_policy = dict(current_policy, measurement_state=[str(value) for value in excluded])
     # Journal source changes require a new index baseline, without changing
@@ -179,7 +179,7 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
                 progress(snapshot, current)
             def reuse(node, st):
                 old = nodes.get(node.path)
-                if not old or old.status not in {'measured', 'deferred'} or old.signature != _signature(st):
+                if not old or old.status != 'measured' or old.signature != _signature(st):
                     return None
                 if regions.intersects(node.path):
                     return None

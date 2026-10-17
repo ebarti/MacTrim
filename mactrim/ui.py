@@ -68,9 +68,11 @@ STATUS_COLOR = {'measured': '#34d399', 'partial': '#fbbf24', 'denied': '#fb7185'
 
 
 def storage_size(node, metric):
-    if getattr(node, 'details_deferred', False) and node.status != 'measured':
+    if node.status in {'deferred', 'unknown'}:
         return 'Not measured'
-    return ('≥ ' if node.status == 'deferred' else '') + human(getattr(node, metric))
+    if node.status == 'scanning' and not getattr(node, metric):
+        return 'Measuring…'
+    return ('≥ ' if node.status in {'partial', 'denied', 'cancelled', 'scanning'} else '') + human(getattr(node, metric))
 
 
 class Approval(ModalScreen):
@@ -146,7 +148,7 @@ class Coverage(ModalScreen):
                 yield Static(self.report['note'])
                 for category, label in [('permissions', 'Access blocked'), ('changes', 'Changed during measurement'),
                                         ('tracking', 'Change tracking uncertain'), ('other', 'Other incomplete scopes'),
-                                        ('deferred', 'Unopened lazy folders')]:
+                                        ('deferred', 'Legacy unmeasured folders')]:
                     count = self.report['counts'].get(category, 0)
                     if count:
                         yield Static(Text('\n%s: %s scopes' % (label, count), style='bold #fbbf24'))
@@ -745,7 +747,7 @@ class MacTrimApp(App):
                 bar = '━' * round(fraction * 24)
                 text = Text('%2d  ' % (index + 1))
                 text.append(bar.ljust(24), style=PALETTE[index % len(PALETTE)])
-                percent = '    —' if getattr(child, 'details_deferred', False) and child.status != 'measured' else '%5.1f%%' % (fraction * 100)
+                percent = '    —' if child.status in {'deferred', 'unknown'} else '%5.1f%%' % (fraction * 100)
                 text.append(' %s  %s\n    %s · %s' % (percent, clean(child.name), storage_size(child, metric), child.status.upper()))
                 chart.add_option(Option(text, id=child.path))
             if self.storage_nodes:
@@ -785,13 +787,17 @@ class MacTrimApp(App):
         if self.storage_measuring:
             discovery = getattr(node, 'progress', {})
             if discovery.get('traversal') == 'levels':
-                refresh_note += ' · discovering level %s (scan root = 0); unopened lazy folders are skipped' % discovery.get('depth', 0)
+                refresh_note += ' · discovering level %s (scan root = 0)' % discovery.get('depth', 0)
+            elif discovery.get('traversal') == 'native':
+                refresh_note += ' · native size scan; completed folder totals stream as measured'
             refresh_note += ' · live rows: first %s immediate directories; totals include all observations' % PAGE_SIZE
             refresh_note += ' · scan root: ' + self.storage_scan_path
         if getattr(node, 'details_deferred', False):
-            refresh_note += ' · folder interior is scanned only when opened (queued while current scan runs)'
+            refresh_note += ' · recursive size included; internal browsing details load when opened'
         lifecycle = ('CANCELLING; observed lower bounds' if self.storage_cancel.is_set() else 'SCANNING; observed lower bounds') if self.storage_measuring else node.status.upper()
-        self.query_main('#storage-summary', Static).update(Text('%s %s · %s · page %s%s\nGraph: top 15 directories / filesystem used at root (allocated), otherwise observed scope bytes. Deferred interiors are unmeasured; parent totals exclude them. Open a lazy folder to measure it.' % (storage_size(node, metric), metric, lifecycle, self.storage_offset // PAGE_SIZE + 1, note) + '\n' + refresh_note))
+        if self.storage_measuring and getattr(node, 'progress', {}).get('scope_finished') and not self.storage_cancel.is_set():
+            lifecycle = node.status.upper() + '; background scan continues'
+        self.query_main('#storage-summary', Static).update(Text('%s %s · %s · page %s%s\nGraph: top 15 directories / filesystem used at root (allocated), otherwise observed scope bytes. Recursive sizes include collapsed folders. Open a lazy folder for internal browsing details.' % (storage_size(node, metric), metric, lifecycle, self.storage_offset // PAGE_SIZE + 1, note) + '\n' + refresh_note))
 
     @work(thread=True, group='storage-cache', exclusive=True)
     def clear_storage_cache(self):
@@ -821,7 +827,7 @@ class MacTrimApp(App):
     def storage_selected(self, path):
         node = next((node for node in self.storage_nodes if node.path == path), None)
         if node:
-            self.query_main('#storage-detail', Static).update(Text('%s\n%s logical · %s allocated · %s · %s\n%s' % (clean(node.path), storage_size(node, 'logical'), storage_size(node, 'allocated'), node.status.upper(), 'protected: read-only' if node.protected else 'read-only metadata', ('Folder interior is scanned only when opened. ' if getattr(node, 'details_deferred', False) else '') + ('; '.join(node.issues) or 'No content read'))))
+            self.query_main('#storage-detail', Static).update(Text('%s\n%s logical · %s allocated · %s · %s\n%s' % (clean(node.path), storage_size(node, 'logical'), storage_size(node, 'allocated'), node.status.upper(), 'protected: read-only' if node.protected else 'read-only metadata', ('Recursive size included; internal browsing details load when opened. ' if getattr(node, 'details_deferred', False) else '') + ('; '.join(node.issues) or 'No content read'))))
         return node
 
     @on(DataTable.RowHighlighted, '#storage-table')

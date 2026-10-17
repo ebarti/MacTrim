@@ -173,13 +173,12 @@ class JournalIndexContractTests(unittest.TestCase):
         self.assertEqual(self.scan().refresh['mode'], 'incremental')
 
     def test_permission_partial_observation_is_saved_and_can_reuse_accessible_subtrees(self):
-        original = os.open
-        def open_directory(path, *args, **kwargs):
-            if str(path) == 'protected':
-                raise PermissionError(13, 'Permission denied', str(path))
-            return original(path, *args, **kwargs)
-        with patch('mactrim.storage.os.open', side_effect=open_directory):
+        blocked = self.data / 'protected'
+        blocked.chmod(0)
+        try:
             observed = self.scan()
+        finally:
+            blocked.chmod(0o700)
         self.assertEqual(observed.status, 'partial')
         self.assertTrue(observed.refresh['cache']['stored'])
         self.assertTrue(observed.refresh['cache']['reusable'])
