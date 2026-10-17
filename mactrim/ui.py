@@ -31,6 +31,19 @@ def signed_size(value):
     return ('−' if value < 0 else '+') + human(abs(value))
 
 
+def index_save_status(node):
+    saved = getattr(node, 'refresh', {}).get('cache')
+    if not saved:
+        return 'Index save status unavailable'
+    if not saved.get('stored'):
+        return 'INDEX NOT SAVED · ' + saved.get('reason', 'Save failed')
+    if not saved.get('complete_index'):
+        return 'TOTALS SAVED ONLY · Directory details exceeded retention limits; full scan required'
+    if saved.get('reusable'):
+        return 'INDEX SAVED · Incremental refresh available'
+    return 'OBSERVATION SAVED · Full reconciliation required before reuse'
+
+
 def highlighted_path(table):
     if table.row_count:
         return str(table.coordinate_to_cell_key(Coordinate(table.cursor_row, 0)).row_key.value)
@@ -583,6 +596,8 @@ class MacTrimApp(App):
         status = '%s · %s metadata visits · %s' % (node.status.upper(), getattr(node, 'counters', {}).get('visited', node.entries), '; '.join(node.issues[:2]) if done else ('%s · %s' % (getattr(node, 'progress', {}).get('phase', 'Measuring'), clean(getattr(node, 'progress', {}).get('path', node.path)))))
         if done and node.status == 'cancelled':
             status += ' · Storage stopped; Refresh starts another scan. Previous saved index preserved.'
+        elif done:
+            status = 'Scan finished (%s) · %s\n%s metadata visits · %s' % (node.status.upper(), index_save_status(node), getattr(node, 'counters', {}).get('visited', node.entries), '; '.join(node.issues[:2]))
         self.query_main('#storage-status', Static).update(Text(status, style=STATUS_COLOR.get(node.status, '#fbbf24')))
 
     def refresh_storage(self):
@@ -621,7 +636,9 @@ class MacTrimApp(App):
         if refresh.get('last_verified'):
             refresh_note += ' · verified ' + datetime.fromtimestamp(refresh['last_verified']).strftime('%b %d %H:%M:%S')
         if cache:
-            refresh_note += ' · cache %s / %s' % (human(cache.get('allocated_bytes', 0)), human(cache['limit_bytes']))
+            refresh_note += ' · ' + index_save_status(node)
+            if 'limit_bytes' in cache:
+                refresh_note += ' · cache %s / %s' % (human(cache.get('allocated_bytes', 0)), human(cache['limit_bytes']))
         if refresh.get('warnings'):
             refresh_note += ' · ' + '; '.join(refresh['warnings'][:2])
         difference = accounting(node, self.capacity_rows)['difference'] if node.path == '/' else None
