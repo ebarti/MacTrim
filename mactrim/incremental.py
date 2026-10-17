@@ -25,9 +25,10 @@ def volume_identity(path):
             bool(os.statvfs(path).f_flag & os.ST_RDONLY)]
 
 
-def inventory(path, state=None, config=None, cancel=None, progress=None, full=False, backend=events.NativeEvents):
+def inventory(path, state=None, config=None, cancel=None, progress=None, full=False, backend=events.NativeEvents, view=None):
     from .config import defaults
     config = config or defaults()
+    view = view or getattr(progress, 'view', None)
     settings = config['storage_cache']
     path = canonical(path)
     cache = Cache(state, settings) if state is not None and settings['enabled'] else None
@@ -44,6 +45,11 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
         check_cancel(cancel)
         if progress and node is not None:
             snapshot = progress_snapshot(node, value, node.path)
+            if view:
+                from .storage import find_directory
+                selected = find_directory(node, view())
+                if selected is not None and selected is not node:
+                    snapshot.view = progress_snapshot(selected, value, node.path)
             snapshot.counters['visited'] = visits
             snapshot.metadata_visits = visits
             progress(snapshot, snapshot)
@@ -153,7 +159,7 @@ def inventory(path, state=None, config=None, cancel=None, progress=None, full=Fa
                     return None
                 return old
             result = complete(path, cancel=cancel, progress=walk_progress if progress else None, exclusions=excluded,
-                              reuse=reuse if allow_reuse else None)
+                              reuse=reuse if allow_reuse else None, view=view)
             visits += result.counters['visited']
             return result
         # No native receiver is alive during enumeration. Replay persistent

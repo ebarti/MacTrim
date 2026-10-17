@@ -20,7 +20,7 @@ from textual.widgets.option_list import Option
 from .config import defaults
 from .executor import Executor, selection
 from .measurement import capacities
-from .storage import page, accounting, PAGE_SIZE
+from .storage import page, accounting, PAGE_SIZE, find_directory, StorageNode
 from .incremental import inventory
 from .history import History
 from .safety import SafetyError, canonical, clean
@@ -267,6 +267,8 @@ class MacTrimApp(App):
         self.storage_offset = 0
         self.storage_page_rows = []
         self.storage_inventory = None
+        self.storage_progress = None
+        self.storage_scan_path = self.storage_path
         self.storage_has_more = False
         self.render_dirty = False
         self.capacity_rows = []
@@ -560,22 +562,28 @@ class MacTrimApp(App):
             self.message('; '.join(row['status'] + ': ' + clean(row.get('reason', row['path'])) for row in result['outcomes']))
         self.refresh_cleanup()
 
-    def start_storage(self, path, full=False):
+    def start_storage(self, path, full=False, refresh=False):
         target = str(canonical(path))
-        if not full and target != self.storage_path and not self.storage_measuring and self.storage_inventory is not None:
-            from .incremental import iter_nodes
-            remembered = next((row for row in iter_nodes(self.storage_inventory) if row.path == target), None)
-            if remembered is not None:
-                self.storage_path, self.storage_node, self.storage_offset = target, remembered, 0
-                remembered.refresh = dict(getattr(self.storage_inventory, 'refresh', {}), mode='cached observation', reason='Navigation reuses last observation; Refresh verifies filesystem events')
+        if not full and not refresh and (self.storage_measuring or (target != self.storage_path and self.storage_inventory is not None)):
+            source = self.storage_progress if self.storage_measuring else self.storage_inventory
+            remembered = find_directory(source, target) if source is not None else None
+            if self.storage_measuring or remembered is not None:
+                self.storage_path, self.storage_offset = target, 0
+                self.storage_node = remembered or StorageNode(target, Path(target).name or '/', kind='directory', status='scanning')
                 self.query_main('#breadcrumbs', Static).update(Text(target, style='bold #67e8f9'))
-                self.load_storage_page(); self.refresh_storage()
-                self.query_main('#storage-status', Static).update('Cached observation; Refresh verifies current filesystem events')
+                if not self.storage_measuring:
+                    self.load_storage_page()
+                self.refresh_storage()
+                self.query_main('#storage-status', Static).update(
+                    'Browsing while scan continues at %s; waiting for observed directory details' % self.storage_scan_path if self.storage_measuring else
+                    'Cached observation; Refresh verifies current filesystem events')
                 return
         self.storage_cancel.set()
         self.storage_cancel = threading.Event()
         self.storage_generation += 1
         self.storage_path = str(canonical(path))
+        self.storage_scan_path = self.storage_path
+        self.storage_progress = None
         self.storage_node = None
         self.storage_offset = 0
         self.storage_page_rows = []
@@ -597,6 +605,7 @@ class MacTrimApp(App):
         try:
             capacity = capacities('/')
             self.call_from_thread(self.capacity_update, capacity, generation)
+            progress.view = lambda: self.storage_path
             node = inventory(path, self.state, config, cancel=cancel, progress=progress, full=full)
             self.call_from_thread(self.storage_update, node, generation, True)
             if self.state is not None and not cancel.is_set() and node.entries > 1:
@@ -629,7 +638,13 @@ class MacTrimApp(App):
     def storage_update(self, node, generation, done):
         if generation != self.storage_generation:
             return
-        self.storage_node = node
+        self.storage_progress = node
+        selected = (getattr(node, 'view', None) if not done else find_directory(node, self.storage_path))
+        if selected is not None and selected.path != self.storage_path:
+            selected = None
+        if selected is None and node.path == self.storage_path:
+            selected = node
+        self.storage_node = selected or StorageNode(self.storage_path, Path(self.storage_path).name or '/', kind='directory', status='scanning' if not done else 'unknown')
         if done:
             self.storage_measuring = False
             self.storage_inventory = node
@@ -705,6 +720,7 @@ class MacTrimApp(App):
         note = (' · signed filesystem difference %s (APFS/excluded/inaccessible)' % signed_size(difference)) if difference is not None else ''
         if self.storage_measuring:
             refresh_note += ' · live rows: first %s immediate directories; totals include all observations' % PAGE_SIZE
+            refresh_note += ' · scan root: ' + self.storage_scan_path
         lifecycle = ('CANCELLING; observed lower bounds' if self.storage_cancel.is_set() else 'SCANNING; observed lower bounds') if self.storage_measuring else node.status.upper()
         self.query_main('#storage-summary', Static).update(Text('%s %s · %s · page %s%s\nGraph: top 15 directories / filesystem used at root (allocated), otherwise scope estimate; partial scope totals are lower bounds. Inaccessible scopes are unknown. Full rescan has no entry/depth cap.' % (human(getattr(node, metric)), metric, lifecycle, self.storage_offset // PAGE_SIZE + 1, note) + '\n' + refresh_note))
 
@@ -806,7 +822,7 @@ class MacTrimApp(App):
 
     def action_refresh(self):
         if self.query_main('#tabs', TabbedContent).active == 'storage':
-            self.start_storage(self.storage_path)
+            self.start_storage(self.storage_path, refresh=True)
         elif self.query_main('#tabs', TabbedContent).active == 'history':
             self.load_history()
         else:
@@ -830,7 +846,7 @@ class MacTrimApp(App):
         elif identifier == 'parent':
             self.start_storage(str(Path(self.storage_path).parent))
         elif identifier == 'storage-refresh':
-            self.start_storage(self.storage_path)
+            self.start_storage(self.storage_path, refresh=True)
         elif identifier == 'cancel-storage':
             self.request_scan_cancel('storage')
         elif identifier == 'storage-full':

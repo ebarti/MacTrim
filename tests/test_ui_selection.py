@@ -42,6 +42,7 @@ class StableSelectionTests(unittest.IsolatedAsyncioTestCase):
                 root = StorageNode('/fixture', 'fixture', status='scanning', allocated=10000)
                 root.children = [StorageNode('/fixture/%s' % i, str(i), status='scanning',
                                              allocated=(20-i)*100) for i in range(20)]
+                app.storage_path = app.storage_scan_path = root.path
                 app.storage_update(root, app.storage_generation, False)
                 await pilot.pause()
                 table = app.query_one('#storage-table', DataTable)

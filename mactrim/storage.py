@@ -53,6 +53,19 @@ def _signature(st):
     return st.st_dev, st.st_ino, st.st_mode, st.st_size, st.st_mtime_ns, st.st_ctime_ns
 
 
+def find_directory(root, path):
+    """Follow path components; never search every node to navigate."""
+    target = canonical(path)
+    if not within(target, root.path):
+        return None
+    node = root
+    for name in target.relative_to(root.path).parts:
+        node = next((child for child in node.children if child.name == name), None)
+        if node is None:
+            return None
+    return node
+
+
 def progress_snapshot(root, phase, current_path, totals=None, branches=None, reused=()):
     """Stable, shallow UI observation. Unfinished directory totals are lower bounds."""
     snapshot = copy(root)
@@ -64,11 +77,17 @@ def progress_snapshot(root, phase, current_path, totals=None, branches=None, reu
     snapshot.children = []
     if totals is not None:
         snapshot.logical, snapshot.allocated, snapshot.entries = totals
+    else:
+        snapshot.logical = max(root.logical, root.own_logical + sum(child.logical for child in root.children))
+        snapshot.allocated = max(root.allocated, root.own_allocated + sum(child.allocated for child in root.children))
     # Presentation must not make every progress tick copy an unbounded tree.
     # Totals above still include every observed directory and file.
     for child in root.children[:PAGE_SIZE]:
         row = copy(child)
         row.issues = list(child.issues)
+        row.children = []
+        row.logical = max(row.logical, child.own_logical)
+        row.allocated = max(row.allocated, child.own_allocated)
         if branches is not None:
             row.logical, row.allocated, row.entries = branches.get(child.path, (0, 0, 0))
             if row.status == 'measured' and row.path not in reused:
@@ -77,7 +96,7 @@ def progress_snapshot(root, phase, current_path, totals=None, branches=None, reu
     return snapshot
 
 
-def complete(path, cancel=None, progress=None, exclusions=(), reuse=None):
+def complete(path, cancel=None, progress=None, exclusions=(), reuse=None, view=None):
     """Iterative no-follow full walk; quotas/depth never determine completion.
 
     Each directory is opened from verified ancestors with a captured inode;
@@ -97,6 +116,7 @@ def complete(path, cancel=None, progress=None, exclusions=(), reuse=None):
     own_exclusions = tuple(canonical(value) for value in exclusions)
     totals, branches = [0, 0, 0], {}
     current, branch, accounted = None, None, (0, 0, 0)
+    selected_view = [None, None]
     def account():
         nonlocal accounted
         if current is None:
@@ -115,7 +135,13 @@ def complete(path, cancel=None, progress=None, exclusions=(), reuse=None):
         if progress and (force or time.monotonic() - last_progress >= .15):
             account()
             last_progress = time.monotonic()
-            progress(progress_snapshot(root, phase, node.path, totals, branches, reused), copy(node))
+            snapshot = progress_snapshot(root, phase, node.path, totals, branches, reused)
+            target = str(canonical(view())) if view else root.path
+            if target != selected_view[0] or selected_view[1] is None:
+                selected_view[:] = [target, find_directory(root, target)]
+            if target != root.path and selected_view[1] is not None:
+                snapshot.view = progress_snapshot(selected_view[1], phase, node.path)
+            progress(snapshot, copy(node))
     def excluded(node, reason):
         node.status = 'skipped'
         node.issues.append(reason)
