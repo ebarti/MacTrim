@@ -59,6 +59,14 @@ pub struct Plan {
     pub items: Vec<Prepared>,
     pub approval: String,
 }
+#[derive(Deserialize)]
+struct PlanHeader {
+    schema: String,
+    id: String,
+    #[serde(with = "crate::paths")]
+    state: PathBuf,
+    created: u64,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Journal {
     pub schema: String,
@@ -360,6 +368,16 @@ impl<P: ActivityProvider> Actions<P> {
         lock.try_lock_exclusive()
             .context("Another cleanup action owns the state")?;
         let keypath = path.join("key");
+        if !keypath.exists() {
+            for group in ["plans", "journals", "quarantine"] {
+                if path.join(group).exists() {
+                    ensure!(
+                        fs::read_dir(path.join(group))?.next().is_none(),
+                        "Cleanup signing key is missing; existing recovery data preserved"
+                    );
+                }
+            }
+        }
         match OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -387,13 +405,48 @@ impl<P: ActivityProvider> Actions<P> {
             prepare_private(&path.join(name))?;
         }
         let state_dir = Dir::open(&path)?;
-        Ok(Self {
+        let actions = Self {
             path,
             key,
             provider,
             _lock: lock,
             state_dir,
-        })
+        };
+        actions.reap_expired_plans()?;
+        Ok(actions)
+    }
+    fn reap_expired_plans(&self) -> Result<()> {
+        // Approval has already expired, so an authenticated plan is only a
+        // disposable inventory. Recovery journals and payloads are independent.
+        for entry in fs::read_dir(self.path.join("plans"))? {
+            let entry = entry?;
+            let Some(id) = entry
+                .path()
+                .file_stem()
+                .and_then(|n| n.to_str())
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            if entry.path().extension().and_then(|n| n.to_str()) != Some("gz")
+                || uuid::Uuid::parse_str(&id).is_err()
+            {
+                continue;
+            }
+            let Ok(header) = self.read::<PlanHeader>(&entry.path()) else {
+                continue;
+            };
+            if header.schema == "mactrim.rust.plan.v1"
+                && header.id == id
+                && header.state == self.path
+                && header.created <= now()
+                && now() - header.created > 600
+            {
+                fs::remove_file(entry.path())?;
+            }
+        }
+        File::open(self.path.join("plans"))?.sync_all()?;
+        Ok(())
     }
     fn file(&self, group: &str, id: &str) -> Result<PathBuf> {
         ensure!(uuid::Uuid::parse_str(id).is_ok(), "Invalid plan/journal ID");
@@ -404,18 +457,13 @@ impl<P: ActivityProvider> Actions<P> {
         if fs::symlink_metadata(path).is_ok() {
             self.authenticated_file(path)?;
         }
-        let pending = path.with_extension(format!("{}.pending", uuid::Uuid::new_v4()));
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&pending)?;
+        let mut pending =
+            tempfile::NamedTempFile::new_in(path.parent().context("Missing record parent")?)?;
+        let file = pending.as_file_mut();
         file.write_all(MAGIC)?;
         file.write_all(&[0; 32])?;
         {
-            let mut zip = GzEncoder::new(&mut file, Compression::fast());
+            let mut zip = GzEncoder::new(&mut *file, Compression::fast());
             serde_json::to_writer(&mut zip, body)?;
             zip.finish()?;
         }
@@ -434,7 +482,7 @@ impl<P: ActivityProvider> Actions<P> {
         file.seek(SeekFrom::Start(MAGIC.len() as u64))?;
         file.write_all(&mac.finalize().into_bytes())?;
         file.sync_all()?;
-        fs::rename(&pending, path)?;
+        pending.persist(path).map_err(|e| e.error)?;
         File::open(path.parent().unwrap())?.sync_all()?;
         Ok(())
     }
@@ -952,5 +1000,35 @@ mod tests {
                 .prepare(&[classify(&repo.join("node_modules")).unwrap()], 0)
                 .is_err()
         );
+    }
+    #[test]
+    fn expired_signed_plans_are_reaped_without_touching_source_or_payloads() {
+        let (_temp, repo, state) = fixture();
+        let a = Actions::with_provider(&state, Quiet).unwrap();
+        let candidate = classify(&repo.join("node_modules")).unwrap();
+        let mut plan = a.prepare(&[candidate], 0).unwrap();
+        plan.created = now() - 601;
+        let path = a.file("plans", &plan.id).unwrap();
+        a.write(&path, &plan).unwrap();
+        let payload = a.path.join("quarantine/keep");
+        fs::write(&payload, b"preserve").unwrap();
+        drop(a);
+        let _a = Actions::with_provider(&state, Quiet).unwrap();
+        assert!(!path.exists());
+        assert!(repo.join("node_modules").exists());
+        assert_eq!(fs::read(payload).unwrap(), b"preserve");
+    }
+    #[test]
+    fn a_missing_signing_key_never_replaces_existing_recovery_authority() {
+        let (_temp, _repo, state) = fixture();
+        let a = Actions::with_provider(&state, Quiet).unwrap();
+        let marker = a.path.join("quarantine/keep");
+        fs::write(&marker, b"preserve").unwrap();
+        let key = a.path.join("key");
+        drop(a);
+        fs::remove_file(&key).unwrap();
+        assert!(Actions::with_provider(&state, Quiet).is_err());
+        assert!(!key.exists());
+        assert_eq!(fs::read(marker).unwrap(), b"preserve");
     }
 }
