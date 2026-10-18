@@ -1,0 +1,664 @@
+use crate::{
+    events,
+    model::*,
+    regions::Regions,
+    scan,
+    store::{self, Generation, Store, Work},
+};
+use anyhow::{Context, Result, bail, ensure};
+use serde::{Deserialize, Serialize};
+use std::{
+    fs,
+    io::{BufRead, BufReader, Read, Write},
+    os::unix::{
+        fs::{FileTypeExt, MetadataExt, PermissionsExt},
+        net::{UnixListener, UnixStream},
+    },
+    path::{Component, Path, PathBuf},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "command", rename_all = "snake_case")]
+pub enum Request {
+    Status,
+    List {
+        path: PathBuf,
+        offset: usize,
+        limit: usize,
+        logical: bool,
+    },
+    Refresh {
+        full: bool,
+    },
+    Expand {
+        path: PathBuf,
+    },
+    Pause,
+    Stop,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Status {
+    pub pid: u32,
+    pub root: PathBuf,
+    pub phase: String,
+    pub running: bool,
+    pub paused: bool,
+    pub history_ready: bool,
+    pub received_cursor: u64,
+    pub applied_cursor: u64,
+    pub pending_regions: usize,
+    pub directories: usize,
+    pub index_bytes: u64,
+    pub visited: u64,
+    pub reused: u64,
+    pub drop_signals: u64,
+    pub recovered_replays: u64,
+    pub last_saved: u64,
+    pub root_node: Option<Node>,
+    pub filesystem_used: u64,
+    pub filesystem_available: u64,
+    pub error: Option<String>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Row {
+    pub path: PathBuf,
+    pub node: Node,
+    pub directory: bool,
+}
+struct Ranked(u64, Row);
+impl PartialEq for Ranked {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+impl Eq for Ranked {}
+impl PartialOrd for Ranked {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Ranked {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .0
+            .cmp(&self.0)
+            .then_with(|| self.1.path.cmp(&other.1.path))
+    }
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Reply {
+    pub status: Status,
+    pub rows: Vec<Row>,
+    pub more: bool,
+    pub message: String,
+}
+struct Public {
+    status: Status,
+    index: Option<Arc<Index>>,
+    detail: Option<Arc<Index>>,
+}
+type Command = (Request, mpsc::SyncSender<Result<Reply, String>>);
+
+pub fn state_path(path: &Path) -> Result<PathBuf> {
+    ensure!(
+        path.is_absolute() && !path.components().any(|c| c == Component::ParentDir),
+        "State path must be absolute without '..'"
+    );
+    if fs::symlink_metadata(path).is_ok() {
+        ensure!(!path.is_symlink(), "State directory cannot be a symlink");
+        return fs::canonicalize(path).map_err(Into::into);
+    }
+    let parent = state_path(path.parent().context("No state parent")?)?;
+    Ok(parent.join(path.file_name().context("No state name")?))
+}
+pub fn request(state: &Path, command: &Request) -> Result<Reply> {
+    let socket = state.join("service.sock");
+    let meta = fs::symlink_metadata(&socket)?;
+    ensure!(
+        meta.file_type().is_socket() && meta.uid() == unsafe { libc::geteuid() },
+        "Unsafe service socket"
+    );
+    let mut stream = UnixStream::connect(&socket).context("Storage service is not running")?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    serde_json::to_writer(&mut stream, command)?;
+    stream.write_all(b"\n")?;
+    let mut line = String::new();
+    BufReader::new(stream)
+        .take(16 * 1024 * 1024)
+        .read_line(&mut line)?;
+    let response: Result<Reply, String> = serde_json::from_str(&line)?;
+    response.map_err(anyhow::Error::msg)
+}
+fn directory_rows(
+    index: Option<&Index>,
+    path: &Path,
+    logical: bool,
+    offset: usize,
+    limit: usize,
+) -> Result<(Vec<Row>, bool)> {
+    let mut heap = std::collections::BinaryHeap::new();
+    let cutoff = offset.saturating_add(limit);
+    let mut total = 0usize;
+    let mut keep = |row: Row| {
+        let size = if logical {
+            row.node.logical
+        } else {
+            row.node.allocated
+        };
+        total += 1;
+        heap.push(Ranked(size, row));
+        if heap.len() > cutoff {
+            heap.pop();
+        }
+    };
+    if let Some(index) = index {
+        for p in index.children.get(path).into_iter().flatten() {
+            if let Some(n) = index.nodes.get(p) {
+                keep(Row {
+                    path: p.clone(),
+                    node: n.clone(),
+                    directory: true,
+                });
+            }
+        }
+    }
+    // Files need only immediate metadata, and are never persisted as inventory.
+    // The IPC handler owns this IO; it cannot block event ingestion.
+    if let Ok(entries) = fs::read_dir(path) {
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let meta = match fs::symlink_metadata(entry.path()) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if meta.is_dir() {
+                continue;
+            }
+            let regular = meta.is_file() && !meta.file_type().is_symlink();
+            keep(Row {
+                path: entry.path(),
+                directory: false,
+                node: Node {
+                    logical: if regular { meta.len() } else { 0 },
+                    allocated: if regular { meta.blocks() * 512 } else { 0 },
+                    status: if regular { 0 } else { 1 },
+                    ..Node::default()
+                },
+            });
+        }
+    }
+    let mut rows: Vec<Row> = heap.into_iter().map(|r| r.1).collect();
+    rows.sort_unstable_by(|a, b| {
+        let size = |r: &Row| {
+            if logical {
+                r.node.logical
+            } else {
+                r.node.allocated
+            }
+        };
+        size(b).cmp(&size(a)).then_with(|| a.path.cmp(&b.path))
+    });
+    let more = total > cutoff;
+    Ok((rows.into_iter().skip(offset).take(limit).collect(), more))
+}
+fn serve(
+    stream: UnixStream,
+    public: Arc<RwLock<Public>>,
+    progress: Arc<Mutex<Progress>>,
+    sender: mpsc::Sender<Command>,
+) -> Result<()> {
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    let mut input = BufReader::new(&stream).take(8193);
+    let mut line = String::new();
+    input.read_line(&mut line)?;
+    ensure!(line.len() <= 8192, "Request too large");
+    let request: Request = serde_json::from_str(&line)?;
+    let reply = match request {
+        Request::List {
+            ref path,
+            offset,
+            limit,
+            logical,
+        } => {
+            ensure!(
+                path.is_absolute() && !path.components().any(|c| c == Component::ParentDir),
+                "Invalid browsing path"
+            );
+            ensure!(limit > 0 && limit <= 500, "Page size must be 1..500");
+            let (status, index, detail) = {
+                let p = public.read().unwrap();
+                ensure!(
+                    path.starts_with(&p.status.root),
+                    "Path outside service scope"
+                );
+                (p.status.clone(), p.index.clone(), p.detail.clone())
+            };
+            progress.lock().unwrap().view = path.clone();
+            let selected = detail
+                .as_deref()
+                .filter(|d| path.starts_with(&d.root))
+                .or(index.as_deref());
+            let (mut rows, mut more) = directory_rows(selected, path, logical, offset, limit)?;
+            if status.running {
+                let live = progress.lock().unwrap();
+                if live.view == *path && !live.rows.is_empty() && selected.is_none() {
+                    rows = live
+                        .rows
+                        .iter()
+                        .skip(offset)
+                        .take(limit)
+                        .map(|(p, n)| Row {
+                            path: p.clone(),
+                            node: n.clone(),
+                            directory: true,
+                        })
+                        .collect();
+                    more = live.rows.len() > offset + limit;
+                }
+            }
+            Reply {
+                status,
+                rows,
+                more,
+                message: String::new(),
+            }
+        }
+        Request::Status => Reply {
+            status: public.read().unwrap().status.clone(),
+            ..Reply::default()
+        },
+        other => {
+            let (tx, rx) = mpsc::sync_channel(1);
+            sender.send((other, tx))?;
+            rx.recv_timeout(Duration::from_secs(3))?
+                .map_err(anyhow::Error::msg)?
+        }
+    };
+    let mut stream = stream;
+    serde_json::to_writer(&mut stream, &Ok::<_, String>(reply))?;
+    stream.write_all(b"\n")?;
+    Ok(())
+}
+
+pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<()> {
+    let root = fs::canonicalize(root)?;
+    let state = state_path(&state)?;
+    let mut store = Store::open(&state)?;
+    let mut identity = events::identity(&root)?;
+    store.bind(&root, &identity, events::current_id())?;
+    let mut index = store.load()?.map(Arc::new);
+    store.reap_orphans()?;
+    if index.is_none() && store.work()?.paths.is_empty() {
+        store.ingest(store.cursor()?, [root.clone()], "Initial baseline")?;
+    }
+    let socket = state.join("service.sock");
+    if let Ok(m) = fs::symlink_metadata(&socket) {
+        ensure!(
+            m.file_type().is_socket() && m.uid() == unsafe { libc::geteuid() },
+            "Unexpected service socket path preserved"
+        );
+        fs::remove_file(&socket)?;
+    }
+    let listener = UnixListener::bind(&socket)?;
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
+    listener.set_nonblocking(true)?;
+    let mut watch = events::watch(identity.clone(), store.cursor()?)?;
+    let mut ready = false;
+    let mut replay_failures = 0;
+    let mut drop_signals = 0;
+    let mut recovered_replays = 0;
+    let progress = Arc::new(Mutex::new(Progress {
+        view: root.clone(),
+        ..Progress::default()
+    }));
+    let public = Arc::new(RwLock::new(Public {
+        status: Status {
+            root: root.clone(),
+            pid: std::process::id(),
+            ..Status::default()
+        },
+        index: index.clone(),
+        detail: None,
+    }));
+    let (commands_tx, commands_rx) = mpsc::channel::<Command>();
+    let clients = Arc::new(AtomicUsize::new(0));
+    let (finished_tx, finished_rx) = mpsc::channel::<Result<(Arc<Index>, Generation, Work)>>();
+    let (details_tx, details_rx) = mpsc::channel::<Result<Arc<Index>>>();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut running = false;
+    let mut detail_running = false;
+    let mut detail_pending: Option<PathBuf> = None;
+    let mut paused: bool = store.get("paused")?.unwrap_or(false);
+    let mut error = None;
+    let mut phase = "Replaying filesystem journal".to_string();
+    let mut identity_check = Instant::now();
+    let mut last_event = Instant::now();
+    let mut last_retry = Instant::now();
+    let mut last_saved = store.generation()?.map(|g| g.created).unwrap_or(0);
+    loop {
+        if terminate.load(Ordering::Relaxed) {
+            cancel.store(true, Ordering::Relaxed);
+            break;
+        }
+        for _ in 0..32 {
+            let batch = match watch.receiver.try_recv() {
+                Ok(b) => b,
+                Err(_) => break,
+            };
+            let change = events::changes(batch, &root, &identity, &state, store.cursor()?);
+            if change.gap != 0 {
+                drop_signals += 1;
+                if replay_failures == 0 {
+                    replay_failures = 1;
+                    ready = false;
+                    phase = format!("Replaying after delivery gap (flags {})", change.gap);
+                    drop(watch);
+                    watch = events::watch(identity.clone(), store.cursor()?)?;
+                } else {
+                    store.ingest(
+                        change.latest,
+                        [root.clone()],
+                        "Journal replay gap; full reconciliation",
+                    )?;
+                    ready = change.history_done;
+                    replay_failures = 0;
+                    phase = "Reconciling reported journal gap".into();
+                    drop(watch);
+                    watch = events::watch(identity.clone(), store.cursor()?)?;
+                }
+                last_event = Instant::now();
+                break;
+            }
+            store.ingest(change.latest, change.paths, "Filesystem changes")?;
+            if change.history_done {
+                ready = true;
+                if replay_failures != 0 {
+                    recovered_replays += 1;
+                    replay_failures = 0;
+                }
+            }
+            last_event = Instant::now();
+        }
+        if watch.overflow.swap(false, Ordering::AcqRel) {
+            if replay_failures != 0 {
+                store.ingest(
+                    watch
+                        .overflow_latest
+                        .load(Ordering::Relaxed)
+                        .max(store.cursor()?),
+                    [root.clone()],
+                    "Receiver pressure; full reconciliation",
+                )?;
+                replay_failures = 0;
+            } else {
+                replay_failures = 1;
+            }
+            ready = false;
+            phase = "Replaying after receiver queue pressure".into();
+            drop(watch);
+            watch = events::watch(identity.clone(), store.cursor()?)?;
+        }
+        if identity_check.elapsed() > Duration::from_secs(10) {
+            let current = events::identity(&root)?;
+            if current != identity {
+                cancel.store(true, Ordering::Relaxed);
+                identity = current;
+                store.bind(&root, &identity, events::current_id())?;
+                ready = false;
+                drop(watch);
+                watch = events::watch(identity.clone(), store.cursor()?)?;
+                phase = "Volume history changed; reconciling full scope".into();
+            }
+            identity_check = Instant::now();
+        }
+        while let Ok((command, tx)) = commands_rx.try_recv() {
+            let reply = match command {
+                Request::Stop => {
+                    terminate.store(true, Ordering::Relaxed);
+                    "Service stopping; committed index and pending work preserved"
+                }
+                Request::Pause => {
+                    paused = true;
+                    store.set_paused(true)?;
+                    cancel.store(true, Ordering::Relaxed);
+                    "Scan paused; Refresh resumes it"
+                }
+                Request::Refresh { full } => {
+                    paused = false;
+                    store.set_paused(false)?;
+                    error = None;
+                    if full {
+                        store.ingest(store.cursor()?, [root.clone()], "Explicit full rescan")?;
+                    } else if !running {
+                        let retry: Vec<_> = index
+                            .as_ref()
+                            .into_iter()
+                            .flat_map(|i| i.nodes.iter())
+                            .filter(|(_, n)| n.status > 1 && n.error != 0)
+                            .map(|(p, _)| p.clone())
+                            .collect();
+                        store.ingest(store.cursor()?, retry, "Retrying incomplete coverage")?;
+                    }
+                    "Refresh uses the received journal and pending regions; no automatic baseline reset"
+                }
+                Request::Expand { path } => {
+                    if !path.starts_with(&root)
+                        || path.components().any(|c| c == Component::ParentDir)
+                    {
+                        let _ = tx.send(Err("Path outside scope".into()));
+                        continue;
+                    }
+                    detail_pending = Some(path);
+                    "Browsing detail queued; current scan continues"
+                }
+                _ => "Unsupported control request",
+            };
+            let _ = tx.send(Ok(Reply {
+                status: public.read().unwrap().status.clone(),
+                message: reply.into(),
+                ..Reply::default()
+            }));
+        }
+        if let Ok(result) = finished_rx.try_recv() {
+            running = false;
+            match result {
+                Ok((candidate, generation, work))
+                    if !cancel.load(Ordering::Relaxed)
+                        && events::identity(&root)? == work.identity =>
+                {
+                    store.commit(&generation, &work, &candidate)?;
+                    last_saved = generation.created;
+                    if work.paths.iter().any(|p| p == &root) {
+                        store.set_full_at(last_saved)?;
+                    }
+                    index = Some(candidate);
+                    public.write().unwrap().detail = None;
+                    phase = "Index saved; incremental tracking active".into();
+                    error = None;
+                }
+                Ok(_) => {
+                    phase = "Candidate interrupted; previous index preserved".into();
+                }
+                Err(e) => {
+                    error = Some(format!("{e:#}"));
+                    paused = true;
+                    store.set_paused(true)?;
+                    phase = "Measurement paused after failure".into();
+                }
+            }
+            last_retry = Instant::now();
+        }
+        if let Ok(result) = details_rx.try_recv() {
+            detail_running = false;
+            match result {
+                Ok(d) => public.write().unwrap().detail = Some(d),
+                Err(e) => error = Some(e.to_string()),
+            }
+        }
+        let work = store.work()?;
+        if ready
+            && !paused
+            && !running
+            && !detail_running
+            && last_event.elapsed() >= Duration::from_millis(750)
+            && !work.paths.is_empty()
+        {
+            let work = store.claim()?;
+            running = true;
+            cancel.store(false, Ordering::Relaxed);
+            phase = work.reason.clone();
+            let previous = index.clone();
+            let root = root.clone();
+            let state = state.clone();
+            let cancel = cancel.clone();
+            let progress = progress.clone();
+            let tx = finished_tx.clone();
+            thread::Builder::new()
+                .name("mactrim-measurement".into())
+                .spawn(move || {
+                    let result = (|| {
+                        let dirty: Regions = work.paths.iter().cloned().collect();
+                        let measured = Arc::new(scan::measure(
+                            &root,
+                            std::slice::from_ref(&state),
+                            previous.as_deref(),
+                            &dirty,
+                            &cancel,
+                            Some(&progress),
+                        )?);
+                        if cancel.load(Ordering::Relaxed) {
+                            bail!("Scan paused; previous index preserved");
+                        }
+                        progress.lock().unwrap().phase = "Saving compressed directory index".into();
+                        let generation = Generation::write(&state, &measured)?;
+                        Ok((measured, generation, work))
+                    })();
+                    let _ = tx.send(result);
+                })?;
+        } else if ready
+            && !paused
+            && !running
+            && !detail_running
+            && let Some(path) = detail_pending.take()
+        {
+            detail_running = true;
+            cancel.store(false, Ordering::Relaxed);
+            let cancel = cancel.clone();
+            let tx = details_tx.clone();
+            let state = state.clone();
+            thread::spawn(move || {
+                let result =
+                    scan::measure(&path, &[state], None, &Regions::default(), &cancel, None)
+                        .map(Arc::new);
+                let _ = tx.send(result);
+            });
+        }
+        // A periodic audit covers advisory-event blind spots, not ordinary Refresh.
+        if ready
+            && !paused
+            && !running
+            && work.paths.is_empty()
+            && last_retry.elapsed() > Duration::from_secs(3600)
+        {
+            if store::now().saturating_sub(store.full_at()?) >= 7 * 86400 {
+                store.ingest(
+                    store.cursor()?,
+                    [root.clone()],
+                    "Periodic reconciliation due",
+                )?;
+            }
+            last_retry = Instant::now();
+        }
+        {
+            let live = progress.lock().unwrap();
+            let mut p = public.write().unwrap();
+            p.index = index.clone();
+            let (used, available) = capacity(&root).unwrap_or_default();
+            p.status = Status {
+                pid: std::process::id(),
+                root: root.clone(),
+                phase: if paused {
+                    "Paused; Refresh resumes measurement".into()
+                } else if running && !live.phase.is_empty() {
+                    live.phase.clone()
+                } else {
+                    phase.clone()
+                },
+                running,
+                paused,
+                history_ready: ready,
+                received_cursor: store.cursor()?,
+                applied_cursor: store.applied()?,
+                pending_regions: work.paths.len(),
+                directories: index.as_ref().map(|i| i.nodes.len()).unwrap_or(0),
+                index_bytes: store.footprint()?,
+                visited: live.visited,
+                reused: live.reused,
+                drop_signals,
+                recovered_replays,
+                last_saved,
+                root_node: index.as_ref().and_then(|i| i.root_node().cloned()),
+                filesystem_used: used,
+                filesystem_available: available,
+                error: error.clone(),
+            };
+        }
+        while let Ok((stream, _)) = listener.accept() {
+            if clients.load(Ordering::Relaxed) >= 8 {
+                drop(stream);
+                continue;
+            }
+            clients.fetch_add(1, Ordering::Relaxed);
+            let clients = clients.clone();
+            let public = public.clone();
+            let progress = progress.clone();
+            let sender = commands_tx.clone();
+            thread::spawn(move || {
+                let error_stream = stream.try_clone().ok();
+                if let Err(error) = serve(stream, public, progress, sender)
+                    && let Some(mut out) = error_stream
+                {
+                    let _ = serde_json::to_writer(
+                        &mut out,
+                        &Err::<Reply, String>(format!("{error:#}")),
+                    );
+                    let _ = out.write_all(b"\n");
+                }
+                clients.fetch_sub(1, Ordering::Relaxed);
+            });
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    drop(watch);
+    drop(listener);
+    fs::remove_file(socket)?;
+    Ok(())
+}
+
+pub fn capacity(path: &Path) -> Result<(u64, u64)> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let p = CString::new(path.as_os_str().as_bytes())?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    ensure!(
+        unsafe { libc::statvfs(p.as_ptr(), stat.as_mut_ptr()) } == 0,
+        "Filesystem capacity unavailable"
+    );
+    let s = unsafe { stat.assume_init() };
+    Ok((
+        (s.f_blocks.saturating_sub(s.f_bfree) as u64) * s.f_frsize,
+        (s.f_bavail as u64) * s.f_frsize,
+    ))
+}
