@@ -842,6 +842,8 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
                     "Loading saved directory tree; event ingestion active".into()
                 } else if paused {
                     "Paused; Refresh resumes measurement".into()
+                } else if !ready {
+                    "Replaying filesystem journal; event continuity is not settled yet".into()
                 } else if running && !live.phase.is_empty() {
                     live.phase.clone()
                 } else {
