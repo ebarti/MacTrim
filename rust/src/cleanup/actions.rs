@@ -751,6 +751,12 @@ mod tests {
         fs::create_dir(&repo).unwrap();
         let git = |args: &[&str]| {
             let output = std::process::Command::new("/usr/bin/git")
+                .args([
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                ])
                 .arg("-C")
                 .arg(&repo)
                 .args(args)
