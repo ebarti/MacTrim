@@ -459,13 +459,7 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
                     if full {
                         store.ingest(store.cursor()?, [root.clone()], "Explicit full rescan")?;
                     } else if !running {
-                        let retry: Vec<_> = index
-                            .as_ref()
-                            .into_iter()
-                            .flat_map(|i| i.nodes.iter())
-                            .filter(|(_, n)| n.status > 1 && n.error != 0)
-                            .map(|(p, _)| p.clone())
-                            .collect();
+                        let retry = index.as_deref().map(retry_regions).unwrap_or_default();
                         store.ingest(store.cursor()?, retry, "Retrying incomplete coverage")?;
                     }
                     "Refresh uses the received journal and pending regions; no automatic baseline reset"
@@ -689,4 +683,46 @@ pub fn capacity(path: &Path) -> Result<(u64, u64)> {
         (s.f_blocks.saturating_sub(s.f_bfree) as u64) * s.f_frsize,
         (s.f_bavail as u64) * s.f_frsize,
     ))
+}
+
+pub fn retry_regions(index: &Index) -> Vec<PathBuf> {
+    let mut paths = Regions::default();
+    for node in index
+        .nodes
+        .values()
+        .filter(|n| n.status > 1 && n.error != 0)
+    {
+        if let Some(path) = node
+            .error_path
+            .as_ref()
+            .and_then(|p| p.ancestors().find(|p| index.nodes.contains_key(*p)))
+        {
+            paths.insert(path.to_owned());
+        }
+    }
+    paths.paths().cloned().collect()
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    #[test]
+    fn inherited_permission_error_retries_only_the_denied_scope() {
+        let mut index = Index::new("/fixture".into());
+        for p in ["/fixture", "/fixture/parent", "/fixture/parent/denied"] {
+            index.insert(
+                p.into(),
+                Node {
+                    status: if p.ends_with("denied") { 3 } else { 2 },
+                    error: libc::EACCES,
+                    error_path: Some("/fixture/parent/denied".into()),
+                    ..Node::default()
+                },
+            );
+        }
+        assert_eq!(
+            retry_regions(&index),
+            vec![PathBuf::from("/fixture/parent/denied")]
+        );
+    }
 }
