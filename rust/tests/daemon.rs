@@ -48,7 +48,7 @@ fn real_daemon_tracks_edits_and_recovers_changes_made_while_stopped() {
     let temp = tempfile::tempdir().unwrap();
     let base = fs::canonicalize(temp.path()).unwrap();
     let root = base.join("files");
-    let state = base.join("state");
+    let state = root.join(".state");
     fs::create_dir(&root).unwrap();
     fs::create_dir(root.join("a")).unwrap();
     fs::create_dir(root.join("b")).unwrap();

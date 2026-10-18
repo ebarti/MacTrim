@@ -345,6 +345,7 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
     let mut phase = "Replaying filesystem journal".to_string();
     let mut identity_check = Instant::now();
     let mut last_event = Instant::now();
+    let mut queued_at = Instant::now();
     let mut last_retry = Instant::now();
     let mut last_saved = store.generation()?.map(|g| g.created).unwrap_or(0);
     loop {
@@ -367,12 +368,19 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
                     drop(watch);
                     watch = events::watch(identity.clone(), store.cursor()?)?;
                 } else {
+                    let anchor = events::current_id();
+                    let current = events::identity(&root)?;
+                    if current != identity || store.cursor()? > anchor {
+                        cancel.store(true, Ordering::Relaxed);
+                        identity = current;
+                        store.bind(&root, &identity, anchor)?;
+                    }
                     store.ingest(
-                        change.latest,
+                        anchor.max(store.cursor()?),
                         [root.clone()],
                         "Journal replay gap; full reconciliation",
                     )?;
-                    ready = change.history_done;
+                    ready = true; // Root invalidation covers history through the new anchor.
                     replay_failures = 0;
                     phase = "Reconciling reported journal gap".into();
                     drop(watch);
@@ -381,7 +389,16 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
                 last_event = Instant::now();
                 break;
             }
-            store.ingest(change.latest, change.paths, "Filesystem changes")?;
+            let meaningful = !change.paths.is_empty();
+            if meaningful && store.work()?.paths.is_empty() {
+                queued_at = Instant::now();
+            }
+            // Persisting acknowledgements of our own excluded state writes
+            // would generate another event forever. They need no pending work;
+            // the next meaningful batch can safely cover them.
+            if meaningful || change.history_done {
+                store.ingest(change.latest, change.paths, "Filesystem changes")?;
+            }
             if change.history_done {
                 ready = true;
                 if replay_failures != 0 {
@@ -389,23 +406,23 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
                     replay_failures = 0;
                 }
             }
-            last_event = Instant::now();
+            if meaningful {
+                last_event = Instant::now();
+            }
         }
         if watch.overflow.swap(false, Ordering::AcqRel) {
             if replay_failures != 0 {
                 store.ingest(
-                    watch
-                        .overflow_latest
-                        .load(Ordering::Relaxed)
-                        .max(store.cursor()?),
+                    events::current_id().max(store.cursor()?),
                     [root.clone()],
                     "Receiver pressure; full reconciliation",
                 )?;
                 replay_failures = 0;
+                ready = true;
             } else {
                 replay_failures = 1;
+                ready = false;
             }
-            ready = false;
             phase = "Replaying after receiver queue pressure".into();
             drop(watch);
             watch = events::watch(identity.clone(), store.cursor()?)?;
@@ -512,13 +529,24 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
             && !paused
             && !running
             && !detail_running
-            && last_event.elapsed() >= Duration::from_millis(750)
+            && (last_event.elapsed() >= Duration::from_millis(750)
+                || queued_at.elapsed() >= Duration::from_secs(2))
             && !work.paths.is_empty()
         {
             let work = store.claim()?;
+            queued_at = Instant::now();
             running = true;
             cancel.store(false, Ordering::Relaxed);
             phase = work.reason.clone();
+            {
+                let mut live = progress.lock().unwrap();
+                let view = live.view.clone();
+                *live = Progress {
+                    view,
+                    phase: phase.clone(),
+                    ..Progress::default()
+                };
+            }
             let previous = index.clone();
             let root = root.clone();
             let state = state.clone();
