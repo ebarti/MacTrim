@@ -1,10 +1,7 @@
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
-pub const POLICY: &str = "storage.native.v3";
+pub const POLICY: &str = "storage.rust.v1";
 pub const LINKED: u32 = 1;
 pub const REUSED: u32 = 2;
 pub const COLLAPSED: u32 = 4;
@@ -16,10 +13,12 @@ pub struct Node {
     pub entries: u64,
     pub own_logical: u64,
     pub own_allocated: u64,
+    pub own_entries: u64,
     pub signature: [u64; 6],
     pub flags: u32,
     pub status: u32,
     pub error: i32,
+    #[serde(with = "crate::paths::optional")]
     pub error_path: Option<PathBuf>,
 }
 
@@ -42,10 +41,12 @@ impl Node {
 #[derive(Clone, Debug, Default)]
 pub struct Index {
     pub root: PathBuf,
-    pub nodes: BTreeMap<PathBuf, Node>,
-    pub children: BTreeMap<PathBuf, Vec<PathBuf>>,
+    pub nodes: im::OrdMap<PathBuf, Node>,
+    pub children: im::OrdMap<PathBuf, im::Vector<PathBuf>>,
+    pub linked: im::OrdSet<PathBuf>,
     pub visited: u64,
     pub reused: u64,
+    pub full_scan: bool,
 }
 
 impl Index {
@@ -63,9 +64,40 @@ impl Index {
             self.children
                 .entry(parent.to_owned())
                 .or_default()
-                .push(path.clone());
+                .push_back(path.clone());
+        }
+        if node.flags & LINKED != 0 {
+            self.linked.insert(path.clone());
+        } else {
+            self.linked.remove(&path);
         }
         self.nodes.insert(path, node);
+    }
+    pub fn remove_subtree(&mut self, root: &Path) {
+        let paths: Vec<_> = self
+            .nodes
+            .range(root.to_owned()..)
+            .take_while(|(p, _)| p.starts_with(root))
+            .map(|(p, _)| p.clone())
+            .collect();
+        for path in paths {
+            self.nodes.remove(&path);
+            self.linked.remove(&path);
+            self.children.remove(&path);
+        }
+        if let Some(parent) = root.parent()
+            && let Some(children) = self.children.get_mut(parent)
+        {
+            children.retain(|p| p != root);
+        }
+    }
+    pub fn linked_intersects(&self, path: &Path) -> bool {
+        path.ancestors().any(|p| self.linked.contains(p))
+            || self
+                .linked
+                .range(path.to_owned()..)
+                .next()
+                .is_some_and(|p| p.starts_with(path))
     }
     pub fn root_node(&self) -> Option<&Node> {
         self.nodes.get(&self.root)
@@ -95,7 +127,7 @@ impl Index {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default)]
 pub struct Progress {
     pub phase: String,
     pub current: PathBuf,
@@ -114,6 +146,8 @@ pub struct Identity {
     pub namespace_uuid: String,
     pub device: u64,
     pub uuid: String,
+    #[serde(with = "crate::paths")]
     pub mount: PathBuf,
+    #[serde(with = "crate::paths")]
     pub relative: PathBuf,
 }

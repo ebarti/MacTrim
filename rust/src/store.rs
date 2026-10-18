@@ -97,6 +97,24 @@ pub struct Generation {
     pub digest: String,
     pub directories: usize,
     pub created: u64,
+    #[serde(default)]
+    pub base_directories: usize,
+    #[serde(default)]
+    pub patches: u64,
+    #[serde(default)]
+    pub patch_bytes: u64,
+    #[serde(skip)]
+    pending: Option<PendingPatch>,
+}
+#[derive(Clone, Debug)]
+struct PendingPatch {
+    compressed: Vec<u8>,
+    digest: String,
+}
+#[derive(Serialize, Deserialize)]
+struct DeltaRow {
+    path: Vec<u8>,
+    node: Option<Node>,
 }
 
 impl Generation {
@@ -168,9 +186,67 @@ impl Generation {
             digest: format!("{:x}", hash.finalize()),
             directories: index.nodes.len(),
             created,
+            base_directories: index.nodes.len(),
+            patches: 0,
+            patch_bytes: 0,
+            pending: None,
         })
     }
-    pub fn read(&self, state: &Path) -> Result<Index> {
+    pub fn update(state: &Path, index: &Index, previous: Option<(&Self, &Index)>) -> Result<Self> {
+        let Some((generation, old)) = previous.filter(|_| !index.full_scan) else {
+            return Self::write(state, index);
+        };
+        let mut encoded = GzEncoder::new(Vec::new(), Compression::fast());
+        serde_json::to_writer(
+            &mut encoded,
+            &Header {
+                schema: "mactrim.rust.delta.v1".into(),
+                policy: POLICY.into(),
+                root: bytes(&index.root).to_vec(),
+                created: now(),
+            },
+        )?;
+        encoded.write_all(b"\n")?;
+        for delta in old.nodes.diff(&index.nodes) {
+            let (path, node) = match delta {
+                im::ordmap::DiffItem::Add(p, n)
+                | im::ordmap::DiffItem::Update { new: (p, n), .. } => (p, Some(n.clone())),
+                im::ordmap::DiffItem::Remove(p, _) => (p, None),
+            };
+            serde_json::to_writer(
+                &mut encoded,
+                &DeltaRow {
+                    path: bytes(path.strip_prefix(&index.root)?).to_vec(),
+                    node,
+                },
+            )?;
+            encoded.write_all(b"\n")?;
+        }
+        let compressed = encoded.finish()?;
+        let base_bytes = private_file(&state.join(&generation.name), false)?
+            .metadata()?
+            .len();
+        // Compact when retained delta bytes reach the measured checkpoint size.
+        // This changes the representation, never the directories retained.
+        if generation
+            .patch_bytes
+            .saturating_add(compressed.len() as u64)
+            >= base_bytes
+        {
+            return Self::write(state, index);
+        }
+        let mut result = generation.clone();
+        result.patches += 1;
+        result.patch_bytes += compressed.len() as u64;
+        result.created = now();
+        result.directories = index.nodes.len();
+        result.pending = Some(PendingPatch {
+            digest: format!("{:x}", Sha256::digest(&compressed)),
+            compressed,
+        });
+        Ok(result)
+    }
+    fn read_checkpoint(&self, state: &Path) -> Result<Index> {
         ensure!(valid_generation_name(&self.name), "Invalid generation path");
         let mut file = private_file(&state.join(&self.name), false)?;
         let before = file.metadata()?;
@@ -230,7 +306,13 @@ impl Generation {
             paths.push(path);
         }
         ensure!(
-            index.nodes.len() == self.directories && index.root_node().is_some(),
+            index.nodes.len()
+                == if self.base_directories == 0 {
+                    self.directories
+                } else {
+                    self.base_directories
+                }
+                && index.root_node().is_some(),
             "Incomplete directory generation"
         );
         let after = file.metadata()?;
@@ -256,6 +338,7 @@ fn valid_generation_name(name: &str) -> bool {
 pub struct Work {
     pub revision: u64,
     pub cursor: u64,
+    #[serde(with = "crate::paths::list")]
     pub paths: Vec<PathBuf>,
     pub reason: String,
     pub identity: Identity,
@@ -286,11 +369,12 @@ impl Store {
             held.metadata()?.ino() == fs::symlink_metadata(&database)?.ino(),
             "Database replaced during open"
         );
-        db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;
+        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS pending(path BLOB PRIMARY KEY, revision INTEGER NOT NULL, reason TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS observations(at INTEGER NOT NULL, logical INTEGER NOT NULL, allocated INTEGER NOT NULL, status INTEGER NOT NULL);")?;
         db.execute_batch("CREATE TABLE IF NOT EXISTS directory_history(bucket INTEGER NOT NULL,path BLOB NOT NULL,before_json TEXT NOT NULL,after_json TEXT NOT NULL,at INTEGER NOT NULL,PRIMARY KEY(bucket,path));")?;
+        db.execute_batch("CREATE TABLE IF NOT EXISTS tree_deltas(base TEXT NOT NULL,ordinal INTEGER NOT NULL,digest TEXT NOT NULL,compressed BLOB NOT NULL,PRIMARY KEY(base,ordinal));")?;
         Ok(Self {
             db,
             path: path.to_owned(),
@@ -342,7 +426,66 @@ impl Store {
         self.get("generation")
     }
     pub fn load(&self) -> Result<Option<Index>> {
-        self.generation()?.map(|g| g.read(&self.path)).transpose()
+        let Some(generation) = self.generation()? else {
+            return Ok(None);
+        };
+        let mut index = generation.read_checkpoint(&self.path)?;
+        let mut query = self.db.prepare("SELECT ordinal,digest,compressed FROM tree_deltas WHERE base=? AND ordinal<=? ORDER BY ordinal")?;
+        let mut rows = query.query(params![generation.name, sql_int(generation.patches)?])?;
+        let mut expected = 1;
+        while let Some(row) = rows.next()? {
+            let ordinal: i64 = row.get(0)?;
+            let digest: String = row.get(1)?;
+            let data: Vec<u8> = row.get(2)?;
+            ensure!(
+                ordinal as u64 == expected && format!("{:x}", Sha256::digest(&data)) == digest,
+                "Missing or corrupt tree delta; original preserved"
+            );
+            expected += 1;
+            let mut decoded = BufReader::new(GzDecoder::new(data.as_slice()));
+            let mut line = String::new();
+            decoded.read_line(&mut line)?;
+            let header: Header = serde_json::from_str(&line)?;
+            ensure!(
+                header.schema == "mactrim.rust.delta.v1"
+                    && header.policy == POLICY
+                    && header.root == bytes(&index.root),
+                "Delta identity mismatch"
+            );
+            loop {
+                line.clear();
+                if decoded.read_line(&mut line)? == 0 {
+                    break;
+                }
+                let delta: DeltaRow = serde_json::from_str(&line)?;
+                let relative = from_bytes(delta.path);
+                ensure!(
+                    !relative.is_absolute()
+                        && !relative
+                            .components()
+                            .any(|c| c == std::path::Component::ParentDir)
+                        && !bytes(&relative).contains(&0),
+                    "Escaped tree delta"
+                );
+                let path = index.root.join(relative);
+                if let Some(node) = delta.node {
+                    index.insert(path, node);
+                } else {
+                    index.remove_subtree(&path);
+                }
+            }
+        }
+        ensure!(
+            expected == generation.patches + 1 && index.nodes.len() == generation.directories,
+            "Incomplete tree delta chain"
+        );
+        for path in index.nodes.keys().filter(|p| *p != &index.root) {
+            ensure!(
+                path.parent().is_some_and(|p| index.nodes.contains_key(p)),
+                "Disconnected delta tree"
+            );
+        }
+        Ok(Some(index))
     }
     pub fn cursor(&self) -> Result<u64> {
         Ok(self.get("cursor")?.unwrap_or(0))
@@ -503,6 +646,26 @@ impl Store {
         );
         let old = self.generation()?;
         let tx = self.db.transaction()?;
+        if let Some(patch) = &generation.pending {
+            ensure!(
+                old.as_ref().is_some_and(
+                    |o| o.name == generation.name && o.patches + 1 == generation.patches
+                ),
+                "Delta candidate no longer follows committed tree"
+            );
+            tx.execute(
+                "INSERT INTO tree_deltas VALUES(?,?,?,?)",
+                params![
+                    generation.name,
+                    sql_int(generation.patches)?,
+                    patch.digest,
+                    patch.compressed
+                ],
+            )?;
+        } else {
+            ensure!(generation.patches == 0, "Missing candidate delta");
+            tx.execute("DELETE FROM tree_deltas", [])?;
+        }
         set(&tx, "generation", generation)?;
         set(&tx, "applied", &work.cursor)?;
         set(&tx, "active", &Option::<Work>::None)?;
@@ -542,8 +705,7 @@ impl Store {
             [sql_int(work.revision)?],
         )?;
         if let Some(n) = index.root_node() {
-            // Hourly root observations are small; detailed history remains in
-            // the existing app until the History migration is complete.
+            // Hourly root observations supplement sparse directory deltas.
             let last: Option<i64> =
                 tx.query_row("SELECT MAX(at) FROM observations", [], |r| r.get(0))?;
             if last.is_none_or(|t| generation.created.saturating_sub(t as u64) >= 3600) {
@@ -607,6 +769,66 @@ impl Store {
         let mut result: Vec<_> = combined.into_values().collect();
         result.sort_unstable_by_key(|r| std::cmp::Reverse(r.growth().unwrap_or(i128::MIN)));
         Ok(result)
+    }
+    pub fn history_page(
+        state: &Path,
+        scope: &Path,
+        since: u64,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<crate::history::Change>, bool)> {
+        let database = state.join("service.sqlite3");
+        let held = private_file(&database, false)?;
+        let db =
+            Connection::open_with_flags(&database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        db.busy_timeout(std::time::Duration::from_secs(2))?;
+        ensure!(
+            held.metadata()?.ino() == fs::symlink_metadata(&database)?.ino(),
+            "History database replaced while opening"
+        );
+        let prefix = if scope == Path::new("/") {
+            b"/".to_vec()
+        } else {
+            [bytes(scope), b"/"].concat()
+        };
+        let mut end = prefix.clone();
+        *end.last_mut().unwrap() += 1;
+        let mut statement = db.prepare("WITH scoped AS (
+            SELECT path,before_json,after_json,at,
+              ROW_NUMBER() OVER(PARTITION BY path ORDER BY bucket) AS first,
+              ROW_NUMBER() OVER(PARTITION BY path ORDER BY bucket DESC) AS last
+            FROM directory_history WHERE bucket>=?1 AND (path=?2 OR (path>=?3 AND path<?4))
+          ), combined AS (
+            SELECT path,MAX(CASE WHEN first=1 THEN before_json END) AS before_json,
+              MAX(CASE WHEN last=1 THEN after_json END) AS after_json,MAX(at) AS at
+            FROM scoped GROUP BY path
+          ) SELECT path,before_json,after_json,at FROM combined
+          ORDER BY CASE WHEN json_extract(before_json,'$.complete')=1 AND json_extract(after_json,'$.complete')=1 THEN 1 ELSE 0 END DESC,
+            CASE WHEN json_extract(before_json,'$.complete')=1 AND json_extract(after_json,'$.complete')=1
+              THEN json_extract(after_json,'$.allocated')-json_extract(before_json,'$.allocated') END DESC,path
+          LIMIT ?5 OFFSET ?6")?;
+        let mut rows = statement.query(params![
+            sql_int(since / 3600)?,
+            bytes(scope),
+            prefix,
+            end,
+            sql_int(limit as u64 + 1)?,
+            sql_int(offset as u64)?
+        ])?;
+        let mut changes = Vec::new();
+        while let Some(row) = rows.next()? {
+            let before: String = row.get(1)?;
+            let after: String = row.get(2)?;
+            changes.push(crate::history::Change {
+                path: from_bytes(row.get(0)?),
+                before: serde_json::from_str(&before)?,
+                after: serde_json::from_str(&after)?,
+                at: row.get::<_, i64>(3)? as u64,
+            });
+        }
+        let more = changes.len() > limit;
+        changes.truncate(limit);
+        Ok((changes, more))
     }
     pub fn footprint(&self) -> Result<u64> {
         let mut size = fs::metadata(&self.path)?.blocks() * 512;

@@ -14,12 +14,14 @@ use walkdir::WalkDir;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Candidate {
     pub id: String,
+    #[serde(with = "crate::paths")]
     pub path: PathBuf,
     pub category: String,
     pub eligible: bool,
     pub evidence: Vec<String>,
     pub blockers: Vec<String>,
     pub regenerate: String,
+    #[serde(with = "crate::paths::optional")]
     pub repository: Option<PathBuf>,
     pub allocated: Option<u64>,
 }
@@ -27,6 +29,7 @@ pub struct Candidate {
 pub struct Discovery {
     pub candidates: Vec<Candidate>,
     pub warnings: Vec<String>,
+    #[serde(with = "crate::paths::list")]
     pub skipped_roots: Vec<PathBuf>,
 }
 fn candidate(path: &Path, category: &str) -> Candidate {

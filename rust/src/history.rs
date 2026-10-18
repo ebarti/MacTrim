@@ -20,6 +20,7 @@ impl From<&Node> for Counts {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Change {
+    #[serde(with = "crate::paths")]
     pub path: PathBuf,
     pub before: Option<Counts>,
     pub after: Option<Counts>,
@@ -40,28 +41,27 @@ pub fn changes(previous: Option<&Index>, current: &Index, at: u64) -> Vec<Change
         return vec![];
     };
     let mut result = Vec::new();
-    for (path, node) in &current.nodes {
-        let before = previous.nodes.get(path).map(Counts::from);
-        let after = Some(Counts::from(node));
-        if before != after {
-            result.push(Change {
-                path: path.clone(),
-                before,
-                after,
-                at,
-            });
+    for delta in previous.nodes.diff(&current.nodes) {
+        let (path, before, after) = match delta {
+            im::ordmap::DiffItem::Add(p, n) => (p, None, Some(Counts::from(n))),
+            im::ordmap::DiffItem::Update {
+                old: (_, a),
+                new: (p, b),
+            } => (p, Some(Counts::from(a)), Some(Counts::from(b))),
+            im::ordmap::DiffItem::Remove(p, n) => (p, Some(Counts::from(n)), None),
+        };
+        if before == after {
+            continue;
         }
-    }
-    for (path, node) in &previous.nodes {
         let visible = path
             .parent()
             .and_then(|p| p.ancestors().find_map(|p| current.nodes.get(p)))
             .is_some_and(|n| n.measured() && n.flags & crate::model::COLLAPSED == 0);
-        if !current.nodes.contains_key(path) && visible {
+        if after.is_some() || visible {
             result.push(Change {
                 path: path.clone(),
-                before: Some(Counts::from(node)),
-                after: None,
+                before,
+                after,
                 at,
             });
         }

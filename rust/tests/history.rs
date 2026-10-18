@@ -100,3 +100,63 @@ fn denied_parent_is_not_evidence_that_descendants_were_deleted() {
     assert_eq!(changes[0].path, before.root);
     assert!(changes[0].growth().is_none());
 }
+
+#[test]
+fn history_pages_rank_the_whole_scope_and_match_the_saved_deltas() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = fs::canonicalize(temp.path()).unwrap();
+    let root = base.join("files");
+    let state = base.join("state");
+    fs::create_dir(&root).unwrap();
+    let mut before = Index::new(root.clone());
+    before.insert(root.clone(), Node::default());
+    for n in 0..613 {
+        before.insert(
+            root.join(format!("dir-{n:03}")),
+            Node {
+                allocated: 4096,
+                logical: 4096,
+                ..Node::default()
+            },
+        );
+    }
+    let mut store = Store::open(&state).unwrap();
+    store.bind(&root, &id(), 100).unwrap();
+    let generation = Generation::write(&state, &before).unwrap();
+    let work = store.claim().unwrap();
+    store.commit(&generation, &work, &before).unwrap();
+    let mut after = before.clone();
+    for n in 0..613 {
+        after
+            .nodes
+            .get_mut(&root.join(format!("dir-{n:03}")))
+            .unwrap()
+            .allocated += n;
+    }
+    let generation = Generation::write(&state, &after).unwrap();
+    let changes = history::changes(Some(&before), &after, generation.created);
+    store.ingest(101, [root.clone()], "edits").unwrap();
+    let work = store.claim().unwrap();
+    store
+        .commit_changes(&generation, &work, &after, &changes)
+        .unwrap();
+    let expected = store.history(&root, 0).unwrap();
+    let mut observed = Vec::new();
+    let mut offset = 0;
+    loop {
+        let (page, more) = Store::history_page(&state, &root, 0, offset, 100).unwrap();
+        observed.extend(page);
+        if !more {
+            break;
+        }
+        offset += 100;
+    }
+    assert_eq!(
+        observed.iter().map(|c| &c.path).collect::<Vec<_>>(),
+        expected.iter().map(|c| &c.path).collect::<Vec<_>>()
+    );
+    assert_eq!(observed[0].path, root.join("dir-612"));
+    let (page, more) = Store::history_page(&state, &root.join("dir-06"), 0, 0, 100).unwrap();
+    assert!(page.is_empty());
+    assert!(!more);
+}

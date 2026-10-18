@@ -181,11 +181,10 @@ fn publish(
     Ok(())
 }
 
-pub fn measure(
+fn walk(
     root: &Path,
+    namespace: &Path,
     exclusions: &[PathBuf],
-    previous: Option<&Index>,
-    dirty: &Regions,
     cancel: &AtomicBool,
     progress: Option<&Arc<Mutex<Progress>>>,
 ) -> Result<Index> {
@@ -193,16 +192,13 @@ pub fn measure(
     if !meta.is_dir() || meta.file_type().is_symlink() {
         bail!("Scan root must be a real directory");
     }
-    let reuse = previous.filter(|old| {
-        !old.nodes
-            .iter()
-            .any(|(p, n)| n.flags & LINKED != 0 && dirty.intersects(p))
-    });
+    let depth_offset = root.strip_prefix(namespace)?.components().count();
     let mut index = Index::new(root.to_owned());
+    index.full_scan = true;
     let mut frames: Vec<Frame> = vec![];
     let mut links = HashSet::new();
     let mut directories = HashSet::new();
-    let mut new_links = false;
+    let mut aliased = false;
     let mut last = Instant::now() - Duration::from_secs(1);
     let mut walker = WalkDir::new(root)
         .follow_links(false)
@@ -263,7 +259,9 @@ pub fn measure(
                 reused: false,
                 node: Node {
                     signature: signature(&meta),
-                    flags: if entry.depth() > 0 && lazy(path, entry.depth()) {
+                    flags: if entry.depth() + depth_offset > 0
+                        && lazy(path, entry.depth() + depth_offset)
+                    {
                         COLLAPSED
                     } else {
                         0
@@ -271,8 +269,9 @@ pub fn measure(
                     ..Node::default()
                 },
             };
-            let skip = excluded(root, path, &meta, frames.last(), exclusions)
-                || !directories.insert((meta.dev(), meta.ino()));
+            let alias = !directories.insert((meta.dev(), meta.ino()));
+            aliased |= alias;
+            let skip = excluded(namespace, path, &meta, frames.last(), exclusions) || alias;
             if skip {
                 frame.node.status = 1;
                 walker.skip_current_dir();
@@ -282,19 +281,7 @@ pub fn measure(
                 frame.node.own_logical = meta.size();
                 frame.node.own_allocated = meta.blocks() * 512;
                 frame.node.entries = 1;
-                if retained
-                    && !dirty.intersects(path)
-                    && let Some(old) = reuse
-                        .and_then(|i| i.nodes.get(path))
-                        .filter(|n| n.measured() && n.signature == frame.node.signature)
-                {
-                    frame.node = old.clone();
-                    frame.node.flags |= REUSED;
-                    frame.reused = true;
-                    index.reused += old.entries;
-                    index.copy_subtree(reuse.unwrap(), path);
-                    walker.skip_current_dir();
-                }
+                frame.node.own_entries = 1;
             }
             if retained {
                 let mut running = frame.node.clone();
@@ -306,6 +293,7 @@ pub fn measure(
             frames.push(frame);
         } else if let Some(frame) = frames.last_mut() {
             frame.node.entries += 1;
+            frame.node.own_entries += 1;
             if entry.file_type().is_file() && !dataless(&meta) {
                 let linked = meta.nlink() > 1;
                 let duplicate = linked && !links.insert((meta.dev(), meta.ino()));
@@ -319,11 +307,8 @@ pub fn measure(
                     frame.node.own_logical += n.logical;
                     frame.node.own_allocated += n.allocated;
                 }
-                if linked {
-                    new_links = true;
-                    if let Some(owner) = frames.iter_mut().rev().find(|f| f.retained) {
-                        owner.node.flags |= LINKED;
-                    }
+                if linked && let Some(owner) = frames.iter_mut().rev().find(|f| f.retained) {
+                    owner.node.flags |= LINKED;
                 }
             }
         }
@@ -335,9 +320,134 @@ pub fn measure(
     while !frames.is_empty() {
         finish(&mut frames, &mut index)?;
     }
-    if new_links && index.reused > 0 {
-        return measure(root, exclusions, None, dirty, cancel, progress);
+    if aliased && let Some(mut node) = index.root_node().cloned() {
+        node.flags |= LINKED;
+        index.insert(root.to_owned(), node);
     }
     publish(&mut index, &[], root, progress)?;
     Ok(index)
+}
+
+/// Replace invalidated subtrees in a persistent tree, then recompute their
+/// ancestors. Unaffected subtrees share their map nodes with the saved view;
+/// their files and directory metadata are not visited again.
+pub fn measure(
+    root: &Path,
+    exclusions: &[PathBuf],
+    previous: Option<&Index>,
+    dirty: &Regions,
+    cancel: &AtomicBool,
+    progress: Option<&Arc<Mutex<Progress>>>,
+) -> Result<Index> {
+    let full = |why: &str| -> Result<Index> {
+        if let Some(progress) = progress {
+            progress.lock().unwrap().phase = why.into();
+        }
+        walk(root, root, exclusions, cancel, progress)
+    };
+    let Some(old) = previous.filter(|i| i.root == root && i.root_node().is_some()) else {
+        return full("Measuring full baseline");
+    };
+    let mut scopes = Regions::default();
+    for changed in dirty.paths() {
+        ensure_scope(root, changed)?;
+        let scope = changed
+            .ancestors()
+            .find(|p| {
+                old.nodes.contains_key(*p)
+                    && fs::symlink_metadata(p)
+                        .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+            })
+            .context("No surviving indexed ancestor")?;
+        scopes.insert(scope.to_owned());
+    }
+    if scopes.paths().any(|p| p == root) {
+        return full("Full scope reconciliation");
+    }
+    if scopes.paths().any(|p| old.linked_intersects(p)) {
+        return full("Full reconciliation for shared hardlink or directory identities");
+    }
+    let mut candidate = old.clone();
+    candidate.full_scan = false;
+    candidate.visited = 0;
+    candidate.reused = old.root_node().map_or(0, |n| n.entries);
+    let mut ancestors = std::collections::BTreeSet::new();
+    for scope in scopes.paths() {
+        if cancel.load(Ordering::Relaxed) {
+            bail!("Scan cancelled; previous committed index preserved");
+        }
+        let subtree = walk(scope, root, exclusions, cancel, progress)?;
+        if !subtree.linked.is_empty() {
+            return full("Full reconciliation for newly shared hardlink identities");
+        }
+        candidate.visited += subtree.visited;
+        candidate.reused = candidate
+            .reused
+            .saturating_sub(old.nodes.get(scope).map_or(0, |n| n.entries));
+        candidate.remove_subtree(scope);
+        for (path, node) in subtree.nodes {
+            candidate.insert(path, node);
+        }
+        for parent in scope
+            .ancestors()
+            .skip(1)
+            .take_while(|p| p.starts_with(root))
+        {
+            ancestors.insert((
+                std::cmp::Reverse(parent.components().count()),
+                parent.to_owned(),
+            ));
+        }
+    }
+    for (_, path) in ancestors {
+        if cancel.load(Ordering::Relaxed) {
+            bail!("Scan cancelled during reconciliation");
+        }
+        let before = old.nodes.get(&path).context("Missing aggregate ancestor")?;
+        let meta = fs::symlink_metadata(&path)?;
+        if meta.dev() != before.signature[0] || meta.ino() != before.signature[1] || !meta.is_dir()
+        {
+            return full("An indexed ancestor was replaced; full reconciliation");
+        }
+        let children = candidate.children.get(&path);
+        let own_error = before
+            .error_path
+            .as_ref()
+            .filter(|err| !children.into_iter().flatten().any(|p| err.starts_with(p)));
+        let mut node = before.clone();
+        node.signature = signature(&meta);
+        node.own_logical = meta.size();
+        node.own_allocated = meta.blocks() * 512;
+        node.logical = node.own_logical;
+        node.allocated = node.own_allocated;
+        node.entries = node.own_entries;
+        node.flags &= !REUSED;
+        node.status = if own_error.is_some() {
+            before.status
+        } else {
+            0
+        };
+        node.error = if own_error.is_some() { before.error } else { 0 };
+        node.error_path = own_error.cloned();
+        for child in children.into_iter().flatten() {
+            add(
+                &mut node,
+                candidate.nodes.get(child).context("Disconnected child")?,
+            )?;
+        }
+        candidate.insert(path, node);
+    }
+    publish(&mut candidate, &[], root, progress)?;
+    Ok(candidate)
+}
+
+fn ensure_scope(root: &Path, path: &Path) -> Result<()> {
+    anyhow::ensure!(
+        path.starts_with(root)
+            && !path
+                .components()
+                .any(|c| c == std::path::Component::ParentDir),
+        "Invalid changed region"
+    );
+    Ok(())
 }
