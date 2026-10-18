@@ -1,5 +1,5 @@
 //! Durable invalidations plus a streaming compressed tree; no per-file database.
-use crate::model::*;
+use crate::{model::*, regions::Regions};
 use anyhow::{Context, Result, ensure};
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use fs2::FileExt;
@@ -258,6 +258,7 @@ pub struct Work {
     pub cursor: u64,
     pub paths: Vec<PathBuf>,
     pub reason: String,
+    pub identity: Identity,
 }
 
 pub struct Store {
@@ -319,6 +320,8 @@ impl Store {
         set(&tx, "identity", identity)?;
         if changed || cursor > checkpoint {
             set(&tx, "cursor", &checkpoint)?;
+            set(&tx, "applied", &0u64)?;
+            set(&tx, "active", &Option::<Work>::None)?;
             let revision = meta_u64(&tx, "revision")? + 1;
             set(&tx, "revision", &revision)?;
             tx.execute("DELETE FROM pending", [])?;
@@ -434,14 +437,37 @@ impl Store {
                 reason = why;
             }
         }
+        if let Some(active) = self.get::<Option<Work>>("active")?.flatten() {
+            paths.extend(active.paths);
+            if reason.is_empty() {
+                reason = active.reason;
+            }
+        }
+        let paths: Regions = paths.into_iter().collect();
         Ok(Work {
             revision: self.get("revision")?.unwrap_or(0),
             cursor: self.cursor()?,
-            paths,
+            paths: paths.paths().cloned().collect(),
             reason,
+            identity: self.get("identity")?.context("Missing volume identity")?,
         })
     }
+    pub fn claim(&mut self) -> Result<Work> {
+        // Freeze work durably and empty the intake queue. New changes during a
+        // whole-root baseline must remain small changed regions, rather than
+        // being merged into the in-flight root and forcing another full walk.
+        let work = self.work()?;
+        let tx = self.db.transaction()?;
+        set(&tx, "active", &work)?;
+        tx.execute("DELETE FROM pending", [])?;
+        tx.commit()?;
+        Ok(work)
+    }
     pub fn commit(&mut self, generation: &Generation, work: &Work, index: &Index) -> Result<()> {
+        ensure!(
+            self.get::<Identity>("identity")?.as_ref() == Some(&work.identity),
+            "Volume identity changed while measuring; candidate not committed"
+        );
         ensure!(
             generation.directories == index.nodes.len(),
             "Generation does not match candidate"
@@ -454,6 +480,7 @@ impl Store {
         let tx = self.db.transaction()?;
         set(&tx, "generation", generation)?;
         set(&tx, "applied", &work.cursor)?;
+        set(&tx, "active", &Option::<Work>::None)?;
         tx.execute(
             "DELETE FROM pending WHERE revision<=?",
             [sql_int(work.revision)?],

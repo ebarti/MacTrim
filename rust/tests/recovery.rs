@@ -227,3 +227,41 @@ fn cancellation_never_returns_a_candidate_to_commit() {
         .is_err()
     );
 }
+
+#[test]
+fn edit_during_initial_baseline_does_not_force_another_root_scan() {
+    let (_temp, root, state) = fixture();
+    let mut store = Store::open(&state).unwrap();
+    store.bind(&root, &identity(), 100).unwrap();
+    let work = store.claim().unwrap();
+    let result = measure(
+        &root,
+        &[],
+        None,
+        &Regions::default(),
+        &AtomicBool::new(false),
+        None,
+    )
+    .unwrap();
+    store
+        .ingest(140, [root.join("node_modules/a/deep")], "New edit")
+        .unwrap();
+    let generation = Generation::write(&state, &result).unwrap();
+    store.commit(&generation, &work, &result).unwrap();
+    assert_eq!(
+        store.work().unwrap().paths,
+        vec![root.join("node_modules/a/deep")]
+    );
+    assert_eq!(store.applied().unwrap(), 100);
+}
+
+#[test]
+fn claimed_work_survives_process_restart() {
+    let (_temp, root, state) = fixture();
+    let mut store = Store::open(&state).unwrap();
+    store.bind(&root, &identity(), 100).unwrap();
+    let work = store.claim().unwrap();
+    drop(store);
+    let store = Store::open(&state).unwrap();
+    assert_eq!(store.work().unwrap().paths, work.paths);
+}
