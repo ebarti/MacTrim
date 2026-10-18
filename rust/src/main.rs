@@ -27,7 +27,7 @@ struct Args {
     #[arg(long, global = true)]
     state: Option<PathBuf>,
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 #[derive(Subcommand)]
 enum Commands {
@@ -35,6 +35,7 @@ enum Commands {
         #[arg(default_value = "/")]
         root: PathBuf,
     },
+    #[command(alias = "tui")]
     Storage {
         #[arg(default_value = "/")]
         root: PathBuf,
@@ -198,7 +199,10 @@ fn main() {
 fn run() -> Result<()> {
     let args = Args::parse();
     let state = service::state_path(&args.state.unwrap_or(default_state()?))?;
-    match args.command {
+    match args.command.unwrap_or(Commands::Storage {
+        root: "/".into(),
+        json: false,
+    }) {
         Commands::Cleanup { action } => cleanup_command(&state, action),
         Commands::Scan { root } => {
             let root = fs::canonicalize(root)?;
@@ -218,10 +222,21 @@ fn run() -> Result<()> {
                 serde_json::json!({"root":root,"node":index.root_node(),"visited":index.visited,"directories":index.nodes.len(),"rows":index.rows(&root,false)}),
             )
         }
-        Commands::Storage { root, json: _ } => {
+        Commands::Storage { root, json } => {
             let root = fs::canonicalize(root)?;
+            if !json {
+                use std::io::IsTerminal;
+                ensure!(
+                    io::stdout().is_terminal(),
+                    "The TUI needs a terminal; use --json for machine-readable status"
+                );
+            }
             start(&state, &root)?;
-            print(service::request(&state, &Request::Status)?)
+            if json {
+                print(service::request(&state, &Request::Status)?)
+            } else {
+                mactrim_rs::ui::run(state, root, signal_flag()?)
+            }
         }
         Commands::Status => print(service::request(&state, &Request::Status)?),
         Commands::History { path, days } => print(service::request(
@@ -244,6 +259,7 @@ fn run() -> Result<()> {
                 offset,
                 limit,
                 logical,
+                anchor: None,
             },
         )?),
         Commands::Service { action } => match action {

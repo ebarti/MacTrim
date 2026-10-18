@@ -6,3 +6,4 @@ pub mod regions;
 pub mod scan;
 pub mod service;
 pub mod store;
+pub mod ui;

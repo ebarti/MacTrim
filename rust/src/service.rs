@@ -37,6 +37,8 @@ pub enum Request {
         offset: usize,
         limit: usize,
         logical: bool,
+        #[serde(default)]
+        anchor: Option<PathBuf>,
     },
     Refresh {
         full: bool,
@@ -53,6 +55,7 @@ pub struct Status {
     pub root: PathBuf,
     pub phase: String,
     pub running: bool,
+    pub detail_running: bool,
     pub paused: bool,
     pub history_ready: bool,
     pub received_cursor: u64,
@@ -68,6 +71,9 @@ pub struct Status {
     pub root_node: Option<Node>,
     pub filesystem_used: u64,
     pub filesystem_available: u64,
+    pub observed_allocated: u64,
+    pub observed_logical: u64,
+    pub current_path: PathBuf,
     pub error: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -103,6 +109,8 @@ pub struct Reply {
     pub more: bool,
     pub message: String,
     pub history: Vec<crate::history::Change>,
+    pub scope: Option<Node>,
+    pub offset: usize,
 }
 struct Public {
     status: Status,
@@ -148,20 +156,76 @@ fn directory_rows(
     logical: bool,
     offset: usize,
     limit: usize,
-) -> Result<(Vec<Row>, bool)> {
-    let mut heap = std::collections::BinaryHeap::new();
-    let cutoff = offset.saturating_add(limit);
-    let mut total = 0usize;
-    let mut keep = |row: Row| {
-        let size = if logical {
-            row.node.logical
+    anchor: Option<&Path>,
+) -> Result<(Vec<Row>, bool, usize)> {
+    ensure!(limit > 0, "Page size must be positive");
+    let anchor = anchor.filter(|p| p.parent() == Some(path)).and_then(|p| {
+        index
+            .and_then(|i| i.nodes.get(p))
+            .map(|n| Row {
+                path: p.to_owned(),
+                node: n.clone(),
+                directory: true,
+            })
+            .or_else(|| {
+                let m = fs::symlink_metadata(p).ok()?;
+                if m.is_dir() {
+                    return None;
+                }
+                Some(Row {
+                    path: p.to_owned(),
+                    directory: false,
+                    node: Node {
+                        logical: if m.is_file() { m.len() } else { 0 },
+                        allocated: if m.is_file() { m.blocks() * 512 } else { 0 },
+                        status: if m.is_file() { 0 } else { 1 },
+                        ..Node::default()
+                    },
+                })
+            })
+    });
+    let score = |r: &Row| {
+        if logical {
+            r.node.logical
         } else {
-            row.node.allocated
-        };
+            r.node.allocated
+        }
+    };
+    let mut heap = std::collections::BinaryHeap::new();
+    let mut before = std::collections::BinaryHeap::new();
+    let mut after = std::collections::BinaryHeap::new();
+    let mut rank = 0usize;
+    let mut total = 0usize;
+    let cutoff = offset.saturating_add(limit);
+    let mut keep = |row: Row| {
         total += 1;
-        heap.push(Ranked(size, row));
-        if heap.len() > cutoff {
-            heap.pop();
+        let item = Ranked(score(&row), row);
+        if let Some(anchor) = &anchor {
+            if item.1.path == anchor.path {
+                return;
+            }
+            let ordering = item
+                .0
+                .cmp(&score(anchor))
+                .reverse()
+                .then_with(|| item.1.path.cmp(&anchor.path));
+            if ordering.is_lt() {
+                rank += 1;
+                before.push(std::cmp::Reverse(item));
+                if before.len() >= limit {
+                    before.pop();
+                }
+            } else {
+                after.push(item);
+                if after.len() >= limit {
+                    after.pop();
+                }
+            }
+        } else {
+            heap.push(item);
+            if heap.len() > cutoff {
+                heap.pop();
+            }
         }
     };
     if let Some(index) = index {
@@ -175,14 +239,8 @@ fn directory_rows(
             }
         }
     }
-    // Files need only immediate metadata, and are never persisted as inventory.
-    // The IPC handler owns this IO; it cannot block event ingestion.
     if let Ok(entries) = fs::read_dir(path) {
-        for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
+        for entry in entries.flatten() {
             let meta = match fs::symlink_metadata(entry.path()) {
                 Ok(m) => m,
                 Err(_) => continue,
@@ -203,20 +261,33 @@ fn directory_rows(
             });
         }
     }
-    let mut rows: Vec<Row> = heap.into_iter().map(|r| r.1).collect();
-    rows.sort_unstable_by(|a, b| {
-        let size = |r: &Row| {
-            if logical {
-                r.node.logical
-            } else {
-                r.node.allocated
-            }
-        };
-        size(b).cmp(&size(a)).then_with(|| a.path.cmp(&b.path))
-    });
-    let more = total > cutoff;
-    Ok((rows.into_iter().skip(offset).take(limit).collect(), more))
+    let sort = |a: &Ranked, b: &Ranked| a.cmp(b);
+    if let Some(anchor) = anchor {
+        let actual_offset = rank / limit * limit;
+        let pre = rank % limit;
+        let mut before: Vec<_> = before.into_iter().map(|r| r.0).collect();
+        before.sort_unstable_by(sort);
+        let mut after: Vec<_> = after.into_iter().collect();
+        after.sort_unstable_by(sort);
+        let skip = before.len().saturating_sub(pre);
+        let mut rows: Vec<_> = before.into_iter().skip(skip).map(|r| r.1).collect();
+        rows.push(anchor);
+        rows.extend(after.into_iter().take(limit - pre - 1).map(|r| r.1));
+        return Ok((rows, total > actual_offset + limit, actual_offset));
+    }
+    let mut rows: Vec<_> = heap.into_iter().collect();
+    rows.sort_unstable_by(sort);
+    Ok((
+        rows.into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|r| r.1)
+            .collect(),
+        total > cutoff,
+        offset,
+    ))
 }
+
 fn serve(
     stream: UnixStream,
     public: Arc<RwLock<Public>>,
@@ -236,6 +307,7 @@ fn serve(
             offset,
             limit,
             logical,
+            anchor,
         } => {
             ensure!(
                 path.is_absolute() && !path.components().any(|c| c == Component::ParentDir),
@@ -255,14 +327,21 @@ fn serve(
                 .as_deref()
                 .filter(|d| path.starts_with(&d.root))
                 .or(index.as_deref());
-            let (mut rows, mut more) = directory_rows(selected, path, logical, offset, limit)?;
+            let (mut rows, mut more, mut actual_offset) =
+                directory_rows(selected, path, logical, offset, limit, anchor.as_deref())?;
             if status.running {
                 let live = progress.lock().unwrap();
                 if live.view == *path && !live.rows.is_empty() && selected.is_none() {
+                    if let Some(rank) = anchor
+                        .as_ref()
+                        .and_then(|a| live.rows.iter().position(|(p, _)| p == a))
+                    {
+                        actual_offset = rank / limit * limit;
+                    }
                     rows = live
                         .rows
                         .iter()
-                        .skip(offset)
+                        .skip(actual_offset)
                         .take(limit)
                         .map(|(p, n)| Row {
                             path: p.clone(),
@@ -270,7 +349,7 @@ fn serve(
                             directory: true,
                         })
                         .collect();
-                    more = live.rows.len() > offset + limit;
+                    more = live.rows.len() > actual_offset + limit;
                 }
             }
             Reply {
@@ -279,6 +358,8 @@ fn serve(
                 more,
                 message: String::new(),
                 history: vec![],
+                scope: selected.and_then(|i| i.nodes.get(path)).cloned(),
+                offset: actual_offset,
             }
         }
         Request::Status => Reply {
@@ -642,6 +723,7 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
                     phase.clone()
                 },
                 running,
+                detail_running,
                 paused,
                 history_ready: ready,
                 received_cursor: store.cursor()?,
@@ -657,6 +739,9 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
                 root_node: index.as_ref().and_then(|i| i.root_node().cloned()),
                 filesystem_used: used,
                 filesystem_available: available,
+                observed_allocated: live.allocated,
+                observed_logical: live.logical,
+                current_path: live.current.clone(),
                 error: error.clone(),
             };
         }
@@ -729,6 +814,54 @@ pub fn retry_regions(index: &Index) -> Vec<PathBuf> {
 #[cfg(test)]
 mod retry_tests {
     use super::*;
+    #[test]
+    fn global_ranking_and_anchor_follow_a_directory_across_pages() {
+        let fixture = tempfile::tempdir().unwrap();
+        let mut index = Index::new(fixture.path().to_owned());
+        for n in 0..600 {
+            index.insert(
+                fixture.path().join(format!("item-{n:03}")),
+                Node {
+                    allocated: n,
+                    ..Node::default()
+                },
+            );
+        }
+        let (rows, more, offset) =
+            directory_rows(Some(&index), fixture.path(), false, 0, 200, None).unwrap();
+        assert_eq!(rows[0].path, fixture.path().join("item-599"));
+        assert_eq!(offset, 0);
+        assert!(more);
+        let anchor = fixture.path().join("item-000");
+        let (rows, more, offset) =
+            directory_rows(Some(&index), fixture.path(), false, 0, 200, Some(&anchor)).unwrap();
+        assert_eq!(offset, 400);
+        assert_eq!(rows.last().unwrap().path, anchor);
+        assert!(!more);
+        index.nodes.get_mut(&anchor).unwrap().allocated = 1000;
+        let (rows, more, offset) =
+            directory_rows(Some(&index), fixture.path(), false, 400, 200, Some(&anchor)).unwrap();
+        assert_eq!(offset, 0);
+        assert_eq!(rows[0].path, anchor);
+        assert!(more);
+        for n in [19, 210, 422, 577] {
+            let anchor = fixture.path().join(format!("item-{n:03}"));
+            let expected = index.rows(fixture.path(), false);
+            let rank = expected.iter().position(|(p, _)| p == &anchor).unwrap();
+            let (rows, _, offset) =
+                directory_rows(Some(&index), fixture.path(), false, 0, 37, Some(&anchor)).unwrap();
+            assert_eq!(offset, rank / 37 * 37);
+            assert_eq!(
+                rows.iter().map(|r| &r.path).collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .skip(offset)
+                    .take(37)
+                    .map(|(p, _)| p)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
     #[test]
     fn inherited_permission_error_retries_only_the_denied_scope() {
         let mut index = Index::new("/fixture".into());
