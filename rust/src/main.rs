@@ -42,6 +42,12 @@ enum Commands {
         json: bool,
     },
     Status,
+    History {
+        #[arg(default_value = "/")]
+        path: PathBuf,
+        #[arg(long, default_value = "60")]
+        days: u64,
+    },
     Refresh {
         #[arg(long)]
         full: bool,
@@ -59,6 +65,39 @@ enum Commands {
         #[command(subcommand)]
         action: Service,
     },
+    Cleanup {
+        #[command(subcommand)]
+        action: Cleanup,
+    },
+}
+#[derive(Subcommand)]
+enum Cleanup {
+    Scan {
+        #[arg(long = "root")]
+        roots: Vec<PathBuf>,
+    },
+    Validate {
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+        #[arg(long, default_value = "30")]
+        older_than_days: u64,
+    },
+    Quarantine {
+        id: String,
+        #[arg(long)]
+        approve: Option<String>,
+    },
+    Restore {
+        id: String,
+    },
+    Purge {
+        id: String,
+        #[arg(long)]
+        approve: Option<String>,
+    },
+    Journals,
+    Recover,
+    Activity,
 }
 #[derive(Subcommand)]
 enum Service {
@@ -160,6 +199,7 @@ fn run() -> Result<()> {
     let args = Args::parse();
     let state = service::state_path(&args.state.unwrap_or(default_state()?))?;
     match args.command {
+        Commands::Cleanup { action } => cleanup_command(&state, action),
         Commands::Scan { root } => {
             let root = fs::canonicalize(root)?;
             let progress = Arc::new(Mutex::new(Progress {
@@ -184,6 +224,13 @@ fn run() -> Result<()> {
             print(service::request(&state, &Request::Status)?)
         }
         Commands::Status => print(service::request(&state, &Request::Status)?),
+        Commands::History { path, days } => print(service::request(
+            &state,
+            &Request::History {
+                path,
+                since: store::now().saturating_sub(days.saturating_mul(86400)),
+            },
+        )?),
         Commands::Refresh { full } => print(service::request(&state, &Request::Refresh { full })?),
         Commands::List {
             path,
@@ -208,5 +255,86 @@ fn run() -> Result<()> {
             Service::Stop => print(service::request(&state, &Request::Stop)?),
             Service::Pause => print(service::request(&state, &Request::Pause)?),
         },
+    }
+}
+fn approval(provided: Option<String>, expected: &str) -> Result<String> {
+    if let Some(text) = provided {
+        ensure!(text == expected, "Exact approval required: {expected}");
+        return Ok(text);
+    }
+    use std::io::IsTerminal;
+    ensure!(
+        io::stdin().is_terminal(),
+        "Exact approval required; pass --approve {expected:?}"
+    );
+    eprintln!("Type {expected:?} to approve this action, or press Enter to stop:");
+    let mut text = String::new();
+    io::stdin().read_line(&mut text)?;
+    let text = text.trim_end().to_owned();
+    ensure!(text == expected, "No action approved");
+    Ok(text)
+}
+fn cleanup_command(state: &Path, action: Cleanup) -> Result<()> {
+    use mactrim_rs::cleanup::{
+        self, Actions,
+        activity::{ActivityProvider, NativeActivity},
+    };
+    match action {
+        Cleanup::Scan { mut roots } => {
+            let home = PathBuf::from(std::env::var_os("HOME").context("HOME unavailable")?);
+            if roots.is_empty() {
+                roots = ["Github", "Developer", "Projects", ".codex/worktrees"]
+                    .iter()
+                    .map(|p| home.join(p))
+                    .collect();
+            }
+            print(cleanup::discover(&roots, &home, signal_flag()?.as_ref())?)
+        }
+        Cleanup::Validate {
+            paths,
+            older_than_days,
+        } => {
+            let actions = Actions::open(state)?;
+            let candidates = paths
+                .iter()
+                .map(|p| cleanup::classify(p))
+                .collect::<Result<Vec<_>>>()?;
+            let plan = actions.prepare(&candidates, older_than_days)?;
+            print(
+                serde_json::json!({"plan":plan.id,"approval":plan.approval,"quarantine_frees_bytes":0,"items":plan.items.iter().map(|i|serde_json::json!({"path":i.candidate.path,"allocated":i.snapshot.allocated,"logical":i.snapshot.logical,"inventory_entries":i.snapshot.entries.len(),"evidence":i.candidate.evidence,"regenerate":i.candidate.regenerate})).collect::<Vec<_>>()}),
+            )
+        }
+        Cleanup::Quarantine { id, approve } => {
+            let actions = Actions::open(state)?;
+            let plan = actions.plan(&id)?;
+            let text = approval(approve, &plan.approval)?;
+            print(actions.apply(&id,&text)?.iter().map(|j|serde_json::json!({"journal":j.id,"original":j.original,"quarantine":j.quarantine,"status":j.status,"quarantine_frees_bytes":0})).collect::<Vec<_>>())
+        }
+        Cleanup::Restore { id } => {
+            let j = Actions::open(state)?.restore(&id)?;
+            print(serde_json::json!({"id":j.id,"status":j.status,"original":j.original}))
+        }
+        Cleanup::Purge { id, approve } => {
+            let text = approval(approve, &format!("PURGE {id}"))?;
+            let j = Actions::open(state)?.purge(&id, &text)?;
+            print(
+                serde_json::json!({"id":j.id,"status":j.status,"observed_allocated_before":j.snapshot.allocated,"note":"APFS physical reclamation may differ from allocation estimates"}),
+            )
+        }
+        Cleanup::Journals | Cleanup::Recover => {
+            let actions = Actions::open(state)?;
+            let records = if matches!(action, Cleanup::Recover) {
+                actions.recover()?
+            } else {
+                actions.journals()?
+            };
+            print(records.iter().map(|j|serde_json::json!({"id":j.id,"status":j.status,"original":j.original,"quarantine":j.quarantine,"allocated":j.snapshot.allocated})).collect::<Vec<_>>())
+        }
+        Cleanup::Activity => {
+            let activity = NativeActivity.snapshot()?;
+            print(
+                serde_json::json!({"complete":activity.complete,"issues":activity.issues,"observed_paths":activity.paths.len(),"scope":"current UID open paths/cwd and process arguments; other UIDs unobserved"}),
+            )
+        }
     }
 }

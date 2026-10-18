@@ -290,6 +290,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS pending(path BLOB PRIMARY KEY, revision INTEGER NOT NULL, reason TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS observations(at INTEGER NOT NULL, logical INTEGER NOT NULL, allocated INTEGER NOT NULL, status INTEGER NOT NULL);")?;
+        db.execute_batch("CREATE TABLE IF NOT EXISTS directory_history(bucket INTEGER NOT NULL,path BLOB NOT NULL,before_json TEXT NOT NULL,after_json TEXT NOT NULL,at INTEGER NOT NULL,PRIMARY KEY(bucket,path));")?;
         Ok(Self {
             db,
             path: path.to_owned(),
@@ -479,6 +480,15 @@ impl Store {
         Ok(work)
     }
     pub fn commit(&mut self, generation: &Generation, work: &Work, index: &Index) -> Result<()> {
+        self.commit_changes(generation, work, index, &[])
+    }
+    pub fn commit_changes(
+        &mut self,
+        generation: &Generation,
+        work: &Work,
+        index: &Index,
+        changes: &[crate::history::Change],
+    ) -> Result<()> {
         ensure!(
             self.get::<Identity>("identity")?.as_ref() == Some(&work.identity),
             "Volume identity changed while measuring; candidate not committed"
@@ -496,6 +506,37 @@ impl Store {
         set(&tx, "generation", generation)?;
         set(&tx, "applied", &work.cursor)?;
         set(&tx, "active", &Option::<Work>::None)?;
+        {
+            let unsettled: Regions = {
+                let mut pending = tx.prepare("SELECT path FROM pending")?;
+                let rows = pending.query_map([], |r| r.get::<_, Vec<u8>>(0).map(from_bytes))?;
+                rows.collect::<Result<Vec<_>, _>>()?.into_iter().collect()
+            };
+            let mut statement=tx.prepare("INSERT INTO directory_history VALUES(?,?,?,?,?) ON CONFLICT(bucket,path) DO UPDATE SET after_json=excluded.after_json,at=excluded.at")?;
+            for change in changes {
+                let mut after = change.after.clone();
+                if unsettled.intersects(&change.path)
+                    && let Some(counts) = after.as_mut()
+                {
+                    counts.complete = false;
+                }
+                statement.execute(params![
+                    sql_int(change.at / 3600)?,
+                    bytes(&change.path),
+                    serde_json::to_string(&change.before)?,
+                    serde_json::to_string(&after)?,
+                    sql_int(change.at)?
+                ])?;
+            }
+        }
+        let days = meta_u64(&tx, "history_days")?;
+        let days = if days == 0 { 60 } else { days };
+        tx.execute(
+            "DELETE FROM directory_history WHERE bucket<?",
+            [sql_int(
+                generation.created.saturating_sub(days * 86400) / 3600,
+            )?],
+        )?;
         tx.execute(
             "DELETE FROM pending WHERE revision<=?",
             [sql_int(work.revision)?],
@@ -530,6 +571,42 @@ impl Store {
             File::open(&self.path)?.sync_all()?;
         }
         Ok(())
+    }
+    pub fn history(&self, scope: &Path, since: u64) -> Result<Vec<crate::history::Change>> {
+        let mut statement=self.db.prepare("SELECT path,before_json,after_json,at FROM directory_history WHERE bucket>=? ORDER BY bucket,path")?;
+        let rows = statement.query_map([sql_int(since / 3600)?], |r| {
+            Ok((
+                from_bytes(r.get(0)?),
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })?;
+        let mut combined: BTreeMap<PathBuf, crate::history::Change> = BTreeMap::new();
+        for row in rows {
+            let (path, before, after, at) = row?;
+            if !path.starts_with(scope) {
+                continue;
+            }
+            let after = serde_json::from_str(&after)?;
+            if let Some(existing) = combined.get_mut(&path) {
+                existing.after = after;
+                existing.at = at as u64;
+            } else {
+                combined.insert(
+                    path.clone(),
+                    crate::history::Change {
+                        path,
+                        before: serde_json::from_str(&before)?,
+                        after,
+                        at: at as u64,
+                    },
+                );
+            }
+        }
+        let mut result: Vec<_> = combined.into_values().collect();
+        result.sort_unstable_by_key(|r| std::cmp::Reverse(r.growth().unwrap_or(i128::MIN)));
+        Ok(result)
     }
     pub fn footprint(&self) -> Result<u64> {
         let mut size = fs::metadata(&self.path)?.blocks() * 512;
