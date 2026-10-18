@@ -1,9 +1,7 @@
 #!/bin/sh
-# Isolated project launcher: no global packages or shell configuration changes.
 set -eu
-project_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
-if [ ! -x "$project_dir/.venv/bin/mactrim" ]; then
-    printf '%s\n' 'MacTrim project environment is not installed. See README installation commands.' >&2
-    exit 2
+repo=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if ! test -x "$repo/dist/mactrim"; then
+    "$repo/scripts/build-binary"
 fi
-exec "$project_dir/.venv/bin/mactrim" "$@"
+exec "$repo/dist/mactrim" "$@"

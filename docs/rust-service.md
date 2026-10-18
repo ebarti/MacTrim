@@ -65,6 +65,12 @@ transaction. SQLite uses WAL so browsing History can overlap event ingestion.
 After a crash, an unreferenced generation is harmless; the last committed tree
 and pending work remain authoritative.
 
+The socket and receiver become available while a worker loads the saved tree.
+Filesystem capacity is sampled independently of directory coverage and saved as
+hourly observations, so a denied directory does not prevent volume-usage history.
+History retention is configurable through the service; chart sampling and page
+sizes affect presentation rather than the retained directory inventory.
+
 The service runs as the current user. Full Disk Access and Unix permissions
 still determine which directories macOS permits it to measure. It has no cleanup
 or deletion API. LaunchAgent installation is an explicit command, separate from

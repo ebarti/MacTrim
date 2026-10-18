@@ -293,7 +293,7 @@ pub fn discover(roots: &[PathBuf], home: &Path, cancel: &AtomicBool) -> Result<D
                     "HEAD {head} is reachable from local {target}; remote freshness is unverified"
                 ));
                 c.blockers.push("Registered worktree has Git administration and recovery state; use git worktree tools after review".into());
-                c.regenerate = format!("Review git -C {:?} worktree remove {:?}", repo, path);
+                c.regenerate = "Review the registered checkout with git worktree list before any manual removal".into();
                 result.push(c);
             }
         }

@@ -53,6 +53,9 @@ pub enum Request {
         path: PathBuf,
     },
     Pause,
+    Retention {
+        days: u64,
+    },
     Stop,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -65,6 +68,8 @@ pub struct Status {
     pub detail_running: bool,
     pub paused: bool,
     pub history_ready: bool,
+    pub loading: bool,
+    pub history_days: u64,
     pub received_cursor: u64,
     pub applied_cursor: u64,
     pub pending_regions: usize,
@@ -118,6 +123,7 @@ pub struct Reply {
     pub more: bool,
     pub message: String,
     pub history: Vec<crate::history::Change>,
+    pub capacity_history: Vec<crate::history::CapacityPoint>,
     pub scope: Option<Node>,
     pub offset: usize,
 }
@@ -256,6 +262,16 @@ fn directory_rows(
                 Err(_) => continue,
             };
             if meta.is_dir() {
+                if index.is_none_or(|i| !i.nodes.contains_key(&entry.path())) {
+                    keep(Row {
+                        path: entry.path(),
+                        directory: true,
+                        node: Node {
+                            status: 4,
+                            ..Node::default()
+                        },
+                    });
+                }
                 continue;
             }
             let regular = meta.is_file() && !meta.file_type().is_symlink();
@@ -340,26 +356,20 @@ fn serve(
             let (mut rows, mut more, mut actual_offset) =
                 directory_rows(selected, path, logical, offset, limit, anchor.as_deref())?;
             if status.running {
-                let live = progress.lock().unwrap();
+                let live = progress.lock().unwrap().clone();
                 if live.view == *path && !live.rows.is_empty() && selected.is_none() {
-                    if let Some(rank) = anchor
-                        .as_ref()
-                        .and_then(|a| live.rows.iter().position(|(p, _)| p == a))
-                    {
-                        actual_offset = rank / limit * limit;
+                    let mut observed = Index::new(path.clone());
+                    for (p, n) in live.rows {
+                        observed.insert(p, n);
                     }
-                    rows = live
-                        .rows
-                        .iter()
-                        .skip(actual_offset)
-                        .take(limit)
-                        .map(|(p, n)| Row {
-                            path: p.clone(),
-                            node: n.clone(),
-                            directory: true,
-                        })
-                        .collect();
-                    more = live.rows.len() > actual_offset + limit;
+                    (rows, more, actual_offset) = directory_rows(
+                        Some(&observed),
+                        path,
+                        logical,
+                        offset,
+                        limit,
+                        anchor.as_deref(),
+                    )?;
                 }
             }
             Reply {
@@ -368,6 +378,7 @@ fn serve(
                 more,
                 message: String::new(),
                 history: vec![],
+                capacity_history: vec![],
                 scope: selected.and_then(|i| i.nodes.get(path)).cloned(),
                 offset: actual_offset,
             }
@@ -396,9 +407,11 @@ fn serve(
                 "History page size must be 1..500"
             );
             let (history, more) = Store::history_page(&state, &path, since, offset, limit)?;
+            let capacity_history = Store::capacity_history(&state, since)?;
             Reply {
                 status,
                 history,
+                capacity_history,
                 more,
                 offset,
                 message: "Directory aggregates overlap; incomplete comparisons have unknown growth"
@@ -425,9 +438,17 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
     let mut store = Store::open(&state)?;
     let mut identity = events::identity(&root)?;
     store.bind(&root, &identity, events::current_id())?;
-    let mut index = store.load()?.map(Arc::new);
+    let mut index = None;
+    let mut loading = true;
+    let (loaded_tx, loaded_rx) = mpsc::sync_channel(1);
+    let load_state = state.clone();
+    thread::Builder::new()
+        .name("mactrim-index-loader".into())
+        .spawn(move || {
+            let _ = loaded_tx.send(Store::load_readonly(&load_state).map(|i| i.map(Arc::new)));
+        })?;
     store.reap_orphans()?;
-    if index.is_none() && store.work()?.paths.is_empty() {
+    if store.generation()?.is_none() && store.work()?.paths.is_empty() {
         store.ingest(store.cursor()?, [root.clone()], "Initial baseline")?;
     }
     let socket = state.join("service.sock");
@@ -477,10 +498,45 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
     let mut queued_at = Instant::now();
     let mut last_retry = Instant::now();
     let mut last_saved = store.generation()?.map(|g| g.created).unwrap_or(0);
+    let mut current_capacity = capacity(&root)?;
+    let mut capacity_sample = Instant::now();
+    let mut capacity_save = Instant::now();
+    store.record_capacity(store::now(), current_capacity.0, current_capacity.1)?;
     loop {
         if terminate.load(Ordering::Relaxed) {
             cancel.store(true, Ordering::Relaxed);
             break;
+        }
+        if let Ok(loaded) = loaded_rx.try_recv() {
+            loading = false;
+            match loaded {
+                Ok(saved) => {
+                    index = saved;
+                    if index.is_none() && store.work()?.paths.is_empty() {
+                        store.ingest(store.cursor()?, [root.clone()], "Initial baseline")?;
+                    }
+                }
+                Err(e) => {
+                    error = Some(format!(
+                        "Saved index unreadable: {e:#}; rebuilding accessible metadata"
+                    ));
+                    store.ingest(
+                        store.cursor()?,
+                        [root.clone()],
+                        "Repairing unreadable saved index",
+                    )?;
+                }
+            }
+        }
+        if capacity_sample.elapsed() >= Duration::from_secs(2) {
+            if let Ok(c) = capacity(&root) {
+                current_capacity = c;
+            }
+            capacity_sample = Instant::now();
+        }
+        if capacity_save.elapsed() >= Duration::from_secs(60) {
+            store.record_capacity(store::now(), current_capacity.0, current_capacity.1)?;
+            capacity_save = Instant::now();
         }
         for _ in 0..32 {
             let batch = match watch.receiver.try_recv() {
@@ -578,6 +634,11 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
         }
         while let Ok((command, tx)) = commands_rx.try_recv() {
             let reply = match command {
+                Request::Retention { days } => {
+                    let result=store.set_history_days(days).map(|_|Reply{status:public.read().unwrap().status.clone(),message:format!("History retention set to {days} days; older records removed, reusable database pages retained"),..Reply::default()}).map_err(|e|format!("{e:#}"));
+                    let _ = tx.send(result);
+                    continue;
+                }
                 Request::Stop => {
                     terminate.store(true, Ordering::Relaxed);
                     "Service stopping; committed index and pending work preserved"
@@ -670,7 +731,11 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
             }
         }
         let work = store.work()?;
+        if ready && !loading && !paused && !running && !detail_running && work.paths.is_empty() {
+            phase = "Index saved; incremental tracking active".into();
+        }
         if ready
+            && !loading
             && !paused
             && !running
             && !detail_running
@@ -731,6 +796,7 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
                     let _ = tx.send(result);
                 })?;
         } else if ready
+            && !loading
             && !paused
             && !running
             && !detail_running
@@ -768,11 +834,13 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
             let live = progress.lock().unwrap();
             let mut p = public.write().unwrap();
             p.index = index.clone();
-            let (used, available) = capacity(&root).unwrap_or_default();
+            let (used, available) = current_capacity;
             p.status = Status {
                 pid: std::process::id(),
                 root: root.clone(),
-                phase: if paused {
+                phase: if loading {
+                    "Loading saved directory tree; event ingestion active".into()
+                } else if paused {
                     "Paused; Refresh resumes measurement".into()
                 } else if running && !live.phase.is_empty() {
                     live.phase.clone()
@@ -783,6 +851,8 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
                 detail_running,
                 paused,
                 history_ready: ready,
+                loading,
+                history_days: store.history_days()?,
                 received_cursor: store.cursor()?,
                 applied_cursor: store.applied()?,
                 pending_regions: work.paths.len(),

@@ -160,3 +160,35 @@ fn history_pages_rank_the_whole_scope_and_match_the_saved_deltas() {
     assert!(page.is_empty());
     assert!(!more);
 }
+
+#[test]
+fn physical_capacity_history_is_separate_from_partial_directory_coverage() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = fs::canonicalize(temp.path()).unwrap();
+    let state = base.join("state");
+    let mut store = Store::open(&state).unwrap();
+    let now = mactrim_rs::store::now();
+    let first = now - 7200;
+    store
+        .record_capacity(first, 380_000_000_000, 100_000_000_000)
+        .unwrap();
+    store
+        .record_capacity(first + 1800, 390_000_000_000, 90_000_000_000)
+        .unwrap();
+    store
+        .record_capacity(now, 450_000_000_000, 30_000_000_000)
+        .unwrap();
+    let points = Store::capacity_history(&state, 0).unwrap();
+    assert_eq!(points.last().unwrap().used, 450_000_000_000);
+    assert!(points.len() >= 2);
+    store.set_history_days(1).unwrap();
+    assert_eq!(store.history_days().unwrap(), 1);
+    assert!(store.set_history_days(0).is_err());
+    drop(store);
+    let store = Store::open(&state).unwrap();
+    assert_eq!(store.history_days().unwrap(), 1);
+    assert_eq!(
+        Store::capacity_history(&state, now - 3600).unwrap().len(),
+        1
+    );
+}
