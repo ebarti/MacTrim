@@ -99,8 +99,10 @@ fn error(frame: &mut Frame, path: &Path, code: i32) {
     } else {
         2
     };
-    frame.node.error = code;
-    frame.node.error_path.get_or_insert_with(|| path.to_owned());
+    if frame.node.error_path.is_none() {
+        frame.node.error = code;
+        frame.node.error_path = Some(path.to_owned());
+    }
 }
 fn add(parent: &mut Node, child: &Node) -> Result<()> {
     parent.logical = parent
