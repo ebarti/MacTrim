@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    io::{BufRead, BufReader, Read, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     os::unix::{
         fs::{FileTypeExt, MetadataExt, PermissionsExt},
         net::{UnixListener, UnixStream},
@@ -135,6 +135,19 @@ struct Public {
 }
 type Command = (Request, mpsc::SyncSender<Result<Reply, String>>);
 
+#[derive(Debug)]
+pub struct ServiceUnavailable(io::Error);
+impl std::fmt::Display for ServiceUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Storage service is not running; use 'mactrim service start' (with the same --state for a custom service)")
+    }
+}
+impl std::error::Error for ServiceUnavailable {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
 pub fn state_path(path: &Path) -> Result<PathBuf> {
     ensure!(
         path.is_absolute() && !path.components().any(|c| c == Component::ParentDir),
@@ -149,12 +162,27 @@ pub fn state_path(path: &Path) -> Result<PathBuf> {
 }
 pub fn request(state: &Path, command: &Request) -> Result<Reply> {
     let socket = state.join("service.sock");
-    let meta = fs::symlink_metadata(&socket)?;
+    let meta = match fs::symlink_metadata(&socket) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(ServiceUnavailable(e).into()),
+        Err(e) => return Err(e).context("Cannot inspect storage service socket"),
+    };
     ensure!(
         meta.file_type().is_socket() && meta.uid() == unsafe { libc::geteuid() },
         "Unsafe service socket"
     );
-    let mut stream = UnixStream::connect(&socket).context("Storage service is not running")?;
+    let mut stream = match UnixStream::connect(&socket) {
+        Ok(stream) => stream,
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Err(ServiceUnavailable(e).into());
+        }
+        Err(e) => return Err(e).context("Cannot connect to storage service"),
+    };
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     serde_json::to_writer(&mut stream, command)?;
@@ -165,6 +193,88 @@ pub fn request(state: &Path, command: &Request) -> Result<Reply> {
         .read_line(&mut line)?;
     let response: Result<Reply, String> = serde_json::from_str(&line)?;
     response.map_err(anyhow::Error::msg)
+}
+
+// The writer lock outlives socket removal during shutdown. Waiting for it keeps
+// an immediately following Start from racing the previous service's database.
+pub fn writer_active(state: &Path) -> Result<bool> {
+    let file = match store::private_file(&state.join("writer.lock"), false) {
+        Ok(file) => file,
+        Err(e)
+            if e.downcast_ref::<io::Error>()
+                .is_some_and(|e| e.kind() == io::ErrorKind::NotFound) =>
+        {
+            return Ok(false);
+        }
+        Err(e) => return Err(e).context("Cannot inspect service writer lock"),
+    };
+    match fs2::FileExt::try_lock_shared(&file) {
+        Ok(()) => Ok(false), // Dropping this descriptor releases the probe lock.
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(true),
+        Err(e) => Err(e).context("Cannot inspect service writer lock"),
+    }
+}
+
+pub fn status(state: &Path) -> Result<Reply> {
+    match request(state, &Request::Status) {
+        Ok(reply) => Ok(reply),
+        Err(e) if e.is::<ServiceUnavailable>() => {
+            let transition = writer_active(state)?;
+            Ok(Reply {
+                status: Status {
+                    phase: if transition {
+                        "Starting or stopping"
+                    } else {
+                        "Stopped"
+                    }
+                    .into(),
+                    ..Status::default()
+                },
+                message: if transition {
+                    "Service is starting or stopping; retry shortly. Saved state is preserved."
+                } else {
+                    "Service is stopped; any saved index and pending work are preserved."
+                }
+                .into(),
+                ..Reply::default()
+            })
+        }
+        Err(e) => Err(e),
+    }
+}
+
+pub fn stop(state: &Path) -> Result<Reply> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut acknowledged = None;
+    loop {
+        if acknowledged.is_none() {
+            match request(state, &Request::Stop) {
+                Ok(reply) => acknowledged = Some(reply),
+                Err(e) if e.is::<ServiceUnavailable>() => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if !writer_active(state)? {
+            let message = if acknowledged.is_some() {
+                "Service stopped; committed index and pending work preserved"
+            } else {
+                "Service is already stopped; saved index and pending work preserved"
+            };
+            let mut reply = acknowledged.unwrap_or_default();
+            reply.status.pid = 0;
+            reply.status.phase = "Stopped".into();
+            reply.status.running = false;
+            reply.status.detail_running = false;
+            reply.message = message.into();
+            return Ok(reply);
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "Service has not stopped within 10 seconds; saved state preserved. Inspect {}",
+            state.join("service.log").display()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 fn directory_rows(
     index: Option<&Index>,

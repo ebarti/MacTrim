@@ -6,4 +6,4 @@ binary=${1:-"$repo/dist/mactrim"}
 case "$binary" in /*) ;; *) binary="$repo/$binary";; esac
 "$binary" --version
 "$binary" build-info
-MACTRIM_TEST_BINARY="$binary" cargo test --locked --test daemon --test executable --test terminal
+MACTRIM_TEST_BINARY="$binary" cargo test --locked --test daemon --test executable --test terminal --test lifecycle
