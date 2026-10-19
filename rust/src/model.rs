@@ -151,3 +151,9 @@ pub struct Identity {
     #[serde(with = "crate::paths")]
     pub relative: PathBuf,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Interruption {
+    pub at: u64,
+    pub reason: String,
+}

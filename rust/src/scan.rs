@@ -15,6 +15,23 @@ use std::{
 };
 use walkdir::WalkDir;
 
+/// An expected worker interruption, distinct from a measurement or save failure.
+#[derive(Debug)]
+pub struct Cancelled;
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Scan interrupted; previous committed index preserved")
+    }
+}
+impl std::error::Error for Cancelled {}
+
+pub fn check_cancelled(cancel: &AtomicBool) -> Result<()> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(Cancelled.into());
+    }
+    Ok(())
+}
+
 struct Frame {
     path: PathBuf,
     node: Node,
@@ -205,9 +222,7 @@ fn walk(
         .max_open(32)
         .into_iter();
     while let Some(entry) = walker.next() {
-        if cancel.load(Ordering::Relaxed) {
-            bail!("Scan cancelled; previous committed index preserved");
-        }
+        check_cancelled(cancel)?;
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
@@ -339,6 +354,7 @@ pub fn measure(
     cancel: &AtomicBool,
     progress: Option<&Arc<Mutex<Progress>>>,
 ) -> Result<Index> {
+    check_cancelled(cancel)?;
     let full = |why: &str| -> Result<Index> {
         if let Some(progress) = progress {
             progress.lock().unwrap().phase = why.into();
@@ -373,9 +389,7 @@ pub fn measure(
     candidate.reused = old.root_node().map_or(0, |n| n.entries);
     let mut ancestors = std::collections::BTreeSet::new();
     for scope in scopes.paths() {
-        if cancel.load(Ordering::Relaxed) {
-            bail!("Scan cancelled; previous committed index preserved");
-        }
+        check_cancelled(cancel)?;
         let subtree = walk(scope, root, exclusions, cancel, progress)?;
         if !subtree.linked.is_empty() {
             return full("Full reconciliation for newly shared hardlink identities");
@@ -400,9 +414,7 @@ pub fn measure(
         }
     }
     for (_, path) in ancestors {
-        if cancel.load(Ordering::Relaxed) {
-            bail!("Scan cancelled during reconciliation");
-        }
+        check_cancelled(cancel)?;
         let before = old.nodes.get(&path).context("Missing aggregate ancestor")?;
         let meta = fs::symlink_metadata(&path)?;
         if meta.dev() != before.signature[0] || meta.ino() != before.signature[1] || !meta.is_dir()
@@ -438,6 +450,7 @@ pub fn measure(
         candidate.insert(path, node);
     }
     publish(&mut candidate, &[], root, progress)?;
+    check_cancelled(cancel)?;
     Ok(candidate)
 }
 

@@ -546,6 +546,13 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+    pub fn record_interruption(&mut self, interruption: &Interruption) -> Result<()> {
+        let tx = self.db.transaction()?;
+        // Retain the latest cause across restarts without an unbounded event log.
+        set(&tx, "last_interruption", interruption)?;
+        tx.commit()?;
+        Ok(())
+    }
     pub fn set_full_at(&mut self, at: u64) -> Result<()> {
         let tx = self.db.transaction()?;
         set(&tx, "full_at", &at)?;

@@ -319,6 +319,12 @@ fn print_service_status(reply: &service::Reply, json: bool, heading: &str) -> Re
         )?;
     }
     writeln!(out, "Pending regions: {}", s.pending_regions)?;
+    if let Some(interruption) = &s.last_interruption {
+        let at = chrono::DateTime::from_timestamp(interruption.at as i64, 0)
+            .map(|at| at.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+            .unwrap_or_else(|| interruption.at.to_string());
+        writeln!(out, "Last interruption: {} ({at})", interruption.reason)?;
+    }
     if let Some(node) = &s.root_node
         && node.status > 1
     {

@@ -385,6 +385,13 @@ fn human_service_controls_and_explicit_json_preserve_the_same_lifecycle() {
     ));
     assert_eq!(storage_json["status"]["pid"], saved["status"]["pid"]);
     assert!(human(raw_cli(&state, &["service", "pause"])).contains("paused"));
+    let paused = human(raw_cli(&state, &["status"]));
+    assert!(paused.contains("Paused by user"), "{paused}");
+    assert!(
+        paused.contains("Last interruption: User requested Pause"),
+        "{paused}"
+    );
+    assert!(!paused.contains("Problem:"), "{paused}");
     assert!(human(raw_cli(&state, &["refresh"])).contains("refresh requested"));
     assert!(human(raw_cli(&state, &["service", "retention", "--days", "30"])).contains("30 days"));
     let restarted = human(raw_cli(&state, &["service", "restart"]));

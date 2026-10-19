@@ -215,16 +215,18 @@ fn hardlinks_are_counted_once_and_symlinks_are_not_followed() {
 #[test]
 fn cancellation_never_returns_a_candidate_to_commit() {
     let (_temp, root, _state) = fixture();
+    let failure = measure(
+        &root,
+        &[],
+        None,
+        &Regions::default(),
+        &AtomicBool::new(true),
+        None,
+    )
+    .expect_err("An interrupted scan returned a candidate");
     assert!(
-        measure(
-            &root,
-            &[],
-            None,
-            &Regions::default(),
-            &AtomicBool::new(true),
-            None
-        )
-        .is_err()
+        failure.is::<mactrim_rs::scan::Cancelled>(),
+        "Cancellation lost its type: {failure:#}"
     );
 }
 
