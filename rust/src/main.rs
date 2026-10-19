@@ -26,6 +26,9 @@ use std::{
 struct Args {
     #[arg(long, global = true)]
     state: Option<PathBuf>,
+    /// Print JSON for service controls, status, refresh and Storage.
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -44,8 +47,6 @@ enum Commands {
     Storage {
         #[arg(default_value = "/")]
         root: PathBuf,
-        #[arg(long)]
-        json: bool,
     },
     Status,
     History {
@@ -265,6 +266,69 @@ fn print<T: serde::Serialize>(value: T) -> Result<()> {
     writeln!(out)?;
     Ok(())
 }
+fn print_or_text<T: serde::Serialize>(json: bool, value: &T, text: &str) -> Result<()> {
+    if json {
+        print(value)
+    } else {
+        writeln!(io::stdout().lock(), "{text}").map_err(Into::into)
+    }
+}
+fn print_service_status(reply: &service::Reply, json: bool, heading: &str) -> Result<()> {
+    if json {
+        return print(reply);
+    }
+    let mut out = io::stdout().lock();
+    let s = &reply.status;
+    if s.pid == 0 {
+        return writeln!(
+            out,
+            "MacTrim service is {}.",
+            if s.phase == "Stopped" {
+                "stopped"
+            } else {
+                "starting or stopping"
+            }
+        )
+        .map_err(Into::into);
+    }
+    writeln!(out, "{heading} (PID {}).", s.pid)?;
+    writeln!(out, "Root: {}", s.root.display())?;
+    writeln!(out, "Activity: {}", s.phase)?;
+    if s.running || s.detail_running {
+        writeln!(
+            out,
+            "Progress: {} entries visited; {} reused",
+            s.visited, s.reused
+        )?;
+        writeln!(
+            out,
+            "Measured so far: {} allocated",
+            mactrim_rs::ui::size(s.observed_allocated)
+        )?;
+    }
+    if s.loading {
+        writeln!(out, "Saved index: loading")?;
+    } else if s.last_saved == 0 {
+        writeln!(out, "Saved index: no completed scan yet")?;
+    } else {
+        writeln!(
+            out,
+            "Saved index: {} directories; service data: {}",
+            s.directories,
+            mactrim_rs::ui::size(s.index_bytes)
+        )?;
+    }
+    writeln!(out, "Pending regions: {}", s.pending_regions)?;
+    if let Some(node) = &s.root_node
+        && node.status > 1
+    {
+        writeln!(out, "Coverage: {}", node.status_name())?;
+    }
+    if let Some(error) = &s.error {
+        writeln!(out, "Problem: {error}")?;
+    }
+    Ok(())
+}
 fn main() {
     if let Err(error) = run() {
         eprintln!("MacTrim: {error:#}");
@@ -273,11 +337,12 @@ fn main() {
 }
 fn run() -> Result<()> {
     let args = Args::parse();
+    let json = args.json;
     let state = service::state_path(&args.state.unwrap_or(default_state()?))?;
-    match args.command.unwrap_or(Commands::Storage {
-        root: "/".into(),
-        json: false,
-    }) {
+    match args
+        .command
+        .unwrap_or(Commands::Storage { root: "/".into() })
+    {
         Commands::BuildInfo => build_info(),
         Commands::Doctor { root } => doctor(&state, &root),
         Commands::Cleanup { action } => cleanup_command(&state, action),
@@ -299,7 +364,7 @@ fn run() -> Result<()> {
                 serde_json::json!({"root":root,"node":index.root_node(),"visited":index.visited,"directories":index.nodes.len(),"rows":index.rows(&root,false)}),
             )
         }
-        Commands::Storage { root, json } => {
+        Commands::Storage { root } => {
             let root = fs::canonicalize(root)?;
             if !json {
                 use std::io::IsTerminal;
@@ -315,7 +380,11 @@ fn run() -> Result<()> {
                 mactrim_rs::ui::run(state, root, signal_flag()?)
             }
         }
-        Commands::Status => print(service::status(&state)?),
+        Commands::Status => print_service_status(
+            &service::status(&state)?,
+            json,
+            "MacTrim service is running",
+        ),
         Commands::History {
             path,
             days,
@@ -330,7 +399,11 @@ fn run() -> Result<()> {
                 limit,
             },
         )?),
-        Commands::Refresh { full } => print(service::request(&state, &Request::Refresh { full })?),
+        Commands::Refresh { full } => print_service_status(
+            &service::request(&state, &Request::Refresh { full })?,
+            json,
+            "Storage refresh requested",
+        ),
         Commands::List {
             path,
             offset,
@@ -347,20 +420,31 @@ fn run() -> Result<()> {
             },
         )?),
         Commands::Service { action } => match action {
-            Service::Retention { days } => {
-                print(service::request(&state, &Request::Retention { days })?)
-            }
+            Service::Retention { days } => print_or_text(
+                json,
+                &service::request(&state, &Request::Retention { days })?,
+                &format!("History retention set to {days} days."),
+            ),
             Service::Install { root } => {
                 let root = fs::canonicalize(root)?;
                 let app = mactrim_rs::agent::install(&state, &root)?;
-                print(
-                    serde_json::json!({"installed":app,"state":state,"root":root,"label":mactrim_rs::agent::LABEL,"note":"Per-user storage service installed. Privacy permissions are controlled by macOS."}),
+                print_or_text(
+                    json,
+                    &serde_json::json!({"installed":app,"state":state,"root":root,"label":mactrim_rs::agent::LABEL,"note":"Per-user storage service installed. Privacy permissions are controlled by macOS."}),
+                    &format!(
+                        "MacTrim service installed and started for {}.\nStarts automatically when you log in.\nHelper: {}\nState: {}",
+                        root.display(),
+                        app.display(),
+                        state.display()
+                    ),
                 )
             }
             Service::Uninstall => {
                 mactrim_rs::agent::uninstall(&state)?;
-                print(
-                    serde_json::json!({"uninstalled":mactrim_rs::agent::LABEL,"state_preserved":state}),
+                print_or_text(
+                    json,
+                    &serde_json::json!({"uninstalled":mactrim_rs::agent::LABEL,"state_preserved":state}),
+                    "MacTrim login service uninstalled. Saved index, history and recovery data are preserved.",
                 )
             }
             Service::Plist { root } => {
@@ -371,15 +455,33 @@ fn run() -> Result<()> {
             Service::Run { root } => service::run(root, state, signal_flag()?),
             Service::Start { root } => {
                 start(&state, &root)?;
-                print(service::request(&state, &Request::Status)?)
+                print_service_status(
+                    &service::request(&state, &Request::Status)?,
+                    json,
+                    "MacTrim service is running",
+                )
             }
             Service::Restart { root } => {
                 restart(&state, root)?;
-                print(service::request(&state, &Request::Status)?)
+                print_service_status(
+                    &service::request(&state, &Request::Status)?,
+                    json,
+                    "MacTrim service restarted",
+                )
             }
-            Service::Status => print(service::status(&state)?),
-            Service::Stop => print(service::stop(&state)?),
-            Service::Pause => print(service::request(&state, &Request::Pause)?),
+            Service::Status => print_service_status(
+                &service::status(&state)?,
+                json,
+                "MacTrim service is running",
+            ),
+            Service::Stop => {
+                let reply = service::stop(&state)?;
+                print_or_text(json, &reply, &reply.message)
+            }
+            Service::Pause => {
+                let reply = service::request(&state, &Request::Pause)?;
+                print_or_text(json, &reply, &reply.message)
+            }
         },
     }
 }
