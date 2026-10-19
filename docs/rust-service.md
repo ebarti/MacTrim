@@ -13,8 +13,10 @@ does not track in-place edits to descendant files. Recursive measurement must
 establish a baseline, and later events invalidate cached subtrees. Replacement
 measurements replace totals; they never add a guessed event byte delta.
 
-First principles: a saved event cursor is safe only if every event through it
-is represented by either committed measurements or durable pending work. The
+First principles: an applied event cursor is safe only if every event through it
+is represented by committed measurements and subsequent edits remain in durable
+pending work. A received cursor records delivery progress; after a gap it needs
+a separate durable uncertainty marker and cannot imply verified measurements. The
 receiver and measurement worker have separate lifetimes. A client disconnect
 does not cancel measurement, and a daemon restart replays from its durable
 cursor. A partial observation is preserved and remains explicitly partial.
@@ -34,9 +36,14 @@ The observed limitations and their owning layers are:
 The fix belongs in the service's ingestion and commit protocol. Rust reduces
 receiver overhead and removes the Python interpreter/GIL from this path; it
 does not strengthen Apple's delivery guarantees. Reported gaps cause replay
-from the last durable cursor. A repeated gap, invalid history UUID, wrapped IDs
-or a moved watched root causes a durable invalidation of the whole scope. The
-old observation remains browsable during recovery.
+from the last durable cursor. A repeated gap, invalid history UUID or wrapped IDs
+records historical uncertainty separately from pending scopes. The active scan
+continues, saves its measurements, and then becomes idle; when there is no active
+scan, measurement stays idle. New notifications are still durably collected.
+Refresh is required to resume. The service does not acknowledge an old journal
+cursor in a replacement journal, or mark uncertain History growth as complete.
+Volume UUIDs distinguish a replaced filesystem from a replaced event journal;
+only the former invalidates the active filesystem measurement.
 
 Directory details remain collapsed for dependency folders and after eight
 browsing levels. Their *sizes* include accessible descendants at every depth.
@@ -47,8 +54,21 @@ The service keeps the directory tree in persistent ordered maps from `im`.
 An ordinary update remeasures an antichain of invalidated retained subtrees,
 shares all unaffected map branches and recomputes the affected ancestors. It
 does not clone every directory or visit every unchanged directory to refresh a
-small region. Previously or newly shared hardlink identities require global
-accounting and explicitly trigger a full reconciliation.
+small region. Previously or newly shared hardlink identities can require global
+accounting. An incremental worker reports that requirement and retains its
+pending scopes instead of silently walking the whole root. A Full rescan requires
+an explicit request. A periodic audit can be reported as due without starting it.
+
+The native receiver requests file-level events. File changes invalidate their
+containing directories; indexed SQLite ancestor and descendant queries coalesce
+pending scopes without rewriting the full queue for each batch. There is no
+queue-size threshold that promotes precise paths into a root walk. A durable
+finish-then-idle marker survives restart and is cleared only by explicit Refresh.
+The measurement worker and checkpoint writer share a configurable cooperative
+CPU duty budget (10% of one core by default); event intake does not sleep behind
+that budget. Cancellation remains responsive during paced work and checkpoint
+construction, and unfinished checkpoint files are cleaned up by their temporary
+file owner.
 
 On disk, the service persists a compressed directory checkpoint plus compressed
 changed-node deltas in SQLite, alongside coalesced pending regions and cursors.

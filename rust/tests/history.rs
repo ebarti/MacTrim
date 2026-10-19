@@ -8,6 +8,7 @@ use mactrim_rs::{
 use std::{fs, sync::atomic::AtomicBool};
 fn id() -> Identity {
     Identity {
+        volume_uuid: None,
         namespace_device: 1,
         namespace_inode: 2,
         namespace_uuid: "x".into(),
@@ -35,14 +36,16 @@ fn directory_history_keeps_first_and_latest_hourly_values() {
     fs::write(root.join("data"), vec![0; 16384]).unwrap();
     let second = measure(&root, &[], None, &Regions::default(), &cancel, None).unwrap();
     let d = history::changes(Some(&first), &second, gen1.created);
-    store.ingest(105, [root.clone()], "edit").unwrap();
+    store.ingest(105, [], "Received checkpoint").unwrap();
+    store.resume(true).unwrap();
     let work = store.claim().unwrap();
     let gen2 = Generation::write(&state, &second).unwrap();
     store.commit_changes(&gen2, &work, &second, &d).unwrap();
     fs::write(root.join("data"), vec![0; 32768]).unwrap();
     let third = measure(&root, &[], None, &Regions::default(), &cancel, None).unwrap();
     let d = history::changes(Some(&second), &third, gen1.created);
-    store.ingest(110, [root.clone()], "edit").unwrap();
+    store.ingest(110, [], "Received checkpoint").unwrap();
+    store.resume(true).unwrap();
     let work = store.claim().unwrap();
     let gen3 = Generation::write(&state, &third).unwrap();
     store.commit_changes(&gen3, &work, &third, &d).unwrap();
@@ -135,7 +138,8 @@ fn history_pages_rank_the_whole_scope_and_match_the_saved_deltas() {
     }
     let generation = Generation::write(&state, &after).unwrap();
     let changes = history::changes(Some(&before), &after, generation.created);
-    store.ingest(101, [root.clone()], "edits").unwrap();
+    store.ingest(101, [], "Received checkpoint").unwrap();
+    store.resume(true).unwrap();
     let work = store.claim().unwrap();
     store
         .commit_changes(&generation, &work, &after, &changes)

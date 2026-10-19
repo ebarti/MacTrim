@@ -141,6 +141,8 @@ pub struct Progress {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Identity {
+    #[serde(default)]
+    pub volume_uuid: Option<String>,
     pub namespace_device: u64,
     pub namespace_inode: u64,
     pub namespace_uuid: String,
@@ -150,6 +152,45 @@ pub struct Identity {
     pub mount: PathBuf,
     #[serde(with = "crate::paths")]
     pub relative: PathBuf,
+}
+
+impl Identity {
+    pub fn same_filesystem(&self, other: &Self) -> bool {
+        let physical = match (&self.volume_uuid, &other.volume_uuid) {
+            (Some(a), Some(b)) => a == b && self.namespace_uuid == other.namespace_uuid,
+            _ => self.namespace_device == other.namespace_device && self.device == other.device,
+        };
+        physical
+            && self.namespace_inode == other.namespace_inode
+            && self.mount == other.mount
+            && self.relative == other.relative
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ScanPolicy {
+    pub cpu_percent: u8,
+}
+impl Default for ScanPolicy {
+    fn default() -> Self {
+        Self { cpu_percent: 10 }
+    }
+}
+impl ScanPolicy {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            (1..=100).contains(&self.cpu_percent),
+            "CPU budget must be 1..100 percent of one core"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Verification {
+    pub reason: String,
+    pub requested_at: u64,
+    pub revision: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

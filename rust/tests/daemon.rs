@@ -133,3 +133,100 @@ fn real_daemon_tracks_edits_and_recovers_changes_made_while_stopped() {
         );
     }
 }
+
+#[test]
+fn replaced_history_stays_idle_until_explicit_refresh_and_preserves_budget() {
+    use mactrim_rs::{
+        events,
+        regions::Regions,
+        scan,
+        store::{Generation, Store},
+    };
+    use std::sync::atomic::AtomicBool;
+    let temp = tempfile::tempdir().unwrap();
+    let base = fs::canonicalize(temp.path()).unwrap();
+    let root = base.join("files");
+    let state = base.join("state");
+    fs::create_dir_all(root.join("a")).unwrap();
+    fs::create_dir(root.join("b")).unwrap();
+    fs::write(root.join("a/data"), vec![1; 4096]).unwrap();
+    fs::write(root.join("b/stable"), vec![1; 4096]).unwrap();
+    let mut identity = events::identity(&root).unwrap();
+    identity.uuid = "retired-fixture-history".into();
+    let mut store = Store::open(&state).unwrap();
+    store.bind(&root, &identity, events::current_id()).unwrap();
+    let baseline = scan::measure(
+        &root,
+        &[],
+        None,
+        &Regions::default(),
+        &AtomicBool::new(false),
+        None,
+    )
+    .unwrap();
+    let generation = Generation::write(&state, &baseline).unwrap();
+    let work = store.claim().unwrap();
+    store.commit(&generation, &work, &baseline).unwrap();
+    drop(store);
+
+    let mut daemon = spawn(&root, &state);
+    let idle = wait(&state, |s| {
+        !s.loading && s.history_ready && s.paused && s.finish_then_idle
+    });
+    assert!(!idle.running && !idle.detail_running);
+    assert_eq!(idle.visited, 0);
+    assert_eq!(idle.last_saved, generation.created);
+    assert_eq!(idle.cpu_percent, 10);
+    assert!(idle.verification.is_some());
+    assert!(
+        request(
+            &state,
+            &Request::Policy {
+                cpu_percent: Some(0)
+            }
+        )
+        .is_err()
+    );
+    request(
+        &state,
+        &Request::Policy {
+            cpu_percent: Some(25),
+        },
+    )
+    .unwrap();
+    wait(&state, |s| s.cpu_percent == 25 && s.paused && !s.running);
+    fs::write(root.join("a/data"), vec![2; 128 * 1024]).unwrap();
+    let queued = wait(&state, |s| s.pending_regions > 0 && s.paused);
+    assert_eq!(queued.visited, 0, "New events resumed measurement");
+    assert_eq!(queued.last_saved, generation.created);
+    request(&state, &Request::Stop).unwrap();
+    assert!(daemon.0.wait().unwrap().success());
+
+    let mut restarted = spawn(&root, &state);
+    let idle = wait(&state, |s| {
+        !s.loading && s.history_ready && s.paused && s.finish_then_idle
+    });
+    assert_eq!(idle.visited, 0, "Restart resumed measurement");
+    assert_eq!(idle.cpu_percent, 25);
+    assert_eq!(idle.directories, generation.directories);
+    request(&state, &Request::Refresh { full: false }).unwrap();
+    let refreshed = wait(&state, |s| {
+        !s.paused
+            && !s.running
+            && s.pending_regions == 0
+            && s.root_node
+                .as_ref()
+                .is_some_and(|n| n.logical > baseline.root_node().unwrap().logical)
+    });
+    assert!(!refreshed.finish_then_idle);
+    assert!(
+        refreshed.reused > 0,
+        "Explicit Refresh walked an unchanged sibling"
+    );
+    assert!(
+        refreshed.verification.is_some(),
+        "Incremental refresh concealed missing history"
+    );
+    request(&state, &Request::Stop).unwrap();
+    assert!(restarted.0.wait().unwrap().success());
+}

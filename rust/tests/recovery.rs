@@ -8,6 +8,7 @@ use std::{fs, path::PathBuf, sync::atomic::AtomicBool};
 
 fn identity() -> Identity {
     Identity {
+        volume_uuid: None,
         namespace_device: 1,
         namespace_inode: 2,
         namespace_uuid: "a".into(),
@@ -147,7 +148,7 @@ fn duplicate_writer_and_corruption_are_refused() {
 }
 
 #[test]
-fn changed_history_invalidates_root_and_does_not_erase_saved_observation() {
+fn changed_history_holds_measurement_without_queuing_a_root_scan() {
     let (_temp, root, state) = fixture();
     let mut store = Store::open(&state).unwrap();
     store.bind(&root, &identity(), 100).unwrap();
@@ -167,7 +168,16 @@ fn changed_history_invalidates_root_and_does_not_erase_saved_observation() {
     let mut changed = identity();
     changed.uuid = "replacement".into();
     assert!(store.bind(&root, &changed, 30).unwrap());
-    assert_eq!(store.work().unwrap().paths, vec![root]);
+    assert!(store.work().unwrap().paths.is_empty());
+    assert_eq!(store.applied().unwrap(), 0);
+    assert!(store.verification().unwrap().is_some());
+    assert!(
+        store
+            .get::<Option<String>>("finish_then_idle")
+            .unwrap()
+            .flatten()
+            .is_some()
+    );
     assert!(store.load().unwrap().is_some());
 }
 
@@ -266,4 +276,248 @@ fn claimed_work_survives_process_restart() {
     drop(store);
     let store = Store::open(&state).unwrap();
     assert_eq!(store.work().unwrap().paths, work.paths);
+}
+
+#[test]
+fn broad_uncertainty_does_not_absorb_precise_pending_paths() {
+    let (_temp, root, state) = fixture();
+    let mut store = Store::open(&state).unwrap();
+    store.bind(&root, &identity(), 100).unwrap();
+    let baseline = measure(
+        &root,
+        &[],
+        None,
+        &Regions::default(),
+        &AtomicBool::new(false),
+        None,
+    )
+    .unwrap();
+    let generation = Generation::write(&state, &baseline).unwrap();
+    let work = store.claim().unwrap();
+    store.commit(&generation, &work, &baseline).unwrap();
+    store
+        .ingest(
+            110,
+            [root.join("a/b/c"), root.join("a/bb")],
+            "Precise changes",
+        )
+        .unwrap();
+    store
+        .ingest(120, [root.clone()], "Broad filesystem notification")
+        .unwrap();
+    store
+        .ingest(130, [root.join("a/b")], "Directory changed")
+        .unwrap();
+    assert_eq!(
+        store.work().unwrap().paths,
+        vec![root.join("a/b"), root.join("a/bb")]
+    );
+    assert!(store.verification().unwrap().is_some());
+    assert!(!store.claim().unwrap().full);
+    store
+        .defer_active("Shared files require broader verification")
+        .unwrap();
+    assert_eq!(
+        store.work().unwrap().paths,
+        vec![root.join("a/b"), root.join("a/bb")]
+    );
+    assert_eq!(
+        store.generation().unwrap().unwrap().digest,
+        generation.digest
+    );
+}
+
+#[test]
+fn large_pending_queue_keeps_precise_scopes_instead_of_collapsing_to_root() {
+    let (_temp, root, state) = fixture();
+    let mut store = Store::open(&state).unwrap();
+    store.bind(&root, &identity(), 100).unwrap();
+    store.claim().unwrap();
+    // More than the old one-MiB intake limit. Paths need not exist yet: a
+    // deletion notification is also durable work.
+    let suffix = format!("{}/{}", "x".repeat(240), "y".repeat(240));
+    let paths: Vec<_> = (0..2200)
+        .map(|n| root.join(format!("scope-{n:04}/{suffix}")))
+        .collect();
+    store.ingest(200, paths.clone(), "Large batch").unwrap();
+    // The active baseline still exists; finish it to inspect only the intake.
+    let baseline = measure(
+        &root,
+        &[],
+        None,
+        &Regions::default(),
+        &AtomicBool::new(false),
+        None,
+    )
+    .unwrap();
+    let generation = Generation::write(&state, &baseline).unwrap();
+    let active = store
+        .get::<Option<mactrim_rs::store::Work>>("active")
+        .unwrap()
+        .flatten()
+        .unwrap();
+    store.commit(&generation, &active, &baseline).unwrap();
+    assert_eq!(store.pending_count().unwrap(), paths.len());
+    assert_eq!(store.work().unwrap().paths, paths);
+}
+
+#[test]
+fn incremental_worker_refuses_hidden_full_hardlink_fallback() {
+    let (_temp, root, _state) = fixture();
+    fs::hard_link(
+        root.join("node_modules/a/deep/blob"),
+        root.join("same-file"),
+    )
+    .unwrap();
+    let cancel = AtomicBool::new(false);
+    let baseline = measure(&root, &[], None, &Regions::default(), &cancel, None).unwrap();
+    let failure = mactrim_rs::scan::measure_with_options(
+        &root,
+        &[],
+        Some(&baseline),
+        &[root.join("node_modules")].into_iter().collect(),
+        &cancel,
+        None,
+        mactrim_rs::scan::Options {
+            budget: None,
+            allow_full: false,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        failure.is::<mactrim_rs::scan::NeedsFullReconciliation>(),
+        "{failure:#}"
+    );
+    let unchanged = mactrim_rs::scan::measure_with_options(
+        &root,
+        &[],
+        Some(&baseline),
+        &Regions::default(),
+        &cancel,
+        None,
+        mactrim_rs::scan::Options {
+            budget: None,
+            allow_full: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(baseline.root_node().unwrap().entries, unchanged.reused);
+    assert_eq!(unchanged.visited, 0);
+}
+
+#[test]
+fn cancelled_checkpoint_never_leaves_a_published_partial_tree() {
+    let (_temp, root, state) = fixture();
+    let baseline = measure(
+        &root,
+        &[],
+        None,
+        &Regions::default(),
+        &AtomicBool::new(false),
+        None,
+    )
+    .unwrap();
+    let _store = Store::open(&state).unwrap();
+    let before: std::collections::BTreeSet<_> = fs::read_dir(&state)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    let failure = Generation::update_controlled(
+        &state,
+        &baseline,
+        None,
+        Some(&mactrim_rs::budget::Budget::new(100)),
+        &AtomicBool::new(true),
+    )
+    .unwrap_err();
+    assert!(failure.is::<mactrim_rs::scan::Cancelled>());
+    let after: std::collections::BTreeSet<_> = fs::read_dir(&state)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(before, after);
+}
+
+#[test]
+fn history_change_during_first_baseline_does_not_queue_a_second_baseline() {
+    let (_temp, root, state) = fixture();
+    let mut store = Store::open(&state).unwrap();
+    store.bind(&root, &identity(), 100).unwrap();
+    let active = store.claim().unwrap();
+    let mut changed = identity();
+    changed.uuid = "replacement".into();
+    store.bind(&root, &changed, 30).unwrap();
+    let measured = measure(
+        &root,
+        &[],
+        None,
+        &Regions::default(),
+        &AtomicBool::new(false),
+        None,
+    )
+    .unwrap();
+    let generation = Generation::write(&state, &measured).unwrap();
+    store.commit(&generation, &active, &measured).unwrap();
+    assert!(store.work().unwrap().paths.is_empty());
+    assert_eq!(store.applied().unwrap(), 0);
+    assert!(store.verification().unwrap().is_some());
+    assert_eq!(store.load().unwrap().unwrap().nodes, measured.nodes);
+}
+
+#[test]
+fn upgrade_defers_old_automatic_root_work_without_losing_precise_changes() {
+    let (_temp, root, state) = fixture();
+    let mut store = Store::open(&state).unwrap();
+    store.bind(&root, &identity(), 100).unwrap();
+    let work = store.claim().unwrap();
+    let baseline = measure(
+        &root,
+        &[],
+        None,
+        &Regions::default(),
+        &AtomicBool::new(false),
+        None,
+    )
+    .unwrap();
+    let generation = Generation::write(&state, &baseline).unwrap();
+    store.commit(&generation, &work, &baseline).unwrap();
+    let mut legacy = serde_json::to_value(work).unwrap();
+    let object = legacy.as_object_mut().unwrap();
+    object.remove("full");
+    object.remove("verification_revision");
+    object.insert("reason".into(), "Filesystem changes".into());
+    // Reproduce a ticket written by the previous installed version.
+    let db = rusqlite::Connection::open(state.join("service.sqlite3")).unwrap();
+    db.execute(
+        "INSERT OR REPLACE INTO meta VALUES('active', ?)",
+        [serde_json::to_string(&legacy).unwrap()],
+    )
+    .unwrap();
+    drop(db);
+    store
+        .ingest(110, [root.join("precise-change")], "New change")
+        .unwrap();
+    store.defer_legacy_root_work().unwrap();
+    assert_eq!(
+        store.work().unwrap().paths,
+        vec![root.join("precise-change")]
+    );
+    assert!(
+        store
+            .get::<Option<mactrim_rs::store::Work>>("active")
+            .unwrap()
+            .flatten()
+            .is_none()
+    );
+    assert!(
+        store
+            .get::<Option<String>>("finish_then_idle")
+            .unwrap()
+            .flatten()
+            .is_some()
+    );
+    assert_eq!(
+        store.generation().unwrap().unwrap().digest,
+        generation.digest
+    );
 }

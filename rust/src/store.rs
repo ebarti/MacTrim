@@ -12,7 +12,7 @@ use std::{
     io::{BufRead, BufReader, BufWriter, Read, Write},
     os::unix::{
         ffi::{OsStrExt, OsStringExt},
-        fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
+        fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     },
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -119,17 +119,29 @@ struct DeltaRow {
 
 impl Generation {
     pub fn write(state: &Path, index: &Index) -> Result<Self> {
+        Self::write_controlled(
+            state,
+            index,
+            None,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+    }
+    fn write_controlled(
+        state: &Path,
+        index: &Index,
+        budget: Option<&crate::budget::Budget>,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Self> {
         ensure!(
             !index.nodes.is_empty() && index.root_node().is_some(),
             "Refusing an empty directory tree"
         );
         let name = format!("tree-{}.gz", uuid::Uuid::new_v4());
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(state.join(&name))?;
+        let pending = tempfile::NamedTempFile::new_in(state)?;
+        pending
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        let file = pending.reopen()?;
         let mut encoded = GzEncoder::new(BufWriter::new(file), Compression::fast());
         let created = now();
         serde_json::to_writer(
@@ -144,6 +156,7 @@ impl Generation {
         encoded.write_all(b"\n")?;
         let mut ordinals: HashMap<&Path, usize> = HashMap::with_capacity(index.nodes.len());
         for (ordinal, (path, node)) in index.nodes.iter().enumerate() {
+            crate::scan::checkpoint(cancel, budget)?;
             let parent = if path == &index.root {
                 -1
             } else {
@@ -170,17 +183,24 @@ impl Generation {
         let mut output = encoded.finish()?;
         output.flush()?;
         output.get_ref().sync_all()?;
-        File::open(state)?.sync_all()?;
-        let mut input = private_file(&state.join(&name), false)?;
+        drop(output);
+        let mut input = pending.reopen()?;
         let mut hash = Sha256::new();
         let mut buffer = [0u8; 65536];
         loop {
+            crate::scan::checkpoint(cancel, budget)?;
             let n = input.read(&mut buffer)?;
             if n == 0 {
                 break;
             }
             hash.update(&buffer[..n]);
         }
+        drop(input);
+        crate::scan::checkpoint(cancel, budget)?;
+        pending
+            .persist_noclobber(state.join(&name))
+            .map_err(|e| e.error)?;
+        File::open(state)?.sync_all()?;
         Ok(Self {
             name,
             digest: format!("{:x}", hash.finalize()),
@@ -193,8 +213,23 @@ impl Generation {
         })
     }
     pub fn update(state: &Path, index: &Index, previous: Option<(&Self, &Index)>) -> Result<Self> {
+        Self::update_controlled(
+            state,
+            index,
+            previous,
+            None,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+    }
+    pub fn update_controlled(
+        state: &Path,
+        index: &Index,
+        previous: Option<(&Self, &Index)>,
+        budget: Option<&crate::budget::Budget>,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Self> {
         let Some((generation, old)) = previous.filter(|_| !index.full_scan) else {
-            return Self::write(state, index);
+            return Self::write_controlled(state, index, budget, cancel);
         };
         let mut encoded = GzEncoder::new(Vec::new(), Compression::fast());
         serde_json::to_writer(
@@ -208,6 +243,7 @@ impl Generation {
         )?;
         encoded.write_all(b"\n")?;
         for delta in old.nodes.diff(&index.nodes) {
+            crate::scan::checkpoint(cancel, budget)?;
             let (path, node) = match delta {
                 im::ordmap::DiffItem::Add(p, n)
                 | im::ordmap::DiffItem::Update { new: (p, n), .. } => (p, Some(n.clone())),
@@ -233,7 +269,7 @@ impl Generation {
             .saturating_add(compressed.len() as u64)
             >= base_bytes
         {
-            return Self::write(state, index);
+            return Self::write_controlled(state, index, budget, cancel);
         }
         let mut result = generation.clone();
         result.patches += 1;
@@ -336,6 +372,10 @@ fn valid_generation_name(name: &str) -> bool {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Work {
+    #[serde(default)]
+    pub full: bool,
+    #[serde(default)]
+    pub verification_revision: u64,
     pub revision: u64,
     pub cursor: u64,
     #[serde(with = "crate::paths::list")]
@@ -399,7 +439,14 @@ impl Store {
             );
         }
         let old: Option<Identity> = self.get("identity")?;
-        let changed = old.as_ref() != Some(identity);
+        let changed = old
+            .as_ref()
+            .is_none_or(|old| !old.same_filesystem(identity) || old.uuid != identity.uuid);
+        let same_filesystem = old
+            .as_ref()
+            .is_some_and(|old| old.same_filesystem(identity));
+        let has_generation = self.generation()?.is_some();
+        let has_active = self.get::<Option<Work>>("active")?.flatten().is_some();
         let cursor: u64 = self.get("cursor")?.unwrap_or(checkpoint);
         let tx = self.db.transaction()?;
         set(&tx, "root", &bytes(root))?;
@@ -407,21 +454,120 @@ impl Store {
         if changed || cursor > checkpoint {
             set(&tx, "cursor", &checkpoint)?;
             set(&tx, "applied", &0u64)?;
-            set(&tx, "active", &Option::<Work>::None)?;
             let revision = meta_u64(&tx, "revision")? + 1;
             set(&tx, "revision", &revision)?;
+            if old.is_some() {
+                verification(
+                    &tx,
+                    "Filesystem history changed; finish current work then idle",
+                    revision,
+                )?;
+                set(&tx, "finish_then_idle", &Some("Filesystem history changed"))?;
+            }
+            if !same_filesystem {
+                set(&tx, "active", &Option::<Work>::None)?;
+                tx.execute("DELETE FROM pending", [])?;
+            }
+            if !has_generation && !has_active {
+                tx.execute(
+                    "INSERT OR REPLACE INTO pending VALUES(?,?,?)",
+                    params![bytes(root), sql_int(revision)?, "Initial baseline"],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(changed || cursor > checkpoint)
+    }
+    pub fn policy(&self) -> Result<ScanPolicy> {
+        let policy = self.get::<ScanPolicy>("scan_policy")?.unwrap_or_default();
+        policy.validate()?;
+        Ok(policy)
+    }
+    pub fn set_policy(&mut self, policy: &ScanPolicy) -> Result<()> {
+        policy.validate()?;
+        let tx = self.db.transaction()?;
+        set(&tx, "scan_policy", policy)?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn verification(&self) -> Result<Option<Verification>> {
+        self.get("verification")
+    }
+    pub fn hold_after_scan(&mut self, reason: &str) -> Result<()> {
+        let tx = self.db.transaction()?;
+        let revision = meta_u64(&tx, "revision")? + 1;
+        set(&tx, "revision", &revision)?;
+        verification(&tx, reason, revision)?;
+        set(&tx, "finish_then_idle", &Some(reason))?;
+        set(&tx, "applied", &0u64)?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn resume(&mut self, full: bool) -> Result<()> {
+        let root = from_bytes(self.get("root")?.context("Unbound service state")?);
+        let tx = self.db.transaction()?;
+        set(&tx, "paused", &false)?;
+        set(&tx, "finish_then_idle", &Option::<String>::None)?;
+        if full {
+            let revision = meta_u64(&tx, "revision")? + 1;
+            set(&tx, "revision", &revision)?;
+            set(&tx, "full_requested", &true)?;
             tx.execute("DELETE FROM pending", [])?;
             tx.execute(
                 "INSERT INTO pending VALUES(?,?,?)",
-                params![
-                    bytes(root),
-                    sql_int(revision)?,
-                    "Initial baseline or changed volume history; full reconciliation"
-                ],
+                params![bytes(&root), sql_int(revision)?, "Explicit full rescan"],
             )?;
         }
         tx.commit()?;
-        Ok(changed)
+        Ok(())
+    }
+    pub fn defer_active(&mut self, reason: &str) -> Result<()> {
+        self.hold_after_scan(reason)?;
+        let active = self.get::<Option<Work>>("active")?.flatten();
+        if let Some(active) = active {
+            self.ingest(self.cursor()?, active.paths, reason)?;
+        }
+        let tx = self.db.transaction()?;
+        set(&tx, "active", &Option::<Work>::None)?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn defer_legacy_root_work(&mut self) -> Result<()> {
+        if self.generation()?.is_none() || self.get::<bool>("full_requested")?.unwrap_or(false) {
+            return Ok(());
+        }
+        let root = from_bytes(self.get("root")?.context("Unbound service state")?);
+        let active = self.get::<Option<Work>>("active")?.flatten();
+        let legacy_active = active.as_ref().is_some_and(|w| {
+            !w.full && w.reason != "Explicit full rescan" && w.paths.contains(&root)
+        });
+        let queued: bool = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pending WHERE path=?)",
+            [bytes(&root)],
+            |r| r.get(0),
+        )?;
+        if legacy_active || queued {
+            self.hold_after_scan(
+                "Earlier broad reconciliation deferred; use Full rescan explicitly",
+            )?;
+            let tx = self.db.transaction()?;
+            if legacy_active {
+                set(&tx, "active", &Option::<Work>::None)?;
+            }
+            tx.execute("DELETE FROM pending WHERE path=?", [bytes(&root)])?;
+            tx.commit()?;
+        }
+        Ok(())
+    }
+    pub fn pending_count(&self) -> Result<usize> {
+        let count: i64 = self
+            .db
+            .query_row("SELECT COUNT(*) FROM pending", [], |r| r.get(0))?;
+        Ok(usize::try_from(count)?
+            + self
+                .get::<Option<Work>>("active")?
+                .flatten()
+                .map_or(0, |w| w.paths.len()))
     }
     pub fn generation(&self) -> Result<Option<Generation>> {
         self.get("generation")
@@ -592,6 +738,7 @@ impl Store {
         reason: &str,
     ) -> Result<()> {
         let root = from_bytes(self.get("root")?.context("Unbound service state")?);
+        let has_generation = self.generation()?.is_some();
         let tx = self.db.transaction()?;
         let previous_cursor = meta_u64(&tx, "cursor")?;
         ensure!(
@@ -599,16 +746,6 @@ impl Store {
             "Refusing a backwards event cursor"
         );
         let revision = meta_u64(&tx, "revision")? + 1;
-        let mut pending: BTreeMap<PathBuf, (u64, String)> = {
-            let mut stmt = tx.prepare("SELECT path,revision,reason FROM pending")?;
-            let rows = stmt.query_map([], |r| {
-                Ok((
-                    from_bytes(r.get(0)?),
-                    (r.get::<_, i64>(1)? as u64, r.get(2)?),
-                ))
-            })?;
-            rows.collect::<Result<_, _>>()?
-        };
         for path in paths {
             ensure!(
                 path.is_absolute()
@@ -618,40 +755,44 @@ impl Store {
                         .any(|c| c == std::path::Component::ParentDir),
                 "Invalid dirty path"
             );
-            if let Some(ancestor) = path
-                .ancestors()
-                .find(|p| pending.contains_key(*p))
-                .map(Path::to_owned)
-            {
-                pending.insert(ancestor, (revision, reason.into()));
-            } else {
-                let descendants: Vec<_> = pending
-                    .range(path.clone()..)
-                    .take_while(|(p, _)| p.starts_with(&path))
-                    .map(|(p, _)| p.clone())
-                    .collect();
-                for p in descendants {
-                    pending.remove(&p);
-                }
-                pending.insert(path, (revision, reason.into()));
+            let path: PathBuf = path.components().collect();
+            // Root uncertainty is durable metadata, never an automatic root walk.
+            if path == root && has_generation {
+                verification(&tx, reason, revision)?;
+                continue;
             }
-        }
-        // This bounds only the invalidation queue. Coarsening preserves every
-        // affected path by invalidating the root, never by dropping an entry.
-        if pending.keys().map(|p| bytes(p).len() + 96).sum::<usize>() > 1024 * 1024 {
-            pending = BTreeMap::from([(
-                root,
-                (
-                    revision,
-                    "Pending regions coarsened; full reconciliation".into(),
-                ),
-            )]);
-        }
-        tx.execute("DELETE FROM pending", [])?;
-        {
-            let mut stmt = tx.prepare("INSERT INTO pending VALUES(?,?,?)")?;
-            for (p, (rev, why)) in pending {
-                stmt.execute(params![bytes(&p), sql_int(rev)?, why])?;
+            let mut ancestor = None;
+            for parent in path.ancestors() {
+                let exists: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pending WHERE path=?)",
+                    [bytes(parent)],
+                    |r| r.get(0),
+                )?;
+                if exists {
+                    ancestor = Some(parent);
+                    break;
+                }
+            }
+            if let Some(ancestor) = ancestor {
+                tx.execute(
+                    "UPDATE pending SET revision=?,reason=? WHERE path=?",
+                    params![sql_int(revision)?, reason, bytes(ancestor)],
+                )?;
+            } else {
+                let mut prefix = bytes(&path).to_vec();
+                if !prefix.ends_with(b"/") {
+                    prefix.push(b'/');
+                }
+                let mut upper = prefix.clone();
+                *upper.last_mut().unwrap() += 1;
+                tx.execute(
+                    "DELETE FROM pending WHERE path>=? AND path<?",
+                    params![prefix, upper],
+                )?;
+                tx.execute(
+                    "INSERT INTO pending VALUES(?,?,?)",
+                    params![bytes(&path), sql_int(revision)?, reason],
+                )?;
             }
         }
         set(&tx, "cursor", &cursor)?;
@@ -673,7 +814,10 @@ impl Store {
                 reason = why;
             }
         }
+        let mut full =
+            self.generation()?.is_none() || self.get::<bool>("full_requested")?.unwrap_or(false);
         if let Some(active) = self.get::<Option<Work>>("active")?.flatten() {
+            full |= active.full || active.reason == "Explicit full rescan";
             paths.extend(active.paths);
             if reason.is_empty() {
                 reason = active.reason;
@@ -681,6 +825,8 @@ impl Store {
         }
         let paths: Regions = paths.into_iter().collect();
         Ok(Work {
+            full,
+            verification_revision: self.verification()?.map_or(0, |v| v.revision),
             revision: self.get("revision")?.unwrap_or(0),
             cursor: self.cursor()?,
             paths: paths.paths().cloned().collect(),
@@ -695,6 +841,7 @@ impl Store {
         let work = self.work()?;
         let tx = self.db.transaction()?;
         set(&tx, "active", &work)?;
+        set(&tx, "full_requested", &false)?;
         tx.execute("DELETE FROM pending", [])?;
         tx.commit()?;
         Ok(work)
@@ -709,10 +856,20 @@ impl Store {
         index: &Index,
         changes: &[crate::history::Change],
     ) -> Result<()> {
+        let current_identity: Identity =
+            self.get("identity")?.context("Missing volume identity")?;
         ensure!(
-            self.get::<Identity>("identity")?.as_ref() == Some(&work.identity),
-            "Volume identity changed while measuring; candidate not committed"
+            current_identity.same_filesystem(&work.identity),
+            "Filesystem changed while measuring; candidate not committed"
         );
+        let same_epoch = current_identity == work.identity;
+        let verification = self.verification()?;
+        let completes_verification = work.full
+            && same_epoch
+            && verification
+                .as_ref()
+                .is_none_or(|v| v.revision <= work.verification_revision);
+        let complete_history = completes_verification || (same_epoch && verification.is_none());
         ensure!(
             generation.directories == index.nodes.len(),
             "Generation does not match candidate"
@@ -744,7 +901,13 @@ impl Store {
             tx.execute("DELETE FROM tree_deltas", [])?;
         }
         set(&tx, "generation", generation)?;
-        set(&tx, "applied", &work.cursor)?;
+        if complete_history {
+            set(&tx, "applied", &work.cursor)?;
+        }
+        if completes_verification {
+            tx.execute("DELETE FROM meta WHERE key='verification'", [])?;
+            set(&tx, "full_at", &generation.created)?;
+        }
         set(&tx, "active", &Option::<Work>::None)?;
         {
             let unsettled: Regions = {
@@ -754,7 +917,21 @@ impl Store {
             };
             let mut statement=tx.prepare("INSERT INTO directory_history VALUES(?,?,?,?,?) ON CONFLICT(bucket,path) DO UPDATE SET after_json=excluded.after_json,at=excluded.at")?;
             for change in changes {
+                let mut before = change.before.clone();
                 let mut after = change.after.clone();
+                if verification.is_some()
+                    && let Some(counts) = before.as_mut()
+                {
+                    counts.complete = false;
+                }
+                if !complete_history {
+                    if let Some(counts) = before.as_mut() {
+                        counts.complete = false;
+                    }
+                    if let Some(counts) = after.as_mut() {
+                        counts.complete = false;
+                    }
+                }
                 if unsettled.intersects(&change.path)
                     && let Some(counts) = after.as_mut()
                 {
@@ -763,7 +940,7 @@ impl Store {
                 statement.execute(params![
                     sql_int(change.at / 3600)?,
                     bytes(&change.path),
-                    serde_json::to_string(&change.before)?,
+                    serde_json::to_string(&before)?,
                     serde_json::to_string(&after)?,
                     sql_int(change.at)?
                 ])?;
@@ -792,7 +969,11 @@ impl Store {
                         sql_int(generation.created)?,
                         sql_int(n.logical)?,
                         sql_int(n.allocated)?,
-                        n.status
+                        if complete_history {
+                            n.status
+                        } else {
+                            n.status.max(2)
+                        }
                     ],
                 )?;
                 tx.execute(
@@ -971,6 +1152,18 @@ impl Store {
         }
         Ok(())
     }
+}
+
+fn verification(tx: &rusqlite::Transaction<'_>, reason: &str, revision: u64) -> Result<()> {
+    set(
+        tx,
+        "verification",
+        &Verification {
+            reason: reason.into(),
+            requested_at: now(),
+            revision,
+        },
+    )
 }
 
 fn set<T: Serialize + ?Sized>(tx: &rusqlite::Transaction<'_>, key: &str, value: &T) -> Result<()> {
