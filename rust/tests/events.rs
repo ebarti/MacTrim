@@ -138,6 +138,34 @@ fn filesystem_identity_is_independent_of_journal_identity() {
     assert!(old.same_filesystem(&new));
 }
 
+#[test]
+fn broad_root_notification_does_not_swallow_precise_file_changes() {
+    let c = changes(
+        Batch {
+            events: vec![
+                Event {
+                    path: "Users/test".into(),
+                    flags: MUST_SCAN,
+                    id: 120,
+                },
+                Event {
+                    path: "Users/test/project/data".into(),
+                    flags: ITEM_IS_FILE | 0x1000,
+                    id: 121,
+                },
+            ],
+        },
+        Path::new("/Users/test"),
+        &id(),
+        Path::new("/state"),
+        100,
+    );
+    assert_eq!(
+        c.paths,
+        vec![Path::new("/Users/test"), Path::new("/Users/test/project")]
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn firmlink_device_scope_uses_volume_relative_paths() {

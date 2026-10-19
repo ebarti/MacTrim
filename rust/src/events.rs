@@ -52,6 +52,14 @@ pub fn changes(
     cursor: u64,
 ) -> Changes {
     let mut regions = Regions::default();
+    let mut broad_root = false;
+    let mut invalidate = |path: PathBuf| {
+        if path == root {
+            broad_root = true;
+        } else {
+            regions.insert(path);
+        }
+    };
     let mut latest = cursor;
     let mut gap = 0;
     let mut history_done = false;
@@ -78,7 +86,7 @@ pub fn changes(
         }
         if !path.starts_with(root) {
             if event.flags & (64 | 128) != 0 && root.starts_with(&path) {
-                regions.insert(root.to_owned());
+                invalidate(root.to_owned());
             } else if event.flags & (64 | 128) == 0 {
                 gap |= ROOT_CHANGED;
             }
@@ -86,19 +94,25 @@ pub fn changes(
         }
         if event.flags & ITEM_IS_FILE != 0 {
             if let Some(parent) = path.parent().filter(|p| p.starts_with(root)) {
-                regions.insert(parent.to_owned());
+                invalidate(parent.to_owned());
             }
         } else {
-            regions.insert(path.clone());
+            invalidate(path.clone());
         }
         if event.flags & (0x100 | 0x200 | 0x800 | 64 | 128) != 0
             && let Some(p) = path.parent().filter(|p| p.starts_with(root))
         {
-            regions.insert(p.to_owned());
+            invalidate(p.to_owned());
         }
     }
+    // Keep broad uncertainty alongside precise hints, through to durable
+    // ingestion. A root row in this antichain would swallow the precise rows.
+    let mut paths: Vec<_> = regions.paths().cloned().collect();
+    if broad_root {
+        paths.insert(0, root.to_owned());
+    }
     Changes {
-        paths: regions.paths().cloned().collect(),
+        paths,
         latest,
         gap,
         history_done,
