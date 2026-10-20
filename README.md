@@ -95,9 +95,10 @@ transaction publishes it in `scans.sqlite3`. Cancellation, termination or a fail
 candidate cannot replace earlier completed scans. A force-killed pass may leave
 an unreferenced temporary file, but it cannot publish a half-written scan.
 
-The previous Rust service was stopped and its login registration removed during
-this migration. Its last saved directory index is imported once as a labeled
-legacy scan. Original service database, history, generations and cleanup data are
+When upgrading a login service installation, stop and uninstall it with the
+previous executable before replacing it. The terminal-only binary cannot start
+or reinstall that service. Its last saved directory index is imported once as a
+labeled legacy scan. Original service database, history, generations and cleanup data are
 preserved. Unreadable legacy data stays intact with an import warning. Old hourly
 history remains in its original database; it is not relabeled as full scans.
 

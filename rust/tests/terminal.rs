@@ -136,17 +136,34 @@ fn actual_terminal_full_scans_save_compare_and_quit_without_background_work() {
     ] {
         writer.write_all(b"\t").unwrap();
         writer.flush().unwrap();
-        let screen = wait_screen(&parser, |s| s.contains(marker));
+        let mut screen = wait_screen(&parser, |s| s.contains(marker));
         if marker == "Saved comparison" {
+            let pair = |s: &str, from: u64, to: u64| {
+                s.lines().any(|l| {
+                    l.contains(&format!("Saved comparison #{from} "))
+                        && l.contains(&format!("→ #{to} "))
+                })
+            };
+            wait_screen(&parser, |s| {
+                pair(s, 1, 2) && s.contains(&root.join("b").to_string_lossy().to_string())
+            });
             writer.write_all(b"s").unwrap();
             writer.flush().unwrap();
             wait_screen(&parser, |s| {
-                s.contains("Compare saved scans") && s.contains("Available:")
+                s.contains("Compare saved scans") && s.contains("#1") && s.contains("#2")
             });
-            writer.write_all(b"1 2\r").unwrap();
+            writer.write_all(b"2 1\r").unwrap();
             writer.flush().unwrap();
             wait_screen(&parser, |s| {
-                s.contains("Saved comparison") && !s.contains("Compare saved scans")
+                pair(s, 2, 1) && !s.contains("Compare saved scans")
+            });
+            writer.write_all(b"s").unwrap();
+            writer.flush().unwrap();
+            wait_screen(&parser, |s| s.contains("Compare saved scans"));
+            writer.write_all(b"\r").unwrap();
+            writer.flush().unwrap();
+            screen = wait_screen(&parser, |s| {
+                pair(s, 1, 2) && !s.contains("Compare saved scans")
             });
         }
         evidence.push_str(&screen);

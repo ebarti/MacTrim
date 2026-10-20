@@ -180,12 +180,17 @@ fn print_snapshot(snapshot: &Snapshot) {
         size(snapshot.allocated),
         size(snapshot.logical)
     );
-    println!(
-        "Full traversal: {} entries visited; {} directory aggregates saved",
-        snapshot.visited, snapshot.directories
-    );
     if snapshot.imported {
+        println!(
+            "Imported index: {} directory aggregates; {} recorded entries",
+            snapshot.directories, snapshot.visited
+        );
         println!("Imported from the previous saved index; original data preserved.");
+    } else {
+        println!(
+            "Full traversal: {} entries visited; {} directory aggregates saved",
+            snapshot.visited, snapshot.directories
+        );
     }
     if snapshot.coverage != 0 {
         println!(
