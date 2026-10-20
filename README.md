@@ -1,221 +1,125 @@
 # MacTrim
 
-A native Rust storage explorer, change-tracking service and reviewed cleanup tool
-for macOS. The terminal UI uses Ratatui and Crossterm. The executable includes its
-runtime and SQLite; running it does not require Python, Cargo or an interpreter.
+A native Rust terminal app for exploring disk usage, comparing completed scans,
+and reviewing cleanup actions. MacTrim runs only while its terminal command is
+open. It does not run a daemon, install a login service, subscribe to filesystem
+notifications, or read an event journal.
 
 ## Build and run
-
-Build from source with the pinned Rust toolchain:
 
 ```sh
 ./scripts/build-binary
 ./dist/mactrim storage /
 ```
 
-`./mactrim-launch` builds the binary if it is missing and then runs it. With no
-arguments, MacTrim opens Storage at `/`. A noninteractive invocation can use
-`storage / --json`; this starts or connects to the service and returns its current
-status. It does not wait for a complete first scan.
+`./mactrim-launch` builds a missing binary and then runs it. With no arguments,
+MacTrim opens Storage at `/`. The signed executable includes Rust and SQLite;
+Python, Cargo and an interpreter are not needed to run the packaged app.
+`build-info` reports the compiled source revision and executable checksum.
 
-The client starts a detached, per-user storage service on first use. **`q` closes
-only the UI. The service continues scanning and automatically saves each
-completed measurement.** Reopening connects to that same process and saved tree.
-The default state directory is:
-
-```text
-~/Library/Application Support/MacTrimRust
-```
-
-Use a separate `--state /absolute/path` for a different root or a disposable
-trial. State must be private to the current user. The Rust implementation uses a
-new format; the previous application's personal state is preserved and is not
-imported. A new Rust baseline is necessary once.
+Opening Storage starts **one full scan** of its chosen root. **r** starts another
+full scan after the current one finishes. Every pass inspects metadata throughout
+the accessible scope, including dependency folders and directories deeper than
+eight levels. Previous measurements are used for browsing and comparison, never
+to skip files in a new pass. An edit outside MacTrim does not trigger any work.
 
 ```sh
-./dist/mactrim --state /absolute/trial/state storage /absolute/trial/files
-./dist/mactrim status
-./dist/mactrim doctor /
-./dist/mactrim build-info
+mactrim storage /               # interactive app, new full scan
+mactrim scan /                 # full scan, save, print result, exit
+mactrim refresh /              # another full scan, save, exit
+mactrim status                 # latest saved result, no scanning
+mactrim snapshots              # all saved scan IDs
+mactrim history /              # compare the latest two scans of this root
+mactrim history / --from 2 --to 5
+mactrim list /Users --scan 5
+mactrim doctor /
 ```
 
-`build-info` reports the executable checksum and, for packaged builds, the source
-revision and source checksum. `dist/build.json` records the packaged artifact.
+Command responses are readable text by default. Add **--json** for structured
+output. `storage / --json` runs a complete scan and returns its saved result;
+it does not detach or return a background job. `build-info` and cleanup's detailed
+plan/journal commands retain their structured output.
 
-## Storage and navigation
+The default state is `~/Library/Application Support/MacTrimRust`. Supply
+`--state /absolute/private/path` for a disposable trial. One terminal scan can
+write a state directory at a time; other commands may read its completed scans.
+No service start, install, restart, pause or event-refresh commands are available.
 
-- **Enter / Right** opens a directory; **Left** goes to its parent; **g** returns
-  to the service root. Browsing does not replace or cancel a background scan.
-- **r** refreshes using journal changes and retries inaccessible scopes. **R**
-  asks for confirmation before a full rescan. A full scan is also necessary when
-  the saved event history cannot establish continuity or shared-file accounting
-  requires it. The UI shows the current phase rather than silently resetting.
-- **m** switches allocated/logical size. **[ / ]** changes presentation pages.
-  Ranking happens across all immediate children before paging. Selection follows
-  a path when incoming sizes reorder rows, including across page boundaries.
-- **Ctrl+X** opens a **Y/N** pause confirmation. **Esc alone never cancels a scan.**
-  A pause survives a service restart; Refresh resumes pending measurement.
-  If filesystem history changes, an active scan finishes and saves, then
-  measurement stays idle. An idle service stays idle. The receiver continues
-  collecting changes; Refresh explicitly resumes measurement. A cancelled worker
-  finishing after Refresh cannot undo the resume. `status` records the latest
-  interruption reason and time across restarts; actual measurement or save
-  failures remain errors.
-- **Tab / F1–F4** switches Storage, Cleanup, History/Growth and Quarantine/Recovery.
+## Terminal controls
 
-Sizes include accessible descendants at every depth. Dependency folders such as
-`node_modules`, `.venv`, `venv`, `.tox`, `.nox` and `__pypackages__`, and directories
-beyond eight browsing levels, retain recursive totals while their internal
-browsing rows are loaded on demand. Opening one requests separate detail;
-measurement of the global tree retains its original scope and progress.
+- **q** exits. During a scan, it asks **Y/N** before stopping work and exiting.
+  Completed scans remain saved. An unfinished pass is discarded.
+- **r** starts a new full pass. Pressing it while a scan runs keeps that pass.
+  **R** also offers a confirmation before requesting a full pass.
+- **Ctrl+X** asks **Y/N** before cancelling the active pass. Cancellation stays
+  idle until another explicit scan request. **Esc alone never cancels.**
+- **Enter / Right** opens a directory, **Left** goes up, and **g** returns to the
+  chosen root. Navigation never cancels, replaces or starts a scan.
+- **m** switches logical/allocated size. **[ / ]** changes presentation pages.
+  Selection follows the same path when incoming rows reorder.
+- **Tab / F1–F4** switches Storage, Cleanup, History/Growth and Quarantine.
+- In **History**, **s** chooses two saved scan IDs. Empty input selects the latest
+  pair. Both endpoint IDs and times appear in the comparison title.
 
-There is no constant-time API that supplies an arbitrary directory's recursive
-size. The first baseline must inspect descendant metadata, as `du` does. File
-contents are not read. Initial totals are observed lower bounds until the
-corresponding measurement finishes. Previously saved totals remain available
-while changed regions are measured.
+While a new scan runs, an earlier saved tree remains available and is labeled
+as the previous scan. On a first scan, observed bytes are lower bounds until the
+corresponding directories finish. Immediate file rows are read on navigation;
+the saved measurements and comparisons retain directory aggregates, not a record
+for every ordinary file. File-row metadata is not historical file inventory.
 
-`MEASURED` means measurement completed for that scope; `LAZY` means its recursive
-size is measured and internal browsing detail is collapsed. `PARTIAL` or `DENIED`
-shows an actual coverage problem and its first failing path/error. `SKIPPED`
-identifies an excluded alias, special mount or policy boundary. A partial result
-is still saved and can be updated incrementally. A saved index is not a claim
-that macOS permitted every directory to be read.
+## Saved scans and comparisons
 
-Logical size is `st_size`; allocated size is `st_blocks × 512`. Regular hardlinks
-are counted once across a full measurement. Symlinks are not followed. Duplicate
-APFS Data aliases and unrelated mounted volumes are excluded from the `/` scope.
-Sparse files, APFS clones, compression, snapshots and shared-volume accounting
-mean directory allocation estimates need not equal physical filesystem usage.
-MacTrim displays filesystem capacity separately. It does not assert that their
-difference is removable data or that reclaiming an estimate will free that many
-physical bytes.
+Completed scans **auto-save**, including completed traversals with partial
+coverage. Each gets an independent ID, start/finish times, coverage, physical
+root identity, filesystem capacity and a compressed parent/name directory tree.
+Two scans in the same second remain separate. There is no fixed byte,
+directory-count or browsing-depth limit, and no automatic deletion of old scans.
+The app shows the actual allocated footprint of its saved data. It grows with
+the number and size of scans retained.
 
-## Event tracking, persistence and History
+History compares any two saved scans of the same root. It shows before/after
+allocated sizes and signed growth. Nested directory totals overlap and must not
+be summed. A newly added or removed directory has a known zero endpoint only
+when its parent was measured. Unreadable scopes, missing detail in an imported
+legacy tree, and a replaced root have **unknown growth**. A completed traversal
+can be `PARTIAL` or `DENIED`; its saved state does not claim access to those areas.
 
-The native receiver runs separately from traversal, file-list queries and the UI.
-It does no disk I/O inside the FSEvents callback. A durable received cursor records
-delivery progress alongside pending invalidated regions in SQLite. A separate
-applied cursor records measurement progress. When history is missing, a durable
-uncertainty marker prevents that delivery anchor from claiming verified totals.
+Physical filesystem used/available capacity is recorded with each completed
+scan and shown separately from directory allocation estimates. A scan measures
+a mutable filesystem over an interval, not an atomic point in time. Concurrent
+writers can produce partial observations. There is no event reconciliation or
+automatic retry loop; another scan requires an explicit request.
 
-Changes invalidate cached directory totals. They are not byte deltas. The service
-remeasures affected retained subtrees and updates their ancestors using persistent
-ordered maps from `im`. Unaffected map branches and their measurements are reused.
-It does not depend on directory modification timestamps to detect in-place file
-edits. Hardlinks or namespace changes can require a global reconciliation.
+A private compressed tree is flushed and checksummed before a synchronous SQLite
+transaction publishes it in `scans.sqlite3`. Cancellation, termination or a failed
+candidate cannot replace earlier completed scans. A force-killed pass may leave
+an unreferenced temporary file, but it cannot publish a half-written scan.
 
-Reported delivery gaps trigger replay from the durable checkpoint. A repeated
-gap or changed event-history UUID records uncertainty, preserves the active scan
-and its eventual saved result, and stops further measurement until Refresh. The
-receiver moves to a fresh delivery anchor without acknowledging the missing
-history. A physical filesystem replacement still interrupts a candidate that
-belongs to a different filesystem. Nonconsecutive event IDs alone are not drops.
+The previous Rust service was stopped and its login registration removed during
+this migration. Its last saved directory index is imported once as a labeled
+legacy scan. Original service database, history, generations and cleanup data are
+preserved. Unreadable legacy data stays intact with an import warning. Old hourly
+history remains in its original database; it is not relabeled as full scans.
 
-File notifications invalidate their containing directories. Pending regions are
-coalesced with indexed ancestor and descendant queries in SQLite; a large intake
-queue does not collapse into a root rescan. Broad uncertainty is stored separately
-from precise pending regions. An incremental update that needs global hardlink
-accounting is deferred, retaining its pending scopes and previous measurements.
-Only an explicit Full rescan (or the first baseline) may scan the entire scope.
-Periodic verification can be reported as due; it does not start a scan.
-**No filesystem notification API makes a mutable filesystem a perfect
-snapshot or guarantees that every possible omission can be detected.**
+## Measurement and access
 
-The saved index is a compressed directory tree with parent/name links, plus
-compressed changed-node deltas in SQLite. Deltas compact when their accumulated
-bytes reach the measured checkpoint size. There is no directory-count or byte
-ceiling that discards index records, and no stored inventory of ordinary files.
-A synchronous transaction commits replacement measurements, History changes and
-covered pending work together. An interrupted candidate cannot acknowledge newer
-changes. A service crash preserves the last committed tree and requeues unfinished
-work; it can repeat unfinished measurement, including an interrupted first
-baseline. Closing the UI does not cause that interruption.
+Sizes include accessible descendants at every depth. Logical size is `st_size`;
+allocated size is `st_blocks × 512`. Regular hardlinks count once across each
+full scan; sorted traversal stabilizes attribution. Symlinks are not followed.
+Special mounts, unrelated volumes, the duplicate APFS Data alias and MacTrim's
+own state are excluded. `SKIPPED` identifies these boundaries. Errors retain the
+first affected path and operating-system error.
 
-History also records actual filesystem used/available capacity as hourly
-observations, independently of directory permission coverage. Its chart uses time
-bins for display; the stored hourly series remains intact. This separates physical
-filesystem growth from directory allocation estimates.
+The first totals require descendant metadata inspection, as `du` does; there is
+no constant-time recursive directory-size query. Storage scans do not read file
+contents. APFS clones, sparse files, compression, snapshots and shared-volume
+accounting can make directory estimates differ from physical capacity. This
+difference does not identify removable data.
 
-History keeps changed directory aggregates, coalescing the first and latest
-observation per directory per hour for 60 days by default. Change the retention
-window with `mactrim service retention --days 180`. Older records are removed;
-SQLite can reuse their database pages. Unchanged trees are not copied
-into hourly snapshots. Collapsed folders have aggregate History; their individual
-files are not tracked. Nested rows overlap and must not be summed. An incomplete,
-newly observed or disappeared scope has **unknown growth**, rather than a guessed
-zero. History starts with the Rust baseline and cannot reconstruct earlier disk
-usage from the event log.
-
-```sh
-./dist/mactrim history /Users --days 30 --offset 0 --limit 200
-./dist/mactrim list /Users --offset 0 --limit 200
-./dist/mactrim refresh
-```
-
-The UI reports the actual allocated footprint of service metadata. It varies with
-the number of retained directories and the number of changed aggregates; there is
-no fixed per-Mac estimate. Cleanup plans have separate compressed inventories,
-and quarantine retains the user's selected data until Restore or approved Purge.
-
-## Optional service at login
-
-For launchd supervision and automatic startup at login, run explicitly:
-
-```sh
-./dist/mactrim service install /
-```
-
-This stages an ad-hoc signed `MacTrim Service.app` inside the state directory and
-installs the per-user LaunchAgent `io.github.ebarti.mactrim.storage`. Updates stage
-and sign a replacement before atomically exchanging the installed helper. The
-service uses low-priority I/O, restarts after an unexpected failure, and respects
-a successful explicit Stop. It exposes storage queries and tracking controls; it
-has no deletion API.
-
-```sh
-./dist/mactrim service pause       # retain pending work, stop measurement
-./dist/mactrim service policy --cpu-percent 10 # cooperative background work budget
-./dist/mactrim refresh             # resume and process changes
-./dist/mactrim service status      # also succeeds when stopped; same as mactrim status
-./dist/mactrim service stop        # wait for shutdown; succeeds if already stopped
-./dist/mactrim service start /     # start and replay offline changes
-./dist/mactrim service restart     # stop, wait, start; reuse the configured scan root
-./dist/mactrim service plist /     # inspect the generated XML without installing
-./dist/mactrim service uninstall   # remove login registration; keep all state/data
-```
-
-Service controls, `status` and `refresh` print readable text by default, including
-when output is redirected. Status shows the service PID, root, current activity,
-scan progress and whether an index has been saved. For scripts, request the
-complete JSON response explicitly with `mactrim service status --json` or
-`mactrim --json service status`. `storage --json` continues to return JSON;
-`service plist` intentionally prints the LaunchAgent XML.
-
-Traversal and saving use a cooperative work budget of 10% of one core by default.
-`service policy --cpu-percent N` persists a budget from 1 through 100; this paces
-the measurement worker, while the receiver and queries remain responsive. It is
-a duty-cycle limit, not a guarantee about instantaneous CPU usage or I/O latency.
-Reading an existing index at startup is separate from measurement pacing.
-
-Stop waits until the service releases its state writer lock, so `service stop &&
-service start /` can run without a manual delay. Restart preserves committed
-measurements and pending work; an interrupted first baseline can need measuring
-again. Missing or stale owned sockets report a stopped service, while access,
-unsafe-socket and protocol failures remain visible. Offline status and repeated
-Stop do not create or clear an index. Restart accepts an optional root; a root
-that conflicts with the saved or running service is rejected before stopping it.
-
-**Use it as your regular user, without sudo.** Full Disk Access is a macOS privacy
-permission, separate from Unix privileges. Grant access to the launching terminal
-when running from Terminal; an independently launched background helper may need
-its own Full Disk Access approval. Its stable app path is printed by installation.
-MacTrim does not modify privacy settings or restart your applications.
-
-`doctor` reports real directory-enumeration access for common protected scopes,
-the volume/event identity and current service status. It does not claim one
-permission probe proves access to the whole Mac. Full Disk Access does not bypass
-SIP, Unix ownership/ACLs, unavailable mounts, or entries changing during a scan.
+Run as your normal user. Full Disk Access applies to the launching terminal.
+`doctor` probes enumeration of common protected folders. It does not claim a
+single probe establishes access to the whole Mac, and Full Disk Access does not
+override Unix permissions, SIP or unavailable mounts.
 
 ## Reviewed cleanup and recovery
 
@@ -269,16 +173,13 @@ cargo test --locked --workspace
 ./scripts/verify-binary
 ```
 
-The executable tests exercise native FSEvents on disposable directories, stopped
-service/offline changes, deep aggregates, compressed deltas and restart recovery,
-global paging, signed helper staging and a real pseudo-terminal. The terminal
-checks selection after asynchronous reordering, all four tabs, true-color output
-and keeping the service alive after closing the client. Cleanup mutation tests
-use controlled process-visibility fixtures; they do not claim a live machine's
-process inventory is always complete. No benchmark or whole-Mac scan is part of
-the automated checks.
+Checks cover distinct saved scans, offline edits, full deep traversal, hardlinks,
+symlinks, interrupted saves, root replacement, paging, byte paths, legacy import,
+readable CLI output and a real pseudo-terminal. Terminal checks exercise refresh,
+selection, all four tabs, saved comparisons and exiting without detached work.
+Native executable checks reject the old service entry point and check that no
+FSEvents symbols or CoreServices framework are linked. Cleanup tests retain exact
+approvals, recovery and fresh process-visibility blockers. No benchmark or whole-Mac
+scan is part of automated verification.
 
-See [the recovery design](docs/rust-service.md), the installed SDK's `FSEvents.h`,
-and Apple's current API references for
-[delivery-drop flags](https://developer.apple.com/documentation/coreservices/kfseventstreameventflaguserdropped)
-and [per-device history identity](https://developer.apple.com/documentation/coreservices/1444453-fseventscopyuuidfordevice).
+See [the full-scan persistence contract](docs/full-scan-snapshots.md).

@@ -927,7 +927,6 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
- "core-foundation-sys",
  "crossterm",
  "flate2",
  "fs2",

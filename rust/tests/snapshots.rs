@@ -2,7 +2,7 @@ use mactrim_rs::{
     model::*,
     scan,
     snapshots::{Capture, Snapshots},
-    store::{Generation, Store},
+    store::{self, Generation},
 };
 use std::{fs, path::PathBuf, sync::atomic::AtomicBool};
 
@@ -218,22 +218,17 @@ fn legacy_saved_tree_is_imported_once_and_original_files_are_preserved() {
     let (_temp, root, state) = fixture();
     fs::write(root.join("data"), vec![1; 4096]).unwrap();
     let index = scan::full(&root, &[], &AtomicBool::new(false), None).unwrap();
-    let mut old = Store::open(&state).unwrap();
-    let identity = Identity {
-        volume_uuid: None,
-        namespace_device: 1,
-        namespace_inode: 2,
-        namespace_uuid: "old".into(),
-        device: 1,
-        uuid: "old".into(),
-        mount: "/".into(),
-        relative: "fixture".into(),
-    };
-    old.bind(&root, &identity, 100).unwrap();
+    store::prepare_private(&state).unwrap();
+    store::private_file(&state.join("service.sqlite3"), true).unwrap();
+    let db = rusqlite::Connection::open(state.join("service.sqlite3")).unwrap();
+    db.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT); CREATE TABLE tree_deltas(base TEXT,ordinal INTEGER,digest TEXT,compressed BLOB);").unwrap();
     let generation = Generation::write(&state, &index).unwrap();
-    let work = old.claim().unwrap();
-    old.commit(&generation, &work, &index).unwrap();
-    drop(old);
+    db.execute(
+        "INSERT INTO meta VALUES('generation',?)",
+        [serde_json::to_string(&generation).unwrap()],
+    )
+    .unwrap();
+    drop(db);
     let store = Snapshots::open(&state).unwrap();
     let imported = store.latest(&root).unwrap().unwrap();
     assert!(imported.imported);
