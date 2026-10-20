@@ -234,6 +234,7 @@ fn walk(
     cancel: &AtomicBool,
     progress: Option<&Arc<Mutex<Progress>>>,
     budget: Option<&crate::budget::Budget>,
+    retain_all: bool,
 ) -> Result<Index> {
     let meta = fs::symlink_metadata(root)?;
     if !meta.is_dir() || meta.file_type().is_symlink() {
@@ -249,6 +250,7 @@ fn walk(
     let mut last = Instant::now() - Duration::from_secs(1);
     let mut walker = WalkDir::new(root)
         .follow_links(false)
+        .sort_by_file_name()
         .max_open(32)
         .into_iter();
     while let Some(entry) = walker.next() {
@@ -304,7 +306,8 @@ fn walk(
                 reused: false,
                 node: Node {
                     signature: signature(&meta),
-                    flags: if entry.depth() + depth_offset > 0
+                    flags: if !retain_all
+                        && entry.depth() + depth_offset > 0
                         && lazy(path, entry.depth() + depth_offset)
                     {
                         COLLAPSED
@@ -373,6 +376,17 @@ fn walk(
     Ok(index)
 }
 
+/// A complete foreground measurement, retaining every directory aggregate.
+pub fn full(
+    root: &Path,
+    exclusions: &[PathBuf],
+    cancel: &AtomicBool,
+    progress: Option<&Arc<Mutex<Progress>>>,
+) -> Result<Index> {
+    check_cancelled(cancel)?;
+    walk(root, root, exclusions, cancel, progress, None, true)
+}
+
 /// Replace invalidated subtrees in a persistent tree, then recompute their
 /// ancestors. Unaffected subtrees share their map nodes with the saved view;
 /// their files and directory metadata are not visited again.
@@ -412,7 +426,15 @@ pub fn measure_with_options(
         if let Some(progress) = progress {
             progress.lock().unwrap().phase = why.into();
         }
-        walk(root, root, exclusions, cancel, progress, options.budget)
+        walk(
+            root,
+            root,
+            exclusions,
+            cancel,
+            progress,
+            options.budget,
+            false,
+        )
     };
     let Some(old) = previous.filter(|i| i.root == root && i.root_node().is_some()) else {
         return full("Measuring full baseline");
@@ -443,7 +465,15 @@ pub fn measure_with_options(
     let mut ancestors = std::collections::BTreeSet::new();
     for scope in scopes.paths() {
         checkpoint(cancel, options.budget)?;
-        let subtree = walk(scope, root, exclusions, cancel, progress, options.budget)?;
+        let subtree = walk(
+            scope,
+            root,
+            exclusions,
+            cancel,
+            progress,
+            options.budget,
+            false,
+        )?;
         if !subtree.linked.is_empty() {
             return full("Full reconciliation for newly shared hardlink identities");
         }

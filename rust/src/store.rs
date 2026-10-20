@@ -282,7 +282,7 @@ impl Generation {
         });
         Ok(result)
     }
-    fn read_checkpoint(&self, state: &Path) -> Result<Index> {
+    pub(crate) fn read_checkpoint(&self, state: &Path) -> Result<Index> {
         ensure!(valid_generation_name(&self.name), "Invalid generation path");
         let mut file = private_file(&state.join(&self.name), false)?;
         let before = file.metadata()?;
