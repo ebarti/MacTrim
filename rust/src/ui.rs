@@ -2,8 +2,7 @@
 use crate::{
     cleanup::{self, Actions, Candidate, Journal, Plan},
     history::Change,
-    model::COLLAPSED,
-    session::{Reply, Request, Row, Session, Status},
+    session::{Reply, Request, Row, ScanState, Session, Status},
     snapshots::Snapshot,
 };
 use anyhow::{Context, Result};
@@ -192,7 +191,7 @@ impl App {
             pending: false,
             last_poll: Instant::now() - Duration::from_secs(5),
             sender,
-            message: "Starting a full scan; completed scans save automatically".into(),
+            message: String::new(),
             prompt: None,
             candidates: vec![],
             chosen: BTreeSet::new(),
@@ -250,7 +249,7 @@ impl App {
             let _ = tx.send(Message::Control(session.request(&request)));
         });
     }
-    fn navigate(&mut self, path: PathBuf, _lazy: bool) {
+    fn navigate(&mut self, path: PathBuf) {
         if !path.starts_with(&self.root) {
             return;
         }
@@ -489,8 +488,9 @@ impl App {
                 }
             }
             Message::Control(result) => match result {
-                Ok(reply) => {
-                    self.message = reply.message;
+                Ok(_) => {
+                    // Scan lifecycle is rendered from current Session status, never request feedback.
+                    self.message.clear();
                     self.last_poll = Instant::now() - Duration::from_secs(5);
                 }
                 Err(e) => self.message = format!("Request failed: {e:#}"),
@@ -798,16 +798,16 @@ impl App {
                             self.rows.get(self.table.selected().unwrap_or(0)).cloned()
                             && row.directory
                         {
-                            self.navigate(row.path, row.node.flags & COLLAPSED != 0);
+                            self.navigate(row.path);
                         }
                     }
                     KeyCode::Left | KeyCode::Backspace if self.tab == Tab::Storage => {
                         if let Some(p) = self.view.parent() {
-                            self.navigate(p.to_owned(), false);
+                            self.navigate(p.to_owned());
                         }
                     }
                     KeyCode::Char('g') if self.tab == Tab::Storage => {
-                        self.navigate(self.root.clone(), false)
+                        self.navigate(self.root.clone())
                     }
                     KeyCode::Char('m') if self.tab == Tab::Storage => {
                         self.logical = !self.logical;
@@ -902,6 +902,89 @@ impl App {
         }
         false
     }
+    fn scan_banner(&self) -> (String, String, String, Color) {
+        let retained = self
+            .status
+            .snapshot_id
+            .map(|id| format!("Previous scan #{id} remains saved"))
+            .unwrap_or_else(|| "No earlier saved scan".into());
+        match self.status.scan_state {
+            ScanState::Ready => (
+                "READY TO SCAN".into(),
+                "Press r to start a full scan".into(),
+                retained,
+                Color::Cyan,
+            ),
+            ScanState::Loading => (
+                "PREPARING FULL SCAN".into(),
+                "Loading saved results for browsing".into(),
+                "A fresh full scan will follow".into(),
+                Color::Cyan,
+            ),
+            ScanState::Scanning => (
+                "SCANNING".into(),
+                format!(
+                    "{} entries visited · {} allocated so far",
+                    self.status.visited,
+                    size(self.status.observed_allocated)
+                ),
+                if self.status.snapshot_id.is_some() {
+                    format!("{retained}; displayed totals may be from it")
+                } else {
+                    "Totals shown so far are incomplete".into()
+                },
+                Color::Cyan,
+            ),
+            ScanState::Saving => (
+                "SAVING SCAN".into(),
+                "Measurement finished; writing snapshot to disk".into(),
+                "Keep open until SCAN COMPLETE appears".into(),
+                Color::Cyan,
+            ),
+            ScanState::Completed => {
+                let coverage = self
+                    .status
+                    .root_node
+                    .as_ref()
+                    .map(|n| n.status_name())
+                    .unwrap_or("UNKNOWN");
+                let complete = self.status.root_node.as_ref().is_some_and(|n| n.measured());
+                let detail = if complete {
+                    "Accessible scan scope measured"
+                } else {
+                    "Some areas could not be measured"
+                };
+                (
+                    format!(
+                        "SCAN COMPLETE · SAVED #{}",
+                        self.status.snapshot_id.unwrap_or(0)
+                    ),
+                    format!("Coverage: {coverage} · {detail}"),
+                    format!(
+                        "Finished {} · Saved on disk; safe to quit",
+                        timestamp(self.status.last_saved)
+                    ),
+                    if complete {
+                        Color::Green
+                    } else {
+                        Color::Yellow
+                    },
+                )
+            }
+            ScanState::Cancelled => (
+                "SCAN CANCELLED".into(),
+                "Unfinished scan discarded; no automatic restart".into(),
+                retained,
+                Color::Yellow,
+            ),
+            ScanState::Failed => (
+                "SCAN FAILED".into(),
+                visible(self.status.error.as_deref().unwrap_or(&self.status.phase)),
+                retained,
+                Color::Red,
+            ),
+        }
+    }
     fn draw(&mut self, frame: &mut Frame) {
         let area = frame.area();
         frame.render_widget(
@@ -912,15 +995,29 @@ impl App {
             ),
             area,
         );
+        let (title, detail, note, accent) = self.scan_banner();
+        let accent = self.color(accent);
         if area.width < 70 || area.height < 20 {
-            frame.render_widget(Paragraph::new("MacTrim · enlarge the terminal to at least 70 columns × 20 rows.\nq closes this client; the background scan continues.").wrap(Wrap { trim: false }), area);
+            let lines = vec![
+                Line::styled(
+                    title,
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                ),
+                Line::raw(detail),
+                Line::raw(note),
+                Line::raw("Enlarge the terminal to at least 70 columns × 20 rows."),
+                Line::raw("q exits; active scans require Y/N confirmation."),
+            ];
+            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
             return;
         }
+        let compact = area.height < 28;
         let chunks = Layout::vertical([
-            Constraint::Length(2),
-            Constraint::Length(6),
-            Constraint::Min(5),
-            Constraint::Length(6),
+            Constraint::Length(3),
+            Constraint::Length(if compact { 4 } else { 5 }),
+            Constraint::Length(if compact { 2 } else { 4 }),
+            Constraint::Min(4),
+            Constraint::Length(if compact { 4 } else { 6 }),
         ])
         .split(area);
         frame.render_widget(
@@ -940,35 +1037,56 @@ impl App {
             ),
             chunks[0],
         );
-        let coverage = self
-            .status
-            .root_node
-            .as_ref()
-            .map(|n| n.status_name())
-            .unwrap_or("PENDING");
-        let header = vec![
+        let badge = Style::default()
+            .fg(self.color(Color::Black))
+            .bg(accent)
+            .add_modifier(Modifier::BOLD);
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::styled(title, badge),
+                Line::raw(detail),
+                Line::raw(note),
+            ])
+            .block(
+                Block::default()
+                    .title(" Scan status ")
+                    .borders(Borders::ALL)
+                    .border_type(ratatui::widgets::BorderType::Double)
+                    .border_style(Style::default().fg(accent)),
+            ),
+            chunks[1],
+        );
+        let mut metadata = vec![
             Line::styled(
                 visible(self.view.to_string_lossy()),
                 self.primary().add_modifier(Modifier::BOLD),
             ),
             Line::raw(format!(
-                "Volume at scan: {} used · {} available | Coverage {} · {} directories · saved data {}",
+                "Volume: {} used · {} available | {} directories · saved data {}",
                 size(self.status.filesystem_used),
                 size(self.status.filesystem_available),
-                coverage,
                 self.status.directories,
                 size(self.status.index_bytes)
             )),
-            Line::raw(format!(
-                "{} · saved scan {} · {} scans",
-                visible(&self.status.phase),
-                self.status
-                    .snapshot_id
-                    .map(|id| format!("#{id} at {}", timestamp(self.status.last_saved)))
-                    .unwrap_or_else(|| "pending".into()),
-                self.status.scan_count
-            )),
-            Line::raw(
+        ];
+        if !compact {
+            metadata.push(Line::raw(if self.status.running {
+                format!(
+                    "{} · {}",
+                    visible(&self.status.phase),
+                    visible(self.status.current_path.to_string_lossy())
+                )
+            } else {
+                format!(
+                    "Last saved scan {} · {} saved scans",
+                    self.status
+                        .snapshot_id
+                        .map(|id| format!("#{id} at {}", timestamp(self.status.last_saved)))
+                        .unwrap_or_else(|| "none".into()),
+                    self.status.scan_count
+                )
+            }));
+            metadata.push(Line::raw(
                 self.reply
                     .scope
                     .as_ref()
@@ -980,34 +1098,15 @@ impl App {
                             n.status_name()
                         )
                     })
-                    .unwrap_or_else(|| {
-                        "This folder: measurement pending; all accessible depths are scanned".into()
-                    }),
-            ),
-            Line::raw(if self.status.running {
-                format!(
-                    "Measuring {} · {} visited · {} observed{}",
-                    visible(self.status.current_path.to_string_lossy()),
-                    self.status.visited,
-                    size(self.status.observed_allocated),
-                    if self.status.snapshot_id.is_some() {
-                        " · browsing previous saved scan"
-                    } else {
-                        ""
-                    }
-                )
-            } else {
-                self.status.warning.clone().unwrap_or_else(|| {
-                    "Completed scans save automatically · r starts a new full scan · q exits".into()
-                })
-            }),
-        ];
-        frame.render_widget(Paragraph::new(header).wrap(Wrap { trim: false }), chunks[1]);
+                    .unwrap_or_else(|| "This folder: measurement pending".into()),
+            ));
+        }
+        frame.render_widget(Paragraph::new(metadata), chunks[2]);
         match self.tab {
-            Tab::Storage => self.draw_storage(frame, chunks[2]),
-            Tab::Cleanup => self.draw_cleanup(frame, chunks[2]),
-            Tab::History => self.draw_history(frame, chunks[2]),
-            Tab::Quarantine => self.draw_journals(frame, chunks[2]),
+            Tab::Storage => self.draw_storage(frame, chunks[3]),
+            Tab::Cleanup => self.draw_cleanup(frame, chunks[3]),
+            Tab::History => self.draw_history(frame, chunks[3]),
+            Tab::Quarantine => self.draw_journals(frame, chunks[3]),
         }
         let selected = self.rows.get(self.table.selected().unwrap_or(0));
         let detail = if self.tab == Tab::Storage {
@@ -1037,7 +1136,7 @@ impl App {
         let foot=vec![
             Line::styled(if self.busy {"Working · recovery intent is durable"}else if self.cleanup_running&&self.tab==Tab::Cleanup {"Cleanup discovery running"}else{"q Quit · all scan work stops · Tab/F1–F4 switch views"},self.primary()),
             Line::raw(detail),
-            Line::styled(visible(self.status.error.as_deref().unwrap_or(&self.message)),if self.status.error.is_some(){self.warning()}else{Style::default()}),
+            Line::styled(visible(self.status.error.as_deref().or(self.status.warning.as_deref()).unwrap_or(&self.message)),if self.status.error.is_some()||self.status.warning.is_some(){self.warning()}else{Style::default()}),
             Line::raw::<String>(match self.tab {
                 Tab::Storage=>"Enter/→ Browse · ← Parent · g Root · r Full scan · m Metric · [ ] Pages · Ctrl+X Cancel (Y/N)".into(),
                 Tab::Cleanup=>"Space Select · v Validate → exact approval · / Filter · r Rescan · Ctrl+X Cancel discovery".into(),
@@ -1049,7 +1148,7 @@ impl App {
             Paragraph::new(foot)
                 .block(Block::default().borders(Borders::TOP))
                 .wrap(Wrap { trim: false }),
-            chunks[3],
+            chunks[4],
         );
         if let Some(prompt) = &self.prompt {
             let width = area.width.saturating_sub(4).min(100);
@@ -1206,7 +1305,7 @@ impl App {
         .block(
             Block::default()
                 .title(format!(
-                    " Page {} · Enter loads lazy details ",
+                    " Page {} · Enter opens folder ",
                     self.offset / 200 + 1
                 ))
                 .borders(Borders::ALL),
@@ -1456,6 +1555,153 @@ mod tests {
         }
     }
     #[test]
+    fn completed_partial_scan_has_an_unambiguous_persistent_status() {
+        let (tx, _) = mpsc::channel();
+        let mut app = App::new("/state".into(), "/fixture".into(), tx);
+        app.accept(Message::Storage(
+            0,
+            Ok(Reply {
+                status: Status {
+                    scan_state: ScanState::Completed,
+                    phase: "Scan #2 saved (PARTIAL)".into(),
+                    snapshot_id: Some(2),
+                    last_saved: 1792524352,
+                    root_node: Some(crate::model::Node {
+                        status: 2,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        ));
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(140, 45)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(text.contains("SCAN COMPLETE"), "{text}");
+        assert!(text.contains("SAVED #2"));
+        assert!(!text.contains("Starting a full scan"));
+    }
+    fn rendered(
+        app: &mut App,
+        width: u16,
+        height: u16,
+    ) -> (String, Terminal<ratatui::backend::TestBackend>) {
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(width as usize)
+            .map(|row| row.iter().map(|c| c.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        (text, terminal)
+    }
+    #[test]
+    fn scan_banner_distinguishes_active_work_and_terminal_outcomes_with_an_old_snapshot() {
+        let (tx, _) = mpsc::channel();
+        let mut app = App::new("/state".into(), "/fixture".into(), tx);
+        app.status.snapshot_id = Some(7);
+        app.status.root_node = Some(crate::model::Node::default());
+        app.status.error = Some("Snapshot write failed".into());
+        for (state, title) in [
+            (ScanState::Loading, "PREPARING FULL SCAN"),
+            (ScanState::Scanning, "SCANNING"),
+            (ScanState::Saving, "SAVING SCAN"),
+            (ScanState::Cancelled, "SCAN CANCELLED"),
+            (ScanState::Failed, "SCAN FAILED"),
+        ] {
+            app.status.scan_state = state;
+            let (text, _) = rendered(&mut app, 140, 45);
+            let banner = text.lines().take(8).collect::<Vec<_>>().join("\n");
+            assert!(banner.contains(title), "{banner}");
+            assert!(
+                !text.lines().nth(4).unwrap().contains("SCAN COMPLETE"),
+                "{banner}"
+            );
+        }
+    }
+    #[test]
+    fn completion_banner_is_prominent_in_narrow_and_no_color_terminals() {
+        let (tx, _) = mpsc::channel();
+        let mut app = App::new("/state".into(), "/fixture".into(), tx);
+        app.status.scan_state = ScanState::Completed;
+        app.status.snapshot_id = Some(2);
+        for no_color in [false, true] {
+            for partial in [false, true] {
+                for (width, height) in [(140, 45), (70, 20), (50, 15)] {
+                    app.no_color = no_color;
+                    app.status.root_node = Some(crate::model::Node {
+                        status: if partial { 2 } else { 0 },
+                        ..Default::default()
+                    });
+                    let (text, terminal) = rendered(&mut app, width, height);
+                    let top = text.lines().take(7).collect::<Vec<_>>().join("\n");
+                    assert!(top.contains("SCAN COMPLETE · SAVED #2"), "{top}");
+                    assert!(
+                        top.contains(if partial {
+                            "Coverage: PARTIAL"
+                        } else {
+                            "Coverage: MEASURED"
+                        }),
+                        "{top}"
+                    );
+                    assert!(!text.contains("Starting a full scan"));
+                    assert!(!text.contains("background scan continues"));
+                    assert!(!text.contains("lazy details"));
+                    if width >= 70 {
+                        let badge = &terminal.backend().buffer()[(1, 4)];
+                        assert!(badge.modifier.contains(Modifier::BOLD));
+                        assert_eq!(
+                            badge.bg,
+                            if no_color {
+                                Color::Reset
+                            } else if partial {
+                                Color::Yellow
+                            } else {
+                                Color::Green
+                            }
+                        );
+                        assert!(
+                            text.lines()
+                                .take(3)
+                                .any(|l| l.contains("Storage") && l.contains("Cleanup"))
+                        );
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn old_control_feedback_cannot_claim_a_scan_is_starting_after_completion() {
+        let (tx, _) = mpsc::channel();
+        let mut app = App::new("/state".into(), "/fixture".into(), tx);
+        for message in [
+            "Full scan started; completed scans save automatically",
+            "Cancellation requested; earlier completed scans remain saved",
+        ] {
+            app.accept(Message::Control(Ok(Reply {
+                message: message.into(),
+                ..Default::default()
+            })));
+            app.status.scan_state = ScanState::Completed;
+            app.status.snapshot_id = Some(2);
+            app.status.root_node = Some(crate::model::Node::default());
+            let (text, _) = rendered(&mut app, 140, 45);
+            assert!(text.contains("SCAN COMPLETE · SAVED #2"));
+            assert!(!text.contains(message));
+        }
+    }
+    #[test]
     fn incoming_sort_changes_preserve_selected_path() {
         let (tx, _) = mpsc::channel();
         let mut app = App::new("/state".into(), "/fixture".into(), tx);
@@ -1592,7 +1838,7 @@ mod tests {
         let mut app = App::new("/state".into(), "/fixture".into(), tx);
         app.status.running = true;
         app.status.visited = 42;
-        app.navigate("/fixture/child".into(), false);
+        app.navigate("/fixture/child".into());
         assert!(app.status.running);
         assert_eq!(app.status.visited, 42);
         app.cleanup_loaded = true;
@@ -1670,6 +1916,6 @@ mod tests {
         assert!(rendered(&terminal).contains("Type QUARANTINE fixture"));
         let mut tiny = Terminal::new(ratatui::backend::TestBackend::new(40, 8)).unwrap();
         tiny.draw(|f| app.draw(f)).unwrap();
-        assert!(rendered(&tiny).contains("enlarge"));
+        assert!(rendered(&tiny).to_lowercase().contains("enlarge"));
     }
 }

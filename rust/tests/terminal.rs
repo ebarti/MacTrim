@@ -4,6 +4,7 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::{
     fs,
     io::{Read, Write},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread,
@@ -13,6 +14,12 @@ fn binary() -> PathBuf {
     std::env::var_os("MACTRIM_TEST_BINARY")
         .map(PathBuf::from)
         .unwrap_or_else(|| env!("CARGO_BIN_EXE_mactrim").into())
+}
+struct RestoreDirectoryMode(PathBuf);
+impl Drop for RestoreDirectoryMode {
+    fn drop(&mut self) {
+        let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+    }
 }
 struct Client(Box<dyn portable_pty::Child + Send + Sync>);
 impl Drop for Client {
@@ -83,8 +90,12 @@ fn actual_terminal_full_scans_save_compare_and_quit_without_background_work() {
         }
     });
     wait_screen(&parser, |s| {
-        s.contains("Scan #1 saved") && selected(s, &root.join("a"))
+        s.contains("SCAN COMPLETE · SAVED #1") && selected(s, &root.join("a"))
     });
+    let initial = parser.lock().unwrap().screen().contents();
+    assert!(initial.contains("Coverage: MEASURED"));
+    assert!(!initial.contains("Starting a full scan"));
+    assert!(!initial.contains("lazy details"));
     writer.write_all(b"\x1b[B").unwrap();
     writer.flush().unwrap();
     wait_screen(&parser, |s| selected(s, &root.join("b")));
@@ -100,11 +111,21 @@ fn actual_terminal_full_scans_save_compare_and_quit_without_background_work() {
         1,
         "An edit must not start an update"
     );
+    let denied = root.join("unreadable");
+    fs::create_dir(&denied).unwrap();
+    let _mode = RestoreDirectoryMode(denied.clone());
+    fs::set_permissions(&denied, fs::Permissions::from_mode(0o000)).unwrap();
     writer.write_all(b"r").unwrap();
     writer.flush().unwrap();
     wait_screen(&parser, |s| {
-        selected(s, &root.join("b")) && s.contains("Scan #2 saved")
+        selected(s, &root.join("b")) && s.contains("SCAN COMPLETE · SAVED #2")
     });
+    let completed = wait_screen(&parser, |s| {
+        s.contains("SCAN COMPLETE · SAVED #2") && s.contains("Coverage: PARTIAL")
+    });
+    assert!(completed.contains("Saved on disk; safe to quit"));
+    assert!(!completed.contains("Full scan started"));
+    assert!(!completed.contains("Starting a full scan"));
     thread::sleep(Duration::from_millis(750));
     assert!(
         selected(&parser.lock().unwrap().screen().contents(), &root.join("b")),
@@ -128,7 +149,7 @@ fn actual_terminal_full_scans_save_compare_and_quit_without_background_work() {
     );
     writer.write_all(b"g").unwrap();
     writer.flush().unwrap();
-    let mut evidence = String::new();
+    let mut evidence = format!("{completed}\n\n");
     for marker in [
         "Validate → exact approval",
         "Saved comparison",
