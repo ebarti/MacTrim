@@ -118,7 +118,9 @@ fn actual_terminal_full_scans_save_compare_and_quit_without_background_work() {
     writer.write_all(b"r").unwrap();
     writer.flush().unwrap();
     wait_screen(&parser, |s| {
-        selected(s, &root.join("b")) && s.contains("SCAN COMPLETE · SAVED #2")
+        selected(s, &root.join("b"))
+            && s.contains("SCAN COMPLETE · SAVED #2")
+            && s.contains("128.0 KiB")
     });
     let completed = wait_screen(&parser, |s| {
         s.contains("SCAN COMPLETE · SAVED #2") && s.contains("Coverage: PARTIAL")
