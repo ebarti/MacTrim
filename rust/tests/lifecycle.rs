@@ -18,6 +18,11 @@ fn binary() -> PathBuf {
         .unwrap_or_else(|| env!("CARGO_BIN_EXE_mactrim").into())
 }
 fn cli(state: &Path, args: &[&str]) -> Output {
+    let mut args = args.to_vec();
+    args.push("--json");
+    raw_cli(state, &args)
+}
+fn raw_cli(state: &Path, args: &[&str]) -> Output {
     let mut child = Command::new(binary())
         .arg("--state")
         .arg(state)
@@ -187,6 +192,7 @@ fn stop_waits_for_the_acknowledged_services_writer_to_close() {
         .arg("--state")
         .arg(&state)
         .args(["service", "stop"])
+        .arg("--json")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -304,4 +310,94 @@ fn restart_can_start_a_new_service_with_an_explicit_root() {
     assert_eq!(reply["status"]["root"], root.to_str().unwrap());
     assert!(reply["status"]["pid"].as_u64().unwrap() > 0);
     settled(&state);
+}
+
+fn human(output: Output) -> String {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        !text.trim_start().starts_with('{'),
+        "Expected readable output: {text}"
+    );
+    assert!(
+        !text.contains("\"pending_regions\""),
+        "Wire fields leaked: {text}"
+    );
+    text
+}
+
+#[test]
+fn stopped_commands_are_readable_by_default_even_when_piped() {
+    let (_temp, base) = fixture();
+    let state = base.join("state");
+    for args in [
+        &["status"][..],
+        &["service", "status"],
+        &["service", "stop"],
+    ] {
+        let text = human(raw_cli(&state, args));
+        assert!(text.contains("stopped"), "{text}");
+        assert!(
+            text.lines().count() <= 2,
+            "Offline response is too verbose: {text}"
+        );
+        assert_eq!(success(cli(&state, args))["status"]["phase"], "Stopped");
+        assert!(!state.exists());
+    }
+}
+
+#[test]
+fn human_service_controls_and_explicit_json_preserve_the_same_lifecycle() {
+    let (_temp, base) = fixture();
+    let state = base.join("state");
+    let root = base.join("files");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("data"), vec![1; 8192]).unwrap();
+    let _running = Running(state.clone());
+    let started = human(raw_cli(
+        &state,
+        &["service", "start", root.to_str().unwrap()],
+    ));
+    assert!(
+        started.contains("MacTrim service is running (PID "),
+        "{started}"
+    );
+    assert!(
+        started.contains(&format!("Root: {}", root.display())),
+        "{started}"
+    );
+    let saved = settled(&state);
+    for args in [&["status"][..], &["service", "status"]] {
+        let text = human(raw_cli(&state, args));
+        assert!(text.contains("Saved index:"), "{text}");
+        assert!(text.contains("Activity:"), "{text}");
+        assert!(!text.contains("no completed scan yet"), "{text}");
+    }
+    let global_json = success(raw_cli(&state, &["--json", "service", "status"]));
+    assert_eq!(global_json["status"]["pid"], saved["status"]["pid"]);
+    let storage_json = success(raw_cli(
+        &state,
+        &["storage", root.to_str().unwrap(), "--json"],
+    ));
+    assert_eq!(storage_json["status"]["pid"], saved["status"]["pid"]);
+    assert!(human(raw_cli(&state, &["service", "pause"])).contains("paused"));
+    assert!(human(raw_cli(&state, &["refresh"])).contains("refresh requested"));
+    assert!(human(raw_cli(&state, &["service", "retention", "--days", "30"])).contains("30 days"));
+    let restarted = human(raw_cli(&state, &["service", "restart"]));
+    assert!(
+        restarted.contains("MacTrim service restarted (PID "),
+        "{restarted}"
+    );
+    let current = settled(&state);
+    assert_ne!(current["status"]["pid"], saved["status"]["pid"]);
+    assert_eq!(
+        current["status"]["root_node"]["logical"],
+        saved["status"]["root_node"]["logical"]
+    );
+    assert!(human(raw_cli(&state, &["service", "stop"])).contains("Service stopped"));
+    assert!(human(raw_cli(&state, &["service", "stop"])).contains("already stopped"));
 }

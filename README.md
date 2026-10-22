@@ -167,6 +167,13 @@ has no deletion API.
 ./dist/mactrim service uninstall   # remove login registration; keep all state/data
 ```
 
+Service controls, `status` and `refresh` print readable text by default, including
+when output is redirected. Status shows the service PID, root, current activity,
+scan progress and whether an index has been saved. For scripts, request the
+complete JSON response explicitly with `mactrim service status --json` or
+`mactrim --json service status`. `storage --json` continues to return JSON;
+`service plist` intentionally prints the LaunchAgent XML.
+
 Stop waits until the service releases its state writer lock, so `service stop &&
 service start /` can run without a manual delay. Restart preserves committed
 measurements and pending work; an interrupted first baseline can need measuring
