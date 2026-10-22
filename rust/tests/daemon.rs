@@ -86,6 +86,7 @@ fn real_daemon_tracks_edits_and_recovers_changes_made_while_stopped() {
             offset: 0,
             limit: 20,
             logical: false,
+            anchor: None,
         },
     )
     .unwrap();
