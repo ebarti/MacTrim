@@ -48,6 +48,10 @@ enum Commands {
         path: PathBuf,
         #[arg(long, default_value = "60")]
         days: u64,
+        #[arg(long, default_value = "0")]
+        offset: usize,
+        #[arg(long, default_value = "200")]
+        limit: usize,
     },
     Refresh {
         #[arg(long)]
@@ -239,11 +243,18 @@ fn run() -> Result<()> {
             }
         }
         Commands::Status => print(service::request(&state, &Request::Status)?),
-        Commands::History { path, days } => print(service::request(
+        Commands::History {
+            path,
+            days,
+            offset,
+            limit,
+        } => print(service::request(
             &state,
             &Request::History {
                 path,
                 since: store::now().saturating_sub(days.saturating_mul(86400)),
+                offset,
+                limit,
             },
         )?),
         Commands::Refresh { full } => print(service::request(&state, &Request::Refresh { full })?),

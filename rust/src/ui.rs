@@ -150,6 +150,8 @@ struct App {
     filter: String,
     history: Vec<Change>,
     history_index: usize,
+    history_offset: usize,
+    history_more: bool,
     journals: Vec<Journal>,
     journal_index: usize,
     busy: bool,
@@ -189,6 +191,8 @@ impl App {
             filter: String::new(),
             history: vec![],
             history_index: 0,
+            history_offset: 0,
+            history_more: false,
             journals: vec![],
             journal_index: 0,
             busy: false,
@@ -247,7 +251,12 @@ impl App {
         }
     }
     fn poll(&mut self) {
-        if self.pending || self.last_poll.elapsed() < Duration::from_millis(600) {
+        let interval = if self.tab == Tab::History {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_millis(600)
+        };
+        if self.pending || self.last_poll.elapsed() < interval {
             return;
         }
         if !matches!(self.tab, Tab::Storage | Tab::History) {
@@ -263,6 +272,7 @@ impl App {
         let logical = self.logical;
         let anchor = self.selected.clone();
         let tab = self.tab;
+        let history_offset = self.history_offset;
         thread::spawn(move || {
             let request = if tab == Tab::Storage {
                 Request::List {
@@ -276,6 +286,8 @@ impl App {
                 Request::History {
                     path: view,
                     since: crate::store::now().saturating_sub(60 * 86400),
+                    offset: history_offset,
+                    limit: 200,
                 }
             };
             let reply = service::request(&state, &request);
@@ -360,6 +372,8 @@ impl App {
         }
         self.busy = true;
         self.validating = true;
+        self.cleanup_cancel = Arc::new(AtomicBool::new(false));
+        let cancel = self.cleanup_cancel.clone();
         let state = self.state.clone();
         let tx = self.sender.clone();
         let generation = self.cleanup_gen;
@@ -367,7 +381,8 @@ impl App {
             "Validating fresh Git, process, ownership and descendant metadata; no move is approved"
                 .into();
         thread::spawn(move || {
-            let result = Actions::open(&state).and_then(|a| a.prepare(&candidates, 30));
+            let result =
+                Actions::open(&state).and_then(|a| a.prepare_cancellable(&candidates, 30, &cancel));
             let _ = tx.send(Message::Prepared(generation, result));
         });
     }
@@ -450,6 +465,7 @@ impl App {
                     Ok(reply) => {
                         self.status = reply.status;
                         self.history = reply.history;
+                        self.history_more = reply.more;
                         self.history_index =
                             self.history_index.min(self.history.len().saturating_sub(1));
                     }
@@ -681,6 +697,16 @@ impl App {
                     return false;
                 }
                 match key.code {
+                    KeyCode::Char(']') if self.tab == Tab::History && self.history_more => {
+                        self.history_offset += 200;
+                        self.version += 1;
+                        self.last_poll = Instant::now() - Duration::from_secs(10);
+                    }
+                    KeyCode::Char('[') if self.tab == Tab::History => {
+                        self.history_offset = self.history_offset.saturating_sub(200);
+                        self.version += 1;
+                        self.last_poll = Instant::now() - Duration::from_secs(10);
+                    }
                     KeyCode::Char('q') => {
                         if self.busy {
                             self.message =

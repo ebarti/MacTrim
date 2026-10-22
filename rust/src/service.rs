@@ -29,21 +29,27 @@ use std::{
 pub enum Request {
     Status,
     History {
+        #[serde(with = "crate::paths")]
         path: PathBuf,
         since: u64,
+        offset: usize,
+        limit: usize,
     },
     List {
+        #[serde(with = "crate::paths")]
         path: PathBuf,
         offset: usize,
         limit: usize,
         logical: bool,
         #[serde(default)]
+        #[serde(with = "crate::paths::optional")]
         anchor: Option<PathBuf>,
     },
     Refresh {
         full: bool,
     },
     Expand {
+        #[serde(with = "crate::paths")]
         path: PathBuf,
     },
     Pause,
@@ -52,6 +58,7 @@ pub enum Request {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Status {
     pub pid: u32,
+    #[serde(with = "crate::paths")]
     pub root: PathBuf,
     pub phase: String,
     pub running: bool,
@@ -73,11 +80,13 @@ pub struct Status {
     pub filesystem_available: u64,
     pub observed_allocated: u64,
     pub observed_logical: u64,
+    #[serde(with = "crate::paths")]
     pub current_path: PathBuf,
     pub error: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Row {
+    #[serde(with = "crate::paths")]
     pub path: PathBuf,
     pub node: Node,
     pub directory: bool,
@@ -113,6 +122,7 @@ pub struct Reply {
     pub offset: usize,
 }
 struct Public {
+    state: PathBuf,
     status: Status,
     index: Option<Arc<Index>>,
     detail: Option<Arc<Index>>,
@@ -366,6 +376,36 @@ fn serve(
             status: public.read().unwrap().status.clone(),
             ..Reply::default()
         },
+        Request::History {
+            path,
+            since,
+            offset,
+            limit,
+        } => {
+            let p = public.read().unwrap();
+            let status = p.status.clone();
+            let state = p.state.clone();
+            drop(p);
+            ensure!(
+                path.starts_with(&status.root)
+                    && !path.components().any(|c| c == Component::ParentDir),
+                "History path outside scope"
+            );
+            ensure!(
+                limit > 0 && limit <= 500,
+                "History page size must be 1..500"
+            );
+            let (history, more) = Store::history_page(&state, &path, since, offset, limit)?;
+            Reply {
+                status,
+                history,
+                more,
+                offset,
+                message: "Directory aggregates overlap; incomplete comparisons have unknown growth"
+                    .into(),
+                ..Reply::default()
+            }
+        }
         other => {
             let (tx, rx) = mpsc::sync_channel(1);
             sender.send((other, tx))?;
@@ -411,6 +451,7 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
         ..Progress::default()
     }));
     let public = Arc::new(RwLock::new(Public {
+        state: state.clone(),
         status: Status {
             root: root.clone(),
             pid: std::process::id(),
@@ -444,7 +485,14 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
         for _ in 0..32 {
             let batch = match watch.receiver.try_recv() {
                 Ok(b) => b,
-                Err(_) => break,
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    ready = false;
+                    phase = "Filesystem receiver disconnected; replaying durable checkpoint".into();
+                    drop(watch);
+                    watch = events::watch(identity.clone(), store.cursor()?)?;
+                    break;
+                }
             };
             let change = events::changes(batch, &root, &identity, &state, store.cursor()?);
             if change.gap != 0 {
@@ -530,17 +578,6 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
         }
         while let Ok((command, tx)) = commands_rx.try_recv() {
             let reply = match command {
-                Request::History { path, since } => {
-                    if !path.starts_with(&root)
-                        || path.components().any(|c| c == Component::ParentDir)
-                    {
-                        let _ = tx.send(Err("History path outside scope".into()));
-                        continue;
-                    }
-                    let result=store.history(&path,since).map(|history| Reply { status: public.read().unwrap().status.clone(),history,message:"Directory aggregates overlap; do not sum nested rows. Partial coverage has unknown growth.".into(),..Reply::default() }).map_err(|e|format!("{e:#}"));
-                    let _ = tx.send(result);
-                    continue;
-                }
                 Request::Stop => {
                     terminate.store(true, Ordering::Relaxed);
                     "Service stopping; committed index and pending work preserved"
@@ -594,7 +631,22 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
                         store.set_full_at(last_saved)?;
                     }
                     index = Some(candidate);
-                    public.write().unwrap().detail = None;
+                    let mut p = public.write().unwrap();
+                    let affected = p
+                        .detail
+                        .as_ref()
+                        .filter(|d| {
+                            work.paths
+                                .iter()
+                                .any(|c| c.starts_with(&d.root) || d.root.starts_with(c))
+                        })
+                        .map(|d| d.root.clone());
+                    if let Some(path) = affected {
+                        p.detail = None;
+                        if progress.lock().unwrap().view.starts_with(&path) {
+                            detail_pending = Some(path);
+                        }
+                    }
                     phase = "Index saved; incremental tracking active".into();
                     error = None;
                 }
@@ -641,6 +693,7 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
                 };
             }
             let previous = index.clone();
+            let previous_generation = store.generation()?;
             let root = root.clone();
             let state = state.clone();
             let cancel = cancel.clone();
@@ -663,7 +716,11 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
                             bail!("Scan paused; previous index preserved");
                         }
                         progress.lock().unwrap().phase = "Saving compressed directory index".into();
-                        let generation = Generation::write(&state, &measured)?;
+                        let generation = Generation::update(
+                            &state,
+                            &measured,
+                            previous_generation.as_ref().zip(previous.as_deref()),
+                        )?;
                         let changes = crate::history::changes(
                             previous.as_deref(),
                             &measured,

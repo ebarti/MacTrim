@@ -22,6 +22,7 @@ use std::{
         },
     },
     path::{Component, Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
 };
 use walkdir::WalkDir;
 const MAGIC: &[u8] = b"MACTRIM-RUST-SIGNED-1\n";
@@ -51,6 +52,7 @@ pub struct Prepared {
 pub struct Plan {
     pub schema: String,
     pub id: String,
+    #[serde(with = "crate::paths")]
     pub state: PathBuf,
     pub created: u64,
     pub minimum_days: u64,
@@ -61,7 +63,9 @@ pub struct Plan {
 pub struct Journal {
     pub schema: String,
     pub id: String,
+    #[serde(with = "crate::paths")]
     pub original: PathBuf,
+    #[serde(with = "crate::paths")]
     pub quarantine: PathBuf,
     pub status: String,
     pub created: u64,
@@ -126,6 +130,9 @@ fn secret(path: &Path) -> bool {
         || n.ends_with(".db")
 }
 fn snapshot(root: &Path) -> Result<Snapshot> {
+    snapshot_cancellable(root, &AtomicBool::new(false))
+}
+fn snapshot_cancellable(root: &Path, cancel: &AtomicBool) -> Result<Snapshot> {
     let original = fs::symlink_metadata(root)?;
     ensure!(
         original.is_dir() && !original.file_type().is_symlink() && !protected(root),
@@ -140,6 +147,10 @@ fn snapshot(root: &Path) -> Result<Snapshot> {
         .sort_by_file_name()
         .max_open(16)
     {
+        ensure!(
+            !cancel.load(Ordering::Relaxed),
+            "Validation cancelled; no move approved"
+        );
         let entry = entry?;
         let path = entry.path();
         let m = fs::symlink_metadata(path)?;
@@ -467,6 +478,18 @@ impl<P: ActivityProvider> Actions<P> {
         Ok(result)
     }
     fn validate(&self, candidate: &Candidate, minimum_days: u64) -> Result<Snapshot> {
+        self.validate_cancellable(candidate, minimum_days, &AtomicBool::new(false))
+    }
+    fn validate_cancellable(
+        &self,
+        candidate: &Candidate,
+        minimum_days: u64,
+        cancel: &AtomicBool,
+    ) -> Result<Snapshot> {
+        ensure!(
+            !cancel.load(Ordering::Relaxed),
+            "Validation cancelled; no move approved"
+        );
         ensure!(
             !candidate.path.is_symlink(),
             "Symlink target cannot be selected"
@@ -489,7 +512,7 @@ impl<P: ActivityProvider> Actions<P> {
             "Activity blocks cleanup: {}",
             blockers.join("; ")
         );
-        let fp = snapshot(&fresh.path)?;
+        let fp = snapshot_cancellable(&fresh.path, cancel)?;
         ensure!(
             now().saturating_sub(fp.newest) >= minimum_days.saturating_mul(86400),
             "Recently modified descendants retained"
@@ -501,6 +524,14 @@ impl<P: ActivityProvider> Actions<P> {
         Ok(fp)
     }
     pub fn prepare(&self, candidates: &[Candidate], minimum_days: u64) -> Result<Plan> {
+        self.prepare_cancellable(candidates, minimum_days, &AtomicBool::new(false))
+    }
+    pub fn prepare_cancellable(
+        &self,
+        candidates: &[Candidate],
+        minimum_days: u64,
+        cancel: &AtomicBool,
+    ) -> Result<Plan> {
         ensure!(!candidates.is_empty(), "Select at least one candidate");
         let mut items: Vec<Prepared> = Vec::new();
         for candidate in candidates {
@@ -513,7 +544,7 @@ impl<P: ActivityProvider> Actions<P> {
             );
             items.push(Prepared {
                 candidate: candidate.clone(),
-                snapshot: self.validate(candidate, minimum_days)?,
+                snapshot: self.validate_cancellable(candidate, minimum_days, cancel)?,
             });
         }
         let id = uuid::Uuid::new_v4().to_string();
@@ -526,6 +557,10 @@ impl<P: ActivityProvider> Actions<P> {
             minimum_days,
             items,
         };
+        ensure!(
+            !cancel.load(Ordering::Relaxed),
+            "Validation cancelled; no plan approved"
+        );
         self.write(&self.file("plans", &plan.id)?, &plan)?;
         Ok(plan)
     }

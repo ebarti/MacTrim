@@ -43,11 +43,25 @@ browsing levels. Their *sizes* include accessible descendants at every depth.
 Hardlink/namespace accounting can require a full reconciliation; filesystem
 allocation estimates are distinct from physical APFS volume usage.
 
-The service persists a compressed directory tree and a small transactional
-database of coalesced pending regions and cursors. It does not copy the OS event
+The service keeps the directory tree in persistent ordered maps from `im`.
+An ordinary update remeasures an antichain of invalidated retained subtrees,
+shares all unaffected map branches and recomputes the affected ancestors. It
+does not clone every directory or visit every unchanged directory to refresh a
+small region. Previously or newly shared hardlink identities require global
+accounting and explicitly trigger a full reconciliation.
+
+On disk, the service persists a compressed directory checkpoint plus compressed
+changed-node deltas in SQLite, alongside coalesced pending regions and cursors.
+Delta bytes compact into a new checkpoint once they reach the measured size of
+the checkpoint. This retains the complete tree and avoids a full rewrite for
+each small edit. History queries and immediate-file listings run outside the
+event ingestion loop; their presentation pages never truncate saved data.
+It does not copy the OS event
 log, retain file contents, or persist one record per ordinary file. No byte or
 directory-count ceiling truncates the index. A generation file is fsynced before
-the database atomically points to it and acknowledges covered pending work.
+the database atomically points to it and acknowledges covered pending work;
+delta payloads and their acknowledgements commit in the same synchronous SQLite
+transaction. SQLite uses WAL so browsing History can overlap event ingestion.
 After a crash, an unreferenced generation is harmless; the last committed tree
 and pending work remain authoritative.
 
