@@ -28,6 +28,10 @@ use std::{
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum Request {
     Status,
+    History {
+        path: PathBuf,
+        since: u64,
+    },
     List {
         path: PathBuf,
         offset: usize,
@@ -98,6 +102,7 @@ pub struct Reply {
     pub rows: Vec<Row>,
     pub more: bool,
     pub message: String,
+    pub history: Vec<crate::history::Change>,
 }
 struct Public {
     status: Status,
@@ -273,6 +278,7 @@ fn serve(
                 rows,
                 more,
                 message: String::new(),
+                history: vec![],
             }
         }
         Request::Status => Reply {
@@ -334,7 +340,8 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
     }));
     let (commands_tx, commands_rx) = mpsc::channel::<Command>();
     let clients = Arc::new(AtomicUsize::new(0));
-    let (finished_tx, finished_rx) = mpsc::channel::<Result<(Arc<Index>, Generation, Work)>>();
+    let (finished_tx, finished_rx) =
+        mpsc::channel::<Result<(Arc<Index>, Generation, Work, Vec<crate::history::Change>)>>();
     let (details_tx, details_rx) = mpsc::channel::<Result<Arc<Index>>>();
     let cancel = Arc::new(AtomicBool::new(false));
     let mut running = false;
@@ -442,6 +449,17 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
         }
         while let Ok((command, tx)) = commands_rx.try_recv() {
             let reply = match command {
+                Request::History { path, since } => {
+                    if !path.starts_with(&root)
+                        || path.components().any(|c| c == Component::ParentDir)
+                    {
+                        let _ = tx.send(Err("History path outside scope".into()));
+                        continue;
+                    }
+                    let result=store.history(&path,since).map(|history| Reply { status: public.read().unwrap().status.clone(),history,message:"Directory aggregates overlap; do not sum nested rows. Partial coverage has unknown growth.".into(),..Reply::default() }).map_err(|e|format!("{e:#}"));
+                    let _ = tx.send(result);
+                    continue;
+                }
                 Request::Stop => {
                     terminate.store(true, Ordering::Relaxed);
                     "Service stopping; committed index and pending work preserved"
@@ -485,11 +503,11 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
         if let Ok(result) = finished_rx.try_recv() {
             running = false;
             match result {
-                Ok((candidate, generation, work))
+                Ok((candidate, generation, work, changes))
                     if !cancel.load(Ordering::Relaxed)
                         && events::identity(&root)? == work.identity =>
                 {
-                    store.commit(&generation, &work, &candidate)?;
+                    store.commit_changes(&generation, &work, &candidate, &changes)?;
                     last_saved = generation.created;
                     if work.paths.iter().any(|p| p == &root) {
                         store.set_full_at(last_saved)?;
@@ -565,7 +583,12 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
                         }
                         progress.lock().unwrap().phase = "Saving compressed directory index".into();
                         let generation = Generation::write(&state, &measured)?;
-                        Ok((measured, generation, work))
+                        let changes = crate::history::changes(
+                            previous.as_deref(),
+                            &measured,
+                            generation.created,
+                        );
+                        Ok((measured, generation, work, changes))
                     })();
                     let _ = tx.send(result);
                 })?;
