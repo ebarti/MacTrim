@@ -1,5 +1,5 @@
-//! Hourly directory-size deltas. Unchanged trees are not copied into History.
-use crate::model::{Index, Node};
+//! Comparison values for independently completed full scans.
+use crate::model::Node;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -42,36 +42,4 @@ impl Change {
             _ => None,
         }
     }
-}
-pub fn changes(previous: Option<&Index>, current: &Index, at: u64) -> Vec<Change> {
-    let Some(previous) = previous else {
-        return vec![];
-    };
-    let mut result = Vec::new();
-    for delta in previous.nodes.diff(&current.nodes) {
-        let (path, before, after) = match delta {
-            im::ordmap::DiffItem::Add(p, n) => (p, None, Some(Counts::from(n))),
-            im::ordmap::DiffItem::Update {
-                old: (_, a),
-                new: (p, b),
-            } => (p, Some(Counts::from(a)), Some(Counts::from(b))),
-            im::ordmap::DiffItem::Remove(p, n) => (p, Some(Counts::from(n)), None),
-        };
-        if before == after {
-            continue;
-        }
-        let visible = path
-            .parent()
-            .and_then(|p| p.ancestors().find_map(|p| current.nodes.get(p)))
-            .is_some_and(|n| n.measured() && n.flags & crate::model::COLLAPSED == 0);
-        if after.is_some() || visible {
-            result.push(Change {
-                path: path.clone(),
-                before,
-                after,
-                at,
-            });
-        }
-    }
-    result
 }

@@ -1,6 +1,5 @@
-//! Metadata-only aggregation with bounded-depth working memory, using WalkDir.
-//! Collapsed browsing nodes never prune byte measurement.
-use crate::{model::*, regions::Regions};
+//! One metadata-only full traversal. Every directory aggregate is retained.
+use crate::model::*;
 use anyhow::{Context, Result, bail};
 use std::{
     collections::HashSet,
@@ -25,35 +24,6 @@ impl std::fmt::Display for Cancelled {
 }
 impl std::error::Error for Cancelled {}
 
-#[derive(Debug)]
-pub struct NeedsFullReconciliation(pub &'static str);
-impl std::fmt::Display for NeedsFullReconciliation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.0)
-    }
-}
-impl std::error::Error for NeedsFullReconciliation {}
-
-pub struct Options<'a> {
-    pub budget: Option<&'a crate::budget::Budget>,
-    pub allow_full: bool,
-}
-impl Default for Options<'_> {
-    fn default() -> Self {
-        Self {
-            budget: None,
-            allow_full: true,
-        }
-    }
-}
-pub fn checkpoint(cancel: &AtomicBool, budget: Option<&crate::budget::Budget>) -> Result<()> {
-    check_cancelled(cancel)?;
-    if let Some(budget) = budget {
-        budget.checkpoint(cancel)?;
-    }
-    Ok(())
-}
-
 pub fn check_cancelled(cancel: &AtomicBool) -> Result<()> {
     if cancel.load(Ordering::Relaxed) {
         return Err(Cancelled.into());
@@ -65,8 +35,6 @@ struct Frame {
     path: PathBuf,
     node: Node,
     depth: usize,
-    retained: bool,
-    reused: bool,
 }
 
 fn signature(m: &fs::Metadata) -> [u64; 6] {
@@ -93,20 +61,6 @@ fn dataless(m: &fs::Metadata) -> bool {
         let _ = m;
         false
     }
-}
-fn lazy(path: &Path, depth: usize) -> bool {
-    depth > 8
-        || path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-            [
-                "node_modules",
-                ".venv",
-                "venv",
-                ".tox",
-                ".nox",
-                "__pypackages__",
-            ]
-            .contains(&n)
-        })
 }
 fn excluded(
     root: &Path,
@@ -174,7 +128,7 @@ fn add(parent: &mut Node, child: &Node) -> Result<()> {
 }
 fn finish(frames: &mut Vec<Frame>, index: &mut Index) -> Result<()> {
     let mut frame = frames.pop().unwrap();
-    if !frame.reused && frame.node.status == 0 {
+    if frame.node.status == 0 {
         match fs::symlink_metadata(&frame.path) {
             Ok(m) if signature(&m) == frame.node.signature => (),
             Ok(_) => {
@@ -190,9 +144,7 @@ fn finish(frames: &mut Vec<Frame>, index: &mut Index) -> Result<()> {
     if let Some(parent) = frames.last_mut() {
         add(&mut parent.node, &frame.node)?;
     }
-    if frame.retained {
-        index.insert(frame.path, frame.node);
-    }
+    index.insert(frame.path, frame.node);
     Ok(())
 }
 fn publish(
@@ -208,11 +160,9 @@ fn publish(
     for frame in frames.iter().rev() {
         let mut n = frame.node.clone();
         add(&mut n, &below)?;
-        if frame.retained {
-            let mut running = n.clone();
-            running.status = 4;
-            index.insert(frame.path.clone(), running);
-        }
+        let mut running = n.clone();
+        running.status = 4;
+        index.insert(frame.path.clone(), running);
         below = n;
     }
     let mut live = progress.lock().unwrap();
@@ -229,18 +179,14 @@ fn publish(
 
 fn walk(
     root: &Path,
-    namespace: &Path,
     exclusions: &[PathBuf],
     cancel: &AtomicBool,
     progress: Option<&Arc<Mutex<Progress>>>,
-    budget: Option<&crate::budget::Budget>,
-    retain_all: bool,
 ) -> Result<Index> {
     let meta = fs::symlink_metadata(root)?;
     if !meta.is_dir() || meta.file_type().is_symlink() {
         bail!("Scan root must be a real directory");
     }
-    let depth_offset = root.strip_prefix(namespace)?.components().count();
     let mut index = Index::new(root.to_owned());
     index.full_scan = true;
     let mut frames: Vec<Frame> = vec![];
@@ -254,7 +200,7 @@ fn walk(
         .max_open(32)
         .into_iter();
     while let Some(entry) = walker.next() {
-        checkpoint(cancel, budget)?;
+        check_cancelled(cancel)?;
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
@@ -296,30 +242,17 @@ fn walk(
             }
         };
         if entry.file_type().is_dir() {
-            let retained = frames
-                .last()
-                .is_none_or(|f| f.retained && f.node.flags & COLLAPSED == 0);
             let mut frame = Frame {
                 path: path.to_owned(),
                 depth: entry.depth(),
-                retained,
-                reused: false,
                 node: Node {
                     signature: signature(&meta),
-                    flags: if !retain_all
-                        && entry.depth() + depth_offset > 0
-                        && lazy(path, entry.depth() + depth_offset)
-                    {
-                        COLLAPSED
-                    } else {
-                        0
-                    },
                     ..Node::default()
                 },
             };
             let alias = !directories.insert((meta.dev(), meta.ino()));
             aliased |= alias;
-            let skip = excluded(namespace, path, &meta, frames.last(), exclusions) || alias;
+            let skip = excluded(root, path, &meta, frames.last(), exclusions) || alias;
             if skip {
                 frame.node.status = 1;
                 walker.skip_current_dir();
@@ -331,13 +264,11 @@ fn walk(
                 frame.node.entries = 1;
                 frame.node.own_entries = 1;
             }
-            if retained {
-                let mut running = frame.node.clone();
-                if !skip && !frame.reused {
-                    running.status = 4;
-                }
-                index.insert(path.to_owned(), running);
+            let mut running = frame.node.clone();
+            if !skip {
+                running.status = 4;
             }
+            index.insert(path.to_owned(), running);
             frames.push(frame);
         } else if let Some(frame) = frames.last_mut() {
             frame.node.entries += 1;
@@ -355,7 +286,7 @@ fn walk(
                     frame.node.own_logical += n.logical;
                     frame.node.own_allocated += n.allocated;
                 }
-                if linked && let Some(owner) = frames.iter_mut().rev().find(|f| f.retained) {
+                if linked && let Some(owner) = frames.last_mut() {
                     owner.node.flags |= LINKED;
                 }
             }
@@ -384,166 +315,5 @@ pub fn full(
     progress: Option<&Arc<Mutex<Progress>>>,
 ) -> Result<Index> {
     check_cancelled(cancel)?;
-    walk(root, root, exclusions, cancel, progress, None, true)
-}
-
-/// Replace invalidated subtrees in a persistent tree, then recompute their
-/// ancestors. Unaffected subtrees share their map nodes with the saved view;
-/// their files and directory metadata are not visited again.
-pub fn measure(
-    root: &Path,
-    exclusions: &[PathBuf],
-    previous: Option<&Index>,
-    dirty: &Regions,
-    cancel: &AtomicBool,
-    progress: Option<&Arc<Mutex<Progress>>>,
-) -> Result<Index> {
-    measure_with_options(
-        root,
-        exclusions,
-        previous,
-        dirty,
-        cancel,
-        progress,
-        Options::default(),
-    )
-}
-
-pub fn measure_with_options(
-    root: &Path,
-    exclusions: &[PathBuf],
-    previous: Option<&Index>,
-    dirty: &Regions,
-    cancel: &AtomicBool,
-    progress: Option<&Arc<Mutex<Progress>>>,
-    options: Options<'_>,
-) -> Result<Index> {
-    check_cancelled(cancel)?;
-    let full = |why: &'static str| -> Result<Index> {
-        if !options.allow_full {
-            return Err(NeedsFullReconciliation(why).into());
-        }
-        if let Some(progress) = progress {
-            progress.lock().unwrap().phase = why.into();
-        }
-        walk(
-            root,
-            root,
-            exclusions,
-            cancel,
-            progress,
-            options.budget,
-            false,
-        )
-    };
-    let Some(old) = previous.filter(|i| i.root == root && i.root_node().is_some()) else {
-        return full("Measuring full baseline");
-    };
-    let mut scopes = Regions::default();
-    for changed in dirty.paths() {
-        ensure_scope(root, changed)?;
-        let scope = changed
-            .ancestors()
-            .find(|p| {
-                old.nodes.contains_key(*p)
-                    && fs::symlink_metadata(p)
-                        .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
-            })
-            .context("No surviving indexed ancestor")?;
-        scopes.insert(scope.to_owned());
-    }
-    if scopes.paths().any(|p| p == root) {
-        return full("Full scope reconciliation");
-    }
-    if scopes.paths().any(|p| old.linked_intersects(p)) {
-        return full("Full reconciliation for shared hardlink or directory identities");
-    }
-    let mut candidate = old.clone();
-    candidate.full_scan = false;
-    candidate.visited = 0;
-    candidate.reused = old.root_node().map_or(0, |n| n.entries);
-    let mut ancestors = std::collections::BTreeSet::new();
-    for scope in scopes.paths() {
-        checkpoint(cancel, options.budget)?;
-        let subtree = walk(
-            scope,
-            root,
-            exclusions,
-            cancel,
-            progress,
-            options.budget,
-            false,
-        )?;
-        if !subtree.linked.is_empty() {
-            return full("Full reconciliation for newly shared hardlink identities");
-        }
-        candidate.visited += subtree.visited;
-        candidate.reused = candidate
-            .reused
-            .saturating_sub(old.nodes.get(scope).map_or(0, |n| n.entries));
-        candidate.remove_subtree(scope);
-        for (path, node) in subtree.nodes {
-            candidate.insert(path, node);
-        }
-        for parent in scope
-            .ancestors()
-            .skip(1)
-            .take_while(|p| p.starts_with(root))
-        {
-            ancestors.insert((
-                std::cmp::Reverse(parent.components().count()),
-                parent.to_owned(),
-            ));
-        }
-    }
-    for (_, path) in ancestors {
-        checkpoint(cancel, options.budget)?;
-        let before = old.nodes.get(&path).context("Missing aggregate ancestor")?;
-        let meta = fs::symlink_metadata(&path)?;
-        if meta.dev() != before.signature[0] || meta.ino() != before.signature[1] || !meta.is_dir()
-        {
-            return full("An indexed ancestor was replaced; full reconciliation");
-        }
-        let children = candidate.children.get(&path);
-        let own_error = before
-            .error_path
-            .as_ref()
-            .filter(|err| !children.into_iter().flatten().any(|p| err.starts_with(p)));
-        let mut node = before.clone();
-        node.signature = signature(&meta);
-        node.own_logical = meta.size();
-        node.own_allocated = meta.blocks() * 512;
-        node.logical = node.own_logical;
-        node.allocated = node.own_allocated;
-        node.entries = node.own_entries;
-        node.flags &= !REUSED;
-        node.status = if own_error.is_some() {
-            before.status
-        } else {
-            0
-        };
-        node.error = if own_error.is_some() { before.error } else { 0 };
-        node.error_path = own_error.cloned();
-        for child in children.into_iter().flatten() {
-            add(
-                &mut node,
-                candidate.nodes.get(child).context("Disconnected child")?,
-            )?;
-        }
-        candidate.insert(path, node);
-    }
-    publish(&mut candidate, &[], root, progress)?;
-    check_cancelled(cancel)?;
-    Ok(candidate)
-}
-
-fn ensure_scope(root: &Path, path: &Path) -> Result<()> {
-    anyhow::ensure!(
-        path.starts_with(root)
-            && !path
-                .components()
-                .any(|c| c == std::path::Component::ParentDir),
-        "Invalid changed region"
-    );
-    Ok(())
+    walk(root, exclusions, cancel, progress)
 }

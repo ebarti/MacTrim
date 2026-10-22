@@ -4,7 +4,7 @@ use crate::{
     history::{Change, Counts},
     model::{COLLAPSED, Index},
     scan,
-    store::{self, Generation, Store, bytes, prepare_private, private_file},
+    store::{self, Generation, bytes, prepare_private, private_file},
 };
 use anyhow::{Context, Result, ensure};
 use fs2::FileExt;
@@ -158,7 +158,7 @@ impl Snapshots {
             return Ok(());
         }
         if self.state.join("service.sqlite3").try_exists()?
-            && let Some(index) = Store::load_readonly(&self.state)?
+            && let Some(index) = store::load_legacy(&self.state)?
         {
             let old = Connection::open_with_flags(
                 self.state.join("service.sqlite3"),
@@ -169,17 +169,6 @@ impl Snapshots {
                     r.get(0)
                 })?;
             let old_generation: Generation = serde_json::from_str(&raw)?;
-            let old_identity: Option<String> = old
-                .query_row("SELECT value FROM meta WHERE key='identity'", [], |r| {
-                    r.get(0)
-                })
-                .optional()?;
-            let volume_uuid = old_identity
-                .as_deref()
-                .map(serde_json::from_str::<crate::model::Identity>)
-                .transpose()?
-                .filter(|i| i.volume_uuid.is_some())
-                .map(|i| i.namespace_uuid);
             let node = index.root_node().context("Legacy root missing")?;
             let generation = if old_generation.patches == 0 {
                 old_generation.clone()
@@ -194,7 +183,7 @@ impl Snapshots {
                 identity: filesystem::Identity {
                     device: node.signature[0],
                     inode: node.signature[1],
-                    volume_uuid,
+                    volume_uuid: None,
                 },
                 logical: node.logical,
                 allocated: node.allocated,
@@ -239,7 +228,7 @@ impl Snapshots {
             index.nodes.values().all(|n| n.status != 4),
             "A running measurement cannot be saved as a completed scan"
         );
-        let generation = Generation::update_controlled(&self.state, index, None, None, cancel)?;
+        let generation = Generation::write_cancellable(&self.state, index, cancel)?;
         let result = (|| {
             scan::check_cancelled(cancel)?;
             ensure!(

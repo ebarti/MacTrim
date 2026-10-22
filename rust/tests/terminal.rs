@@ -1,5 +1,5 @@
 #![cfg(target_os = "macos")]
-use mactrim_rs::service::{Request, request};
+use mactrim_rs::snapshots::Snapshots;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::{
     fs,
@@ -13,12 +13,6 @@ fn binary() -> PathBuf {
     std::env::var_os("MACTRIM_TEST_BINARY")
         .map(PathBuf::from)
         .unwrap_or_else(|| env!("CARGO_BIN_EXE_mactrim").into())
-}
-struct Service(PathBuf);
-impl Drop for Service {
-    fn drop(&mut self) {
-        let _ = request(&self.0, &Request::Stop);
-    }
 }
 struct Client(Box<dyn portable_pty::Child + Send + Sync>);
 impl Drop for Client {
@@ -47,7 +41,7 @@ fn selected(content: &str, path: &Path) -> bool {
         .any(|line| line.starts_with(&format!("{} ·", path.display())))
 }
 #[test]
-fn actual_terminal_preserves_selection_and_closing_client_keeps_service_alive() {
+fn actual_terminal_full_scans_save_compare_and_quit_without_background_work() {
     let temp = tempfile::tempdir().unwrap();
     let base = fs::canonicalize(temp.path()).unwrap();
     let root = base.join("files");
@@ -69,12 +63,12 @@ fn actual_terminal_preserves_selection_and_closing_client_keeps_service_alive() 
     command.arg(&state);
     command.arg("storage");
     command.arg(&root);
+    command.env("HOME", &base);
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
     command.env_remove("NO_COLOR");
     let mut client = Client(pair.slave.spawn_command(command).unwrap());
     drop(pair.slave);
-    let _service = Service(state.clone());
     let mut writer = pair.master.take_writer().unwrap();
     let mut reader = pair.master.try_clone_reader().unwrap();
     let parser = Arc::new(Mutex::new(vt100::Parser::new(45, 140, 0)));
@@ -89,15 +83,27 @@ fn actual_terminal_preserves_selection_and_closing_client_keeps_service_alive() 
         }
     });
     wait_screen(&parser, |s| {
-        s.contains("Index saved; incremental tracking active") && selected(s, &root.join("a"))
+        s.contains("Scan #1 saved") && selected(s, &root.join("a"))
     });
     writer.write_all(b"\x1b[B").unwrap();
     writer.flush().unwrap();
     wait_screen(&parser, |s| selected(s, &root.join("b")));
-    let pid = request(&state, &Request::Status).unwrap().status.pid;
     fs::write(root.join("b/data"), vec![2; 131072]).unwrap();
+    thread::sleep(Duration::from_millis(750));
+    assert_eq!(
+        Snapshots::read_only(&state)
+            .unwrap()
+            .unwrap()
+            .list(None)
+            .unwrap()
+            .len(),
+        1,
+        "An edit must not start an update"
+    );
+    writer.write_all(b"r").unwrap();
+    writer.flush().unwrap();
     wait_screen(&parser, |s| {
-        selected(s, &root.join("b")) && s.contains("128.0 KiB")
+        selected(s, &root.join("b")) && s.contains("Scan #2 saved")
     });
     thread::sleep(Duration::from_millis(750));
     assert!(
@@ -110,16 +116,56 @@ fn actual_terminal_preserves_selection_and_closing_client_keeps_service_alive() 
         s.lines()
             .any(|l| l.trim() == root.join("b").to_string_lossy())
     });
-    assert_eq!(request(&state, &Request::Status).unwrap().status.pid, pid);
+    assert_eq!(
+        Snapshots::read_only(&state)
+            .unwrap()
+            .unwrap()
+            .list(None)
+            .unwrap()
+            .len(),
+        2,
+        "Browsing must not start another scan"
+    );
+    writer.write_all(b"g").unwrap();
+    writer.flush().unwrap();
     let mut evidence = String::new();
     for marker in [
         "Validate → exact approval",
-        "Directory deltas",
+        "Saved comparison",
         "Restore / separately approved purge",
     ] {
         writer.write_all(b"\t").unwrap();
         writer.flush().unwrap();
-        let screen = wait_screen(&parser, |s| s.contains(marker));
+        let mut screen = wait_screen(&parser, |s| s.contains(marker));
+        if marker == "Saved comparison" {
+            let pair = |s: &str, from: u64, to: u64| {
+                s.lines().any(|l| {
+                    l.contains(&format!("Saved comparison #{from} "))
+                        && l.contains(&format!("→ #{to} "))
+                })
+            };
+            wait_screen(&parser, |s| {
+                pair(s, 1, 2) && s.contains(&root.join("b").to_string_lossy().to_string())
+            });
+            writer.write_all(b"s").unwrap();
+            writer.flush().unwrap();
+            wait_screen(&parser, |s| {
+                s.contains("Compare saved scans") && s.contains("#1") && s.contains("#2")
+            });
+            writer.write_all(b"2 1\r").unwrap();
+            writer.flush().unwrap();
+            wait_screen(&parser, |s| {
+                pair(s, 2, 1) && !s.contains("Compare saved scans")
+            });
+            writer.write_all(b"s").unwrap();
+            writer.flush().unwrap();
+            wait_screen(&parser, |s| s.contains("Compare saved scans"));
+            writer.write_all(b"\r").unwrap();
+            writer.flush().unwrap();
+            screen = wait_screen(&parser, |s| {
+                pair(s, 1, 2) && !s.contains("Compare saved scans")
+            });
+        }
         evidence.push_str(&screen);
         evidence.push_str("\n\n");
     }
@@ -138,7 +184,7 @@ fn actual_terminal_preserves_selection_and_closing_client_keeps_service_alive() 
         fs::create_dir_all(&dir).unwrap();
         fs::write(PathBuf::from(dir).join("native-terminal.txt"), evidence).unwrap();
     }
-    writer.write_all(b"q").unwrap();
+    writer.write_all(b"qY").unwrap();
     writer.flush().unwrap();
     let started = Instant::now();
     loop {
@@ -146,14 +192,19 @@ fn actual_terminal_preserves_selection_and_closing_client_keeps_service_alive() 
             assert!(status.success());
             break;
         }
-        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{}",
+            parser.lock().unwrap().screen().contents()
+        );
         thread::sleep(Duration::from_millis(50));
     }
-    assert_eq!(
-        request(&state, &Request::Status).unwrap().status.pid,
-        pid,
-        "Closing the UI must leave the same service running"
+    assert!(
+        Snapshots::open(&state).is_ok(),
+        "Quitting releases the scan writer"
     );
+    assert!(!state.join("service.sock").exists());
+    assert!(!state.join("service.sqlite3").exists());
     drop(writer);
     drop(pair.master);
     reading.join().unwrap();

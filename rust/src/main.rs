@@ -1,32 +1,28 @@
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use mactrim_rs::{
-    model::Progress,
-    regions::Regions,
-    scan,
-    service::{self, Request},
-    store,
+    filesystem, scan,
+    session::{self},
+    snapshots::{Capture, Snapshot, Snapshots},
+    ui::size,
 };
 use std::{
     fs,
     io::{self, Write},
-    os::unix::process::CommandExt,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    sync::{Arc, Mutex, atomic::AtomicBool},
-    time::{Duration, Instant},
+    sync::{Arc, atomic::AtomicBool},
 };
 
 #[derive(Parser)]
 #[command(
     name = "mactrim",
     version,
-    about = "Rust storage explorer and persistent change tracker"
+    about = "Terminal disk usage explorer; full scans with saved comparisons"
 )]
 struct Args {
     #[arg(long, global = true)]
     state: Option<PathBuf>,
-    /// Print JSON for service controls, status, refresh and Storage.
+    /// Print structured output instead of human-readable results.
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
@@ -39,42 +35,52 @@ enum Commands {
         #[arg(default_value = "/")]
         root: PathBuf,
     },
+    /// Measure every accessible directory and save a distinct completed scan.
     Scan {
         #[arg(default_value = "/")]
         root: PathBuf,
     },
+    /// Open the terminal app and start a full scan. Quitting stops all work.
     #[command(alias = "tui")]
     Storage {
         #[arg(default_value = "/")]
         root: PathBuf,
     },
+    /// Show the latest saved scan. Does not start a process or scan.
     Status,
+    /// List saved scans, newest first.
+    Snapshots {
+        root: Option<PathBuf>,
+    },
+    /// Compare two saved scans of the same root; defaults to the latest pair.
     History {
         #[arg(default_value = "/")]
         path: PathBuf,
-        #[arg(long, default_value = "60")]
-        days: u64,
+        #[arg(long)]
+        from: Option<u64>,
+        #[arg(long)]
+        to: Option<u64>,
         #[arg(long, default_value = "0")]
         offset: usize,
         #[arg(long, default_value = "200")]
         limit: usize,
     },
+    /// Run another full scan; no change journal or event tracking is used.
     Refresh {
-        #[arg(long)]
-        full: bool,
+        #[arg(default_value = "/")]
+        root: PathBuf,
     },
+    /// Browse a saved directory tree without starting another scan.
     List {
         path: PathBuf,
+        #[arg(long)]
+        scan: Option<u64>,
         #[arg(long, default_value = "0")]
         offset: usize,
         #[arg(long, default_value = "200")]
         limit: usize,
         #[arg(long)]
         logical: bool,
-    },
-    Service {
-        #[command(subcommand)]
-        action: Service,
     },
     Cleanup {
         #[command(subcommand)]
@@ -110,44 +116,6 @@ enum Cleanup {
     Recover,
     Activity,
 }
-#[derive(Subcommand)]
-enum Service {
-    /// Inspect or change the background scanner's share of one CPU core.
-    Policy {
-        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=100))]
-        cpu_percent: Option<u8>,
-    },
-    Retention {
-        #[arg(long)]
-        days: u64,
-    },
-    Install {
-        #[arg(default_value = "/")]
-        root: PathBuf,
-    },
-    Uninstall,
-    Plist {
-        #[arg(default_value = "/")]
-        root: PathBuf,
-    },
-    Run {
-        #[arg(default_value = "/")]
-        root: PathBuf,
-    },
-    Start {
-        #[arg(default_value = "/")]
-        root: PathBuf,
-    },
-    /// Gracefully stop and start again, reusing the configured root by default.
-    Restart {
-        root: Option<PathBuf>,
-    },
-    /// Show service status, including when the service is stopped.
-    Status,
-    Stop,
-    Pause,
-}
-
 fn default_state() -> Result<PathBuf> {
     Ok(
         PathBuf::from(std::env::var_os("HOME").context("HOME unavailable; supply --state")?)
@@ -165,200 +133,92 @@ fn signal_flag() -> Result<Arc<AtomicBool>> {
     }
     Ok(flag)
 }
-pub fn start(state: &Path, root: &Path) -> Result<()> {
-    let root = fs::canonicalize(root).context("Cannot access scan root")?;
-    match service::request(state, &Request::Status) {
-        Ok(reply) => {
-            ensure!(
-                reply.status.root == root,
-                "Running service belongs to another root; use a separate --state directory"
-            );
-            return Ok(());
-        }
-        Err(e) if e.is::<service::ServiceUnavailable>() => {}
-        Err(e) => return Err(e),
-    }
-    if let Some(saved) = store::Store::configured_root(state)? {
-        ensure!(
-            saved == root,
-            "This state belongs to another root; use a separate --state directory"
-        );
-    }
-    store::prepare_private(state)?;
-    let managed = mactrim_rs::agent::start_managed(state)?;
-    let log = store::private_file(&state.join("service.log"), true)?;
-    // Append inherited child output without reopening an unchecked pathname.
-    use std::os::fd::AsRawFd;
-    ensure!(
-        unsafe { libc::fcntl(log.as_raw_fd(), libc::F_SETFL, libc::O_APPEND) } >= 0,
-        "Cannot open service log for append"
-    );
-    let mut command = Command::new(std::env::current_exe()?);
-    command
-        .args(["--state"])
-        .arg(state)
-        .args(["service", "run"])
-        .arg(&root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log.try_clone()?))
-        .stderr(Stdio::from(log))
-        .current_dir("/");
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let mut child = if managed {
-        None
-    } else {
-        Some(command.spawn()?)
-    };
-    let started = Instant::now();
-    loop {
-        match service::request(state, &Request::Status) {
-            Ok(reply) => {
-                ensure!(
-                    reply.status.root == root,
-                    "Running service belongs to another root"
-                );
-                return Ok(());
-            }
-            Err(e) if e.is::<service::ServiceUnavailable>() => {}
-            Err(e) => return Err(e),
-        }
-        if let Some(code) = child.as_mut().map(|c| c.try_wait()).transpose()?.flatten() {
-            anyhow::bail!(
-                "Service exited ({code}); inspect {}",
-                state.join("service.log").display()
-            );
-        }
-        ensure!(
-            started.elapsed() < Duration::from_secs(10),
-            "Service is still starting; inspect {}",
-            state.join("service.log").display()
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
-fn restart(state: &Path, root: Option<PathBuf>) -> Result<()> {
-    let running = match service::request(state, &Request::Status) {
-        Ok(reply) => Some(reply.status.root),
-        Err(e) if e.is::<service::ServiceUnavailable>() => None,
-        Err(e) => return Err(e),
-    };
-    let configured = store::Store::configured_root(state)?;
-    let root = fs::canonicalize(
-        root.or_else(|| running.clone())
-            .or_else(|| configured.clone())
-            .unwrap_or_else(|| "/".into()),
-    )
-    .context("Cannot access scan root")?;
-    for existing in running.iter().chain(configured.iter()) {
-        ensure!(
-            existing == &root,
-            "This service belongs to another root; use a separate --state directory"
-        );
-    }
-    service::stop(state)?;
-    start(state, &root)
-}
+
 fn print<T: serde::Serialize>(value: T) -> Result<()> {
-    let mut out = io::stdout().lock();
-    serde_json::to_writer_pretty(&mut out, &value)?;
-    writeln!(out)?;
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    serde_json::to_writer_pretty(&mut output, &value)?;
+    writeln!(&mut output)?;
     Ok(())
 }
-fn print_or_text<T: serde::Serialize>(json: bool, value: &T, text: &str) -> Result<()> {
-    if json {
-        print(value)
+fn absolute(path: &Path) -> Result<PathBuf> {
+    let path = if path.is_absolute() {
+        path.to_owned()
     } else {
-        writeln!(io::stdout().lock(), "{text}").map_err(Into::into)
+        std::env::current_dir()?.join(path)
+    };
+    ensure!(
+        !path
+            .components()
+            .any(|c| c == std::path::Component::ParentDir),
+        "Use an absolute path without '..'"
+    );
+    Ok(path)
+}
+fn catalog(state: &Path) -> Result<Option<Snapshots>> {
+    if !state.join("scans.sqlite3").try_exists()? && state.join("service.sqlite3").try_exists()? {
+        // Read-only import of the last legacy tree; its original files remain intact.
+        drop(Snapshots::open(state)?);
+    }
+    Snapshots::read_only(state)
+}
+fn when(at: u64) -> String {
+    chrono::DateTime::from_timestamp(at as i64, 0)
+        .map(|t| {
+            t.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S %Z")
+                .to_string()
+        })
+        .unwrap_or_else(|| "unknown time".into())
+}
+fn print_snapshot(snapshot: &Snapshot) {
+    println!("Scan #{} saved — {}", snapshot.id, snapshot.coverage_name());
+    println!("Root: {}", snapshot.root.display());
+    println!("Finished: {}", when(snapshot.finished));
+    println!(
+        "Usage: {} allocated; {} logical",
+        size(snapshot.allocated),
+        size(snapshot.logical)
+    );
+    if snapshot.imported {
+        println!(
+            "Imported index: {} directory aggregates; {} recorded entries",
+            snapshot.directories, snapshot.visited
+        );
+        println!("Imported from the previous saved index; original data preserved.");
+    } else {
+        println!(
+            "Full traversal: {} entries visited; {} directory aggregates saved",
+            snapshot.visited, snapshot.directories
+        );
+    }
+    if snapshot.coverage != 0 {
+        println!(
+            "Coverage is incomplete: unreadable, changing or excluded areas are identified in the saved tree."
+        );
     }
 }
-fn print_service_status(reply: &service::Reply, json: bool, heading: &str) -> Result<()> {
+fn full_scan(state: &Path, root: &Path, json: bool) -> Result<()> {
+    let root = fs::canonicalize(root).context("Cannot access scan root")?;
+    ensure!(state != root, "State directory cannot be the scan root");
+    let cancel = signal_flag()?;
+    let mut catalog = Snapshots::open(state)?;
+    let capture = Capture::begin(&root)?;
+    let index = scan::full(&root, &[state.to_owned()], &cancel, None)?;
+    let snapshot = catalog.save(&index, &capture, &cancel)?;
     if json {
-        return print(reply);
-    }
-    let mut out = io::stdout().lock();
-    let s = &reply.status;
-    if s.pid == 0 {
-        return writeln!(
-            out,
-            "MacTrim service is {}.",
-            if s.phase == "Stopped" {
-                "stopped"
-            } else {
-                "starting or stopping"
-            }
-        )
-        .map_err(Into::into);
-    }
-    writeln!(out, "{heading} (PID {}).", s.pid)?;
-    writeln!(out, "Root: {}", s.root.display())?;
-    writeln!(out, "Activity: {}", s.phase)?;
-    if s.running || s.detail_running {
-        writeln!(
-            out,
-            "Progress: {} entries visited; {} reused",
-            s.visited, s.reused
-        )?;
-        writeln!(
-            out,
-            "Measured so far: {} allocated",
-            mactrim_rs::ui::size(s.observed_allocated)
-        )?;
-    }
-    if s.loading {
-        writeln!(out, "Saved index: loading")?;
-    } else if s.last_saved == 0 {
-        writeln!(out, "Saved index: no completed scan yet")?;
+        print(snapshot)
     } else {
-        writeln!(
-            out,
-            "Saved index: {} directories; service data: {}",
-            s.directories,
-            mactrim_rs::ui::size(s.index_bytes)
-        )?;
+        print_snapshot(&snapshot);
+        println!(
+            "Compare saved scans with: mactrim history {}",
+            root.display()
+        );
+        if let Some(warning) = catalog.import_warning()? {
+            println!("{warning}");
+        }
+        Ok(())
     }
-    writeln!(out, "Pending regions: {}", s.pending_regions)?;
-    if s.cpu_percent != 0 {
-        writeln!(
-            out,
-            "Background scanner budget: {}% of one core",
-            s.cpu_percent
-        )?;
-    }
-    if let Some(verification) = &s.verification {
-        writeln!(
-            out,
-            "Verification needed: {}; full rescans require an explicit request",
-            verification.reason
-        )?;
-    }
-    if s.finish_then_idle && (s.running || s.detail_running) {
-        writeln!(
-            out,
-            "After this scan: save and become idle; Refresh resumes measurement"
-        )?;
-    }
-    if let Some(interruption) = &s.last_interruption {
-        let at = chrono::DateTime::from_timestamp(interruption.at as i64, 0)
-            .map(|at| at.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-            .unwrap_or_else(|| interruption.at.to_string());
-        writeln!(out, "Last interruption: {} ({at})", interruption.reason)?;
-    }
-    if let Some(node) = &s.root_node
-        && node.status > 1
-    {
-        writeln!(out, "Coverage: {}", node.status_name())?;
-    }
-    if let Some(error) = &s.error {
-        writeln!(out, "Problem: {error}")?;
-    }
-    Ok(())
 }
 fn main() {
     if let Err(error) = run() {
@@ -368,156 +228,179 @@ fn main() {
 }
 fn run() -> Result<()> {
     let args = Args::parse();
-    let json = args.json;
-    let state = service::state_path(&args.state.unwrap_or(default_state()?))?;
+    let state = session::state_path(&absolute(&args.state.unwrap_or(default_state()?))?)?;
     match args
         .command
         .unwrap_or(Commands::Storage { root: "/".into() })
     {
         Commands::BuildInfo => build_info(),
-        Commands::Doctor { root } => doctor(&state, &root),
-        Commands::Cleanup { action } => cleanup_command(&state, action),
-        Commands::Scan { root } => {
-            let root = fs::canonicalize(root)?;
-            let progress = Arc::new(Mutex::new(Progress {
-                view: root.clone(),
-                ..Progress::default()
-            }));
-            let index = scan::measure(
-                &root,
-                &[state],
-                None,
-                &Regions::default(),
-                signal_flag()?.as_ref(),
-                Some(&progress),
-            )?;
-            print(
-                serde_json::json!({"root":root,"node":index.root_node(),"visited":index.visited,"directories":index.nodes.len(),"rows":index.rows(&root,false)}),
-            )
-        }
+        Commands::Doctor { root } => doctor(&state, &root, args.json),
+        Commands::Scan { root } | Commands::Refresh { root } => full_scan(&state, &root, args.json),
         Commands::Storage { root } => {
-            let root = fs::canonicalize(root)?;
-            if !json {
-                use std::io::IsTerminal;
-                ensure!(
-                    io::stdout().is_terminal(),
-                    "The TUI needs a terminal; use --json for machine-readable status"
-                );
+            if args.json {
+                return full_scan(&state, &root, true);
             }
-            start(&state, &root)?;
-            if json {
-                print(service::request(&state, &Request::Status)?)
+            let root = fs::canonicalize(root).context("Cannot access scan root")?;
+            ensure!(root != state, "State directory cannot be the scan root");
+            mactrim_rs::ui::run(state, root, signal_flag()?)
+        }
+        Commands::Status => {
+            let latest = catalog(&state)?
+                .map(|c| c.list(None))
+                .transpose()?
+                .and_then(|s| s.into_iter().next());
+            if args.json {
+                print(serde_json::json!({"mode":"terminal-only","latest":latest}))
             } else {
-                mactrim_rs::ui::run(state, root, signal_flag()?)
+                println!("Terminal-only mode; no background service.");
+                if let Some(snapshot) = latest {
+                    print_snapshot(&snapshot);
+                } else {
+                    println!("No completed scans yet. Run mactrim storage / or mactrim scan /.");
+                }
+                Ok(())
             }
         }
-        Commands::Status => print_service_status(
-            &service::status(&state)?,
-            json,
-            "MacTrim service is running",
-        ),
+        Commands::Snapshots { root } => {
+            let root = root.as_deref().map(absolute).transpose()?;
+            let scans = catalog(&state)?
+                .map(|c| c.list(root.as_deref()))
+                .transpose()?
+                .unwrap_or_default();
+            if args.json {
+                print(scans)
+            } else {
+                if scans.is_empty() {
+                    println!("No completed scans yet.");
+                }
+                for s in scans {
+                    println!(
+                        "#{:<5} {}  {:<8} {:>12}  {}{}",
+                        s.id,
+                        when(s.finished),
+                        s.coverage_name(),
+                        size(s.allocated),
+                        s.root.display(),
+                        if s.imported { " [imported]" } else { "" }
+                    );
+                }
+                Ok(())
+            }
+        }
         Commands::History {
             path,
-            days,
+            from,
+            to,
             offset,
             limit,
-        } => print(service::request(
-            &state,
-            &Request::History {
-                path,
-                since: store::now().saturating_sub(days.saturating_mul(86400)),
-                offset,
-                limit,
-            },
-        )?),
-        Commands::Refresh { full } => print_service_status(
-            &service::request(&state, &Request::Refresh { full })?,
-            json,
-            "Storage refresh requested",
-        ),
+        } => {
+            drop(catalog(&state)?);
+            let reply = session::history(&state, &absolute(&path)?, from, to, offset, limit)?;
+            if args.json {
+                return print(reply);
+            }
+            if let (Some(a), Some(b)) = (&reply.compare_from, &reply.compare_to) {
+                println!(
+                    "Scan #{} ({}) → #{} ({})",
+                    a.id,
+                    when(a.finished),
+                    b.id,
+                    when(b.finished)
+                );
+                if reply.same_filesystem == Some(false) {
+                    println!("Root identity changed; growth is unknown.");
+                }
+                println!(
+                    "{:>13} {:>13} {:>13}  Directory",
+                    "Growth", "Before", "After"
+                );
+                for c in &reply.history {
+                    let growth = c
+                        .growth()
+                        .map(|n| {
+                            format!(
+                                "{}{}",
+                                if n >= 0 { "+" } else { "-" },
+                                size(n.unsigned_abs().min(u64::MAX as u128) as u64)
+                            )
+                        })
+                        .unwrap_or_else(|| "UNKNOWN".into());
+                    println!(
+                        "{:>13} {:>13} {:>13}  {}",
+                        growth,
+                        c.before
+                            .as_ref()
+                            .map(|n| size(n.allocated))
+                            .unwrap_or_else(|| "unknown".into()),
+                        c.after
+                            .as_ref()
+                            .map(|n| size(n.allocated))
+                            .unwrap_or_else(|| "unknown".into()),
+                        c.path.display()
+                    );
+                }
+                if reply.history.is_empty() {
+                    println!("No directory size changes in this scope.");
+                }
+            }
+            println!("{}", reply.message);
+            Ok(())
+        }
         Commands::List {
             path,
+            scan,
             offset,
             limit,
             logical,
-        } => print(service::request(
-            &state,
-            &Request::List {
-                path: fs::canonicalize(path)?,
-                offset,
-                limit,
-                logical,
-                anchor: None,
-            },
-        )?),
-        Commands::Service { action } => match action {
-            Service::Policy { cpu_percent } => {
-                let reply = service::request(&state, &Request::Policy { cpu_percent })?;
-                print_or_text(json, &reply, &reply.message)
-            }
-            Service::Retention { days } => print_or_text(
-                json,
-                &service::request(&state, &Request::Retention { days })?,
-                &format!("History retention set to {days} days."),
-            ),
-            Service::Install { root } => {
-                let root = fs::canonicalize(root)?;
-                let app = mactrim_rs::agent::install(&state, &root)?;
-                print_or_text(
-                    json,
-                    &serde_json::json!({"installed":app,"state":state,"root":root,"label":mactrim_rs::agent::LABEL,"note":"Per-user storage service installed. Privacy permissions are controlled by macOS."}),
-                    &format!(
-                        "MacTrim service installed and started for {}.\nStarts automatically when you log in.\nHelper: {}\nState: {}",
-                        root.display(),
-                        app.display(),
-                        state.display()
-                    ),
+        } => {
+            ensure!(limit > 0 && limit <= 500, "Page size must be 1..500");
+            let path = absolute(&path)?;
+            let catalog = catalog(&state)?.context("No saved scan; run mactrim scan first")?;
+            let snapshot = if let Some(id) = scan {
+                catalog.get(id)?
+            } else {
+                catalog
+                    .list(None)?
+                    .into_iter()
+                    .find(|s| path.starts_with(&s.root))
+                    .context("No saved scan for this directory")?
+            };
+            ensure!(
+                path.starts_with(&snapshot.root),
+                "Path outside saved scan root"
+            );
+            let index = catalog.load(&snapshot)?;
+            let (rows, more, offset) =
+                session::directory_rows(Some(&index), &path, logical, offset, limit, None)?;
+            if args.json {
+                print(
+                    serde_json::json!({"snapshot":snapshot,"rows":rows,"more":more,"offset":offset}),
                 )
+            } else {
+                println!("Saved scan #{} · {}", snapshot.id, path.display());
+                for r in rows {
+                    println!(
+                        "{:<9} {:>12}  {}{}",
+                        r.node.status_name(),
+                        size(if logical {
+                            r.node.logical
+                        } else {
+                            r.node.allocated
+                        }),
+                        r.path
+                            .file_name()
+                            .unwrap_or(r.path.as_os_str())
+                            .to_string_lossy(),
+                        if r.directory { "/" } else { "" }
+                    );
+                }
+                if more {
+                    println!("More rows; use --offset {}", offset + limit);
+                }
+                Ok(())
             }
-            Service::Uninstall => {
-                mactrim_rs::agent::uninstall(&state)?;
-                print_or_text(
-                    json,
-                    &serde_json::json!({"uninstalled":mactrim_rs::agent::LABEL,"state_preserved":state}),
-                    "MacTrim login service uninstalled. Saved index, history and recovery data are preserved.",
-                )
-            }
-            Service::Plist { root } => {
-                mactrim_rs::agent::plist_value(&state, &fs::canonicalize(root)?)?
-                    .to_writer_xml(io::stdout().lock())
-                    .map_err(Into::into)
-            }
-            Service::Run { root } => service::run(root, state, signal_flag()?),
-            Service::Start { root } => {
-                start(&state, &root)?;
-                print_service_status(
-                    &service::request(&state, &Request::Status)?,
-                    json,
-                    "MacTrim service is running",
-                )
-            }
-            Service::Restart { root } => {
-                restart(&state, root)?;
-                print_service_status(
-                    &service::request(&state, &Request::Status)?,
-                    json,
-                    "MacTrim service restarted",
-                )
-            }
-            Service::Status => print_service_status(
-                &service::status(&state)?,
-                json,
-                "MacTrim service is running",
-            ),
-            Service::Stop => {
-                let reply = service::stop(&state)?;
-                print_or_text(json, &reply, &reply.message)
-            }
-            Service::Pause => {
-                let reply = service::request(&state, &Request::Pause)?;
-                print_or_text(json, &reply, &reply.message)
-            }
-        },
+        }
+        Commands::Cleanup { action } => cleanup_command(&state, action),
     }
 }
 fn build_info() -> Result<()> {
@@ -538,33 +421,46 @@ fn build_info() -> Result<()> {
         serde_json::json!({"version":env!("CARGO_PKG_VERSION"),"revision":option_env!("MACTRIM_REVISION").unwrap_or("development"),"source_sha256":option_env!("MACTRIM_SOURCE_SHA256").unwrap_or("development"),"dirty":option_env!("MACTRIM_DIRTY").map(|s|s=="true"),"architecture":std::env::consts::ARCH,"os":std::env::consts::OS,"binary_bytes":f.metadata()?.len(),"binary_sha256":format!("{:x}",hash.finalize()),"runtime":"Rust; no Python interpreter","executable":executable}),
     )
 }
-fn doctor(state: &Path, root: &Path) -> Result<()> {
-    use mactrim_rs::events;
+
+fn doctor(state: &Path, root: &Path, json: bool) -> Result<()> {
     let root = fs::canonicalize(root)?;
-    let (used, available) = service::capacity(&root)?;
+    let (used, available) = filesystem::capacity(&root)?;
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME unavailable")?);
     let probes = [
-        home.join("Library/Mail"),
-        home.join("Library/Messages"),
-        home.join("Library/Containers"),
-        home.join("Library/Group Containers"),
+        "Library/Mail",
+        "Library/Messages",
+        "Library/Containers",
+        "Library/Group Containers",
     ]
     .into_iter()
     .map(|p| {
-        let status = match fs::read_dir(&p) {
-            Ok(_) => "directory enumeration allowed".to_owned(),
+        let path = home.join(p);
+        let status = match fs::read_dir(&path) {
+            Ok(_) => "directory enumeration allowed".into(),
             Err(e) if e.kind() == io::ErrorKind::NotFound => "not present".into(),
             Err(e) => format!("{e}"),
         };
-        serde_json::json!({"path":p,"status":status})
+        (path, status)
     })
     .collect::<Vec<_>>();
-    let service = service::request(state, &Request::Status)
-        .map(|r| r.status)
-        .ok();
-    print(
-        serde_json::json!({"root":root,"state":state,"uid":unsafe{libc::geteuid()},"volume":events::identity(&root)?,"filesystem_used":used,"filesystem_available":available,"access_probes":probes,"service":service,"note":"Access is reported per scope. Full Disk Access does not override Unix permissions, SIP, unavailable mounts or changing entries. No file contents were read."}),
-    )
+    if json {
+        print(
+            serde_json::json!({"mode":"terminal-only","root":root,"state":state,"volume":filesystem::identity(&root)?,"filesystem_used":used,"filesystem_available":available,"access_probes":probes}),
+        )
+    } else {
+        println!(
+            "Terminal-only mode; no event monitoring.\nRoot: {}\nState: {}\nFilesystem: {} used; {} available",
+            root.display(),
+            state.display(),
+            size(used),
+            size(available)
+        );
+        for (p, s) in probes {
+            println!("{}: {s}", p.display());
+        }
+        println!("Full Disk Access and Unix permissions apply to this terminal process.");
+        Ok(())
+    }
 }
 fn approval(provided: Option<String>, expected: &str) -> Result<String> {
     if let Some(text) = provided {

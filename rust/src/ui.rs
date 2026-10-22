@@ -1,9 +1,10 @@
-//! Ratatui client. Navigation is local view state; the daemon owns measurement.
+//! Terminal app with one owned full-scan worker and saved scan comparisons.
 use crate::{
     cleanup::{self, Actions, Candidate, Journal, Plan},
     history::Change,
     model::COLLAPSED,
-    service::{self, Reply, Request, Row, Status},
+    session::{Reply, Request, Row, Session, Status},
+    snapshots::Snapshot,
 };
 use anyhow::{Context, Result};
 use crossterm::{
@@ -99,7 +100,9 @@ impl Tab {
     }
 }
 enum Confirm {
-    PauseStorage,
+    CancelScan,
+    Quit,
+    CompareScans,
     CancelCleanup,
     FullRescan,
     Quarantine(Plan),
@@ -127,6 +130,11 @@ struct App {
     view: PathBuf,
     tab: Tab,
     status: Status,
+    session: Option<Arc<Session>>,
+    snapshots: Vec<Snapshot>,
+    compare_from: Option<u64>,
+    compare_to: Option<u64>,
+    compared: Option<(Snapshot, Snapshot)>,
     reply: Reply,
     rows: Vec<Row>,
     selected: Option<PathBuf>,
@@ -169,6 +177,11 @@ impl App {
             root,
             tab: Tab::Storage,
             status: Status::default(),
+            session: None,
+            snapshots: vec![],
+            compare_from: None,
+            compare_to: None,
+            compared: None,
             reply: Reply::default(),
             rows: vec![],
             selected: None,
@@ -179,7 +192,7 @@ impl App {
             pending: false,
             last_poll: Instant::now() - Duration::from_secs(5),
             sender,
-            message: "Connecting to persistent storage service".into(),
+            message: "Starting a full scan; completed scans save automatically".into(),
             prompt: None,
             candidates: vec![],
             chosen: BTreeSet::new(),
@@ -229,13 +242,15 @@ impl App {
         }))
     }
     fn control(&mut self, request: Request) {
-        let state = self.state.clone();
+        let Some(session) = self.session.clone() else {
+            return;
+        };
         let tx = self.sender.clone();
         thread::spawn(move || {
-            let _ = tx.send(Message::Control(service::request(&state, &request)));
+            let _ = tx.send(Message::Control(session.request(&request)));
         });
     }
-    fn navigate(&mut self, path: PathBuf, lazy: bool) {
+    fn navigate(&mut self, path: PathBuf, _lazy: bool) {
         if !path.starts_with(&self.root) {
             return;
         }
@@ -246,11 +261,6 @@ impl App {
         self.selected = None;
         self.table.select(None);
         self.last_poll = Instant::now() - Duration::from_secs(5);
-        if lazy {
-            self.control(Request::Expand { path });
-            self.message =
-                "Details requested; the existing scan keeps its scope and progress".into();
-        }
     }
     fn poll(&mut self) {
         let interval = if self.tab == Tab::History {
@@ -266,7 +276,10 @@ impl App {
         }
         self.pending = true;
         self.last_poll = Instant::now();
-        let state = self.state.clone();
+        let Some(session) = self.session.clone() else {
+            self.pending = false;
+            return;
+        };
         let tx = self.sender.clone();
         let version = self.version;
         let view = self.view.clone();
@@ -275,11 +288,7 @@ impl App {
         let anchor = self.selected.clone();
         let tab = self.tab;
         let history_offset = self.history_offset;
-        let history_days = if self.status.history_days == 0 {
-            60
-        } else {
-            self.status.history_days
-        };
+        let (from, to) = (self.compare_from, self.compare_to);
         thread::spawn(move || {
             let request = if tab == Tab::Storage {
                 Request::List {
@@ -292,12 +301,13 @@ impl App {
             } else {
                 Request::History {
                     path: view,
-                    since: crate::store::now().saturating_sub(history_days.saturating_mul(86400)),
+                    from,
+                    to,
                     offset: history_offset,
                     limit: 200,
                 }
             };
-            let reply = service::request(&state, &request);
+            let reply = session.request(&request);
             let _ = tx.send(if tab == Tab::Storage {
                 Message::Storage(version, reply)
             } else {
@@ -444,11 +454,6 @@ impl App {
                                 self.table.selected().unwrap_or(0).min(reply.rows.len() - 1)
                             })
                         });
-                        if self.message.starts_with("Connecting")
-                            || self.message.starts_with("Service:")
-                        {
-                            self.message="Navigation reuses observations; the daemon keeps measuring when this client closes".into();
-                        }
                         self.status = reply.status.clone();
                         self.rows = reply.rows.clone();
                         self.offset = reply.offset;
@@ -460,7 +465,7 @@ impl App {
                             self.table.select(None);
                         }
                     }
-                    Err(e) => self.message = format!("Service: {e:#}"),
+                    Err(e) => self.message = format!("Storage: {e:#}"),
                 }
             }
             Message::History(version, result) => {
@@ -470,6 +475,9 @@ impl App {
                 }
                 match result {
                     Ok(reply) => {
+                        self.snapshots = reply.snapshots;
+                        self.compared = reply.compare_from.zip(reply.compare_to);
+                        self.message = reply.message;
                         self.status = reply.status;
                         self.history = reply.history;
                         self.capacity_history = reply.capacity_history;
@@ -566,6 +574,21 @@ impl App {
             }
         }
     }
+    fn quit(&mut self) -> bool {
+        if self.busy {
+            self.message = "A data action is finishing; its recovery journal is durable".into();
+            return false;
+        }
+        if self.status.running || self.cleanup_running {
+            self.prompt = Some(Prompt {
+                kind: Confirm::Quit,
+                input: Input::default(),
+                scroll: 0,
+            });
+            return false;
+        }
+        true
+    }
     fn input(&mut self, event: Event) -> bool {
         if let Some(mut prompt) = self.prompt.take() {
             if let Event::Key(key) = event {
@@ -577,7 +600,10 @@ impl App {
                     || matches!(key.code, KeyCode::Char('n') | KeyCode::Char('N'))
                         && matches!(
                             prompt.kind,
-                            Confirm::PauseStorage | Confirm::CancelCleanup | Confirm::FullRescan
+                            Confirm::CancelScan
+                                | Confirm::Quit
+                                | Confirm::CancelCleanup
+                                | Confirm::FullRescan
                         )
                 {
                     self.message = "No action approved; current work continues".into();
@@ -603,13 +629,15 @@ impl App {
                     return false;
                 }
                 match &prompt.kind {
-                    Confirm::PauseStorage | Confirm::CancelCleanup | Confirm::FullRescan => {
+                    Confirm::CancelScan
+                    | Confirm::Quit
+                    | Confirm::CancelCleanup
+                    | Confirm::FullRescan => {
                         if key.code == KeyCode::Char('y') || key.code == KeyCode::Char('Y') {
                             match prompt.kind {
-                                Confirm::PauseStorage => self.control(Request::Pause),
-                                Confirm::FullRescan => {
-                                    self.control(Request::Refresh { full: true })
-                                }
+                                Confirm::CancelScan => self.control(Request::Cancel),
+                                Confirm::Quit => return true,
+                                Confirm::FullRescan => self.control(Request::Scan),
                                 _ => {
                                     self.cleanup_cancel.store(true, Ordering::Relaxed);
                                     self.cleanup_gen += 1;
@@ -624,6 +652,43 @@ impl App {
                             return false;
                         }
                         if key.code == KeyCode::Enter {
+                            return false;
+                        }
+                    }
+                    Confirm::CompareScans => {
+                        if key.code == KeyCode::Enter {
+                            let value = prompt.input.value().trim();
+                            if value.is_empty() {
+                                self.compare_from = None;
+                                self.compare_to = None;
+                            } else {
+                                let ids = value
+                                    .split_whitespace()
+                                    .map(str::parse::<u64>)
+                                    .collect::<std::result::Result<Vec<_>, _>>();
+                                match ids {
+                                    Ok(ids)
+                                        if ids.len() == 2
+                                            && ids[0] != ids[1]
+                                            && ids.iter().all(|id| {
+                                                self.snapshots.iter().any(|s| s.id == *id)
+                                            }) =>
+                                    {
+                                        self.compare_from = Some(ids[0]);
+                                        self.compare_to = Some(ids[1]);
+                                    }
+                                    _ => {
+                                        self.message =
+                                            "Enter two different saved scan IDs, such as 1 2"
+                                                .into();
+                                        return false;
+                                    }
+                                }
+                            }
+                            self.history_offset = 0;
+                            self.history_index = 0;
+                            self.version += 1;
+                            self.last_poll = Instant::now() - Duration::from_secs(10);
                             return false;
                         }
                     }
@@ -684,7 +749,7 @@ impl App {
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-                    return !self.busy;
+                    return self.quit();
                 }
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('x') {
                     if self.tab == Tab::Cleanup && (self.cleanup_running || self.validating) {
@@ -693,11 +758,9 @@ impl App {
                             input: Input::default(),
                             scroll: 0,
                         });
-                    } else if self.tab == Tab::Storage
-                        && (self.status.running || self.status.detail_running)
-                    {
+                    } else if self.tab == Tab::Storage && self.status.running {
                         self.prompt = Some(Prompt {
-                            kind: Confirm::PauseStorage,
+                            kind: Confirm::CancelScan,
                             input: Input::default(),
                             scroll: 0,
                         });
@@ -715,14 +778,13 @@ impl App {
                         self.version += 1;
                         self.last_poll = Instant::now() - Duration::from_secs(10);
                     }
-                    KeyCode::Char('q') => {
-                        if self.busy {
-                            self.message =
-                                "A data action is finishing; its recovery journal is durable"
-                                    .into();
-                        } else {
-                            return true;
-                        }
+                    KeyCode::Char('q') => return self.quit(),
+                    KeyCode::Char('s') if self.tab == Tab::History => {
+                        self.prompt = Some(Prompt {
+                            kind: Confirm::CompareScans,
+                            input: Input::default(),
+                            scroll: 0,
+                        });
                     }
                     KeyCode::Tab => self.switch(self.tab.next()),
                     KeyCode::F(1) => self.switch(Tab::Storage),
@@ -752,11 +814,6 @@ impl App {
                         self.version += 1;
                         self.last_poll = Instant::now() - Duration::from_secs(5);
                     }
-                    KeyCode::Char('e') if self.tab == Tab::Storage => {
-                        self.control(Request::Expand {
-                            path: self.view.clone(),
-                        })
-                    }
                     KeyCode::Char(']') if self.tab == Tab::Storage && self.reply.more => {
                         self.offset += 200;
                         self.version += 1;
@@ -777,9 +834,7 @@ impl App {
                         })
                     }
                     KeyCode::Char('r') => match self.tab {
-                        Tab::Storage | Tab::History => {
-                            self.control(Request::Refresh { full: false })
-                        }
+                        Tab::Storage | Tab::History => self.control(Request::Scan),
                         Tab::Cleanup => self.discover(),
                         Tab::Quarantine => self.load_journals(),
                     },
@@ -897,7 +952,7 @@ impl App {
                 self.primary().add_modifier(Modifier::BOLD),
             ),
             Line::raw(format!(
-                "Volume used {} · available {}  |  Coverage {} · {} retained directories · service metadata {}",
+                "Volume at scan: {} used · {} available | Coverage {} · {} directories · saved data {}",
                 size(self.status.filesystem_used),
                 size(self.status.filesystem_available),
                 coverage,
@@ -905,30 +960,47 @@ impl App {
                 size(self.status.index_bytes)
             )),
             Line::raw(format!(
-                "{} · saved {} · {} pending regions",
+                "{} · saved scan {} · {} scans",
                 visible(&self.status.phase),
-                timestamp(self.status.last_saved),
-                self.status.pending_regions
+                self.status
+                    .snapshot_id
+                    .map(|id| format!("#{id} at {}", timestamp(self.status.last_saved)))
+                    .unwrap_or_else(|| "pending".into()),
+                self.status.scan_count
             )),
-            Line::raw(self.reply.scope.as_ref().map(|n|format!("This folder: {} logical / {} allocated estimate · {}",size(n.logical),size(n.allocated),n.status_name())).unwrap_or_else(||"This folder: measurement pending; accessible descendants are measured at every depth".into())),
-            Line::styled(if self.status.finish_then_idle {
-                if self.status.running || self.status.detail_running {
-                    "History changed: finishing and saving this scan, then idle; Refresh resumes measurement".into()
-                } else {
-                    "Measurement idle; saved observations retained. Press r to resume, or R for Full rescan".into()
-                }
-            } else if self.status.verification.is_some() {
-                "Saved observations retained; some changes need verification. Full rescan requires R".into()
-            } else if self.status.running {
+            Line::raw(
+                self.reply
+                    .scope
+                    .as_ref()
+                    .map(|n| {
+                        format!(
+                            "This folder: {} logical / {} allocated · {}",
+                            size(n.logical),
+                            size(n.allocated),
+                            n.status_name()
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        "This folder: measurement pending; all accessible depths are scanned".into()
+                    }),
+            ),
+            Line::raw(if self.status.running {
                 format!(
-                    "Measuring {}",
-                    visible(self.status.current_path.to_string_lossy())
+                    "Measuring {} · {} visited · {} observed{}",
+                    visible(self.status.current_path.to_string_lossy()),
+                    self.status.visited,
+                    size(self.status.observed_allocated),
+                    if self.status.snapshot_id.is_some() {
+                        " · browsing previous saved scan"
+                    } else {
+                        ""
+                    }
                 )
-            } else if self.status.detail_running {
-                "Loading browsing detail; the saved index remains available".into()
             } else {
-                "Completed observations save automatically; q leaves the service running".into()
-            }, if self.status.verification.is_some() { self.warning() } else { Style::default() }),
+                self.status.warning.clone().unwrap_or_else(|| {
+                    "Completed scans save automatically · r starts a new full scan · q exits".into()
+                })
+            }),
         ];
         frame.render_widget(Paragraph::new(header).wrap(Wrap { trim: false }), chunks[1]);
         match self.tab {
@@ -962,7 +1034,17 @@ impl App {
         } else {
             String::new()
         };
-        let foot=vec![Line::styled(if self.busy {"Working · recovery intent is durable"}else if self.cleanup_running&&self.tab==Tab::Cleanup {"Cleanup discovery running"}else{"q Close client · daemon continues · Tab/F1–F4 switch views"},self.primary()),Line::raw(detail),Line::styled(visible(self.status.error.as_deref().unwrap_or(&self.message)),if self.status.error.is_some(){self.warning()}else{Style::default()}),Line::raw(match self.tab{Tab::Storage=>format!("Enter/→ Browse · ← Parent · g Root · r Refresh events · R Full rescan · m Metric · [ ] Pages · Ctrl+X Pause · observed {} / {} visits",size(self.status.observed_allocated),self.status.visited),Tab::Cleanup=>"Space Select · v Validate → exact approval · / Filter · r Rescan · Ctrl+X Cancel discovery".into(),Tab::History=>"Observed directory deltas · nested rows overlap · incomplete or unobserved comparisons have unknown growth".into(),Tab::Quarantine=>"u Restore · d Purge with exact typed approval · r Recover journals · quarantine frees zero bytes".into()})];
+        let foot=vec![
+            Line::styled(if self.busy {"Working · recovery intent is durable"}else if self.cleanup_running&&self.tab==Tab::Cleanup {"Cleanup discovery running"}else{"q Quit · all scan work stops · Tab/F1–F4 switch views"},self.primary()),
+            Line::raw(detail),
+            Line::styled(visible(self.status.error.as_deref().unwrap_or(&self.message)),if self.status.error.is_some(){self.warning()}else{Style::default()}),
+            Line::raw::<String>(match self.tab {
+                Tab::Storage=>"Enter/→ Browse · ← Parent · g Root · r Full scan · m Metric · [ ] Pages · Ctrl+X Cancel (Y/N)".into(),
+                Tab::Cleanup=>"Space Select · v Validate → exact approval · / Filter · r Rescan · Ctrl+X Cancel discovery".into(),
+                Tab::History=>"s Choose scan IDs · [ ] Pages · r Full scan · nested directory totals overlap; incomplete growth is unknown".into(),
+                Tab::Quarantine=>"u Restore · d Purge with exact typed approval · r Recover journals · quarantine frees zero bytes".into()
+            })
+        ];
         frame.render_widget(
             Paragraph::new(foot)
                 .block(Block::default().borders(Borders::TOP))
@@ -1030,9 +1112,11 @@ impl App {
                 return;
             }
             let (title,text)=match &prompt.kind{
-                Confirm::PauseStorage=>("Pause Storage?",format!("Pause the active scan for {}?\n\nY pauses measurement. N, Enter or Esc keeps it running.\nThe committed index and pending changes remain saved.",self.status.root.display())),
+                Confirm::CancelScan=>("Cancel this scan?",format!("Cancel the active full scan of {}?\nY cancels. N, Enter or Esc keeps it running.\nEarlier completed scans are preserved. No scan starts automatically.",self.root.display())),
+                Confirm::Quit=>("Quit and stop scanning?","Y stops active measurement and exits. N, Enter or Esc continues.\nCompleted scans remain saved. The unfinished pass is discarded.".into()),
+                Confirm::CompareScans=>("Compare saved scans",format!("Type FROM TO scan IDs, then Enter. Empty input selects the latest pair.\nAvailable: {}\n\n{}",self.snapshots.iter().take(12).map(|s|format!("#{} {} {}",s.id,timestamp(s.finished),s.coverage_name())).collect::<Vec<_>>().join("; "),prompt.input.value())),
                 Confirm::CancelCleanup=>("Cancel cleanup discovery?","Y cancels discovery/validation. N, Enter or Esc keeps it running.\nExisting results remain available; no data move is approved.".into()),
-                Confirm::FullRescan=>("Full metadata rescan?",format!("Measure the complete accessible scope {} again?\nY starts a full scan. N, Enter or Esc keeps the current index.\nNormal Refresh uses event changes instead.",self.root.display())),
+                Confirm::FullRescan=>("Full metadata scan?",format!("Measure the complete accessible scope {} again?\nY starts a full scan. N, Enter or Esc keeps the current scan.\nThe result saves as a separate scan for comparison.",self.root.display())),
                 Confirm::Filter=>("Filter cleanup candidates",format!("Path or category; Enter applies, Esc closes.\n\n{}",prompt.input.value())),
                 Confirm::Quarantine(plan)=>{let bytes=plan.items.iter().map(|i|i.snapshot.allocated).sum();let paths=plan.items.iter().map(|i|format!("{} · {}",visible(i.candidate.path.to_string_lossy()),size(i.snapshot.allocated))).collect::<Vec<_>>().join("\n");("Review quarantine",format!("{} items · {} allocated estimate · zero bytes freed\n{}\n\nType {} and press Enter.\n{}",plan.items.len(),size(bytes),paths,plan.approval,prompt.input.value()))},
                 Confirm::Purge(id)=>("Permanent deletion",format!("Delete the captured, unchanged quarantine contents for {id}?\nRestore is available before deletion. New or modified entries block purge.\n\nType PURGE {id} and press Enter.\n{}",prompt.input.value())),
@@ -1208,7 +1292,7 @@ impl App {
         let chart = Chart::new(vec![series])
             .block(
                 Block::default()
-                    .title(" Filesystem used · GiB · hourly observations ")
+                    .title(" Filesystem used at completed scans · GiB ")
                     .borders(Borders::ALL),
             )
             .x_axis(
@@ -1261,19 +1345,24 @@ impl App {
         .block(
             Block::default()
                 .title(format!(
-                    " Directory deltas · {} days · hourly coalescing · [ ] pages ",
-                    if self.status.history_days == 0 {
-                        60
-                    } else {
-                        self.status.history_days
-                    }
+                    " Saved comparison {} · [ ] pages · s choose scans ",
+                    self.compared
+                        .as_ref()
+                        .map(|(a, b)| format!(
+                            "#{} {} → #{} {}",
+                            a.id,
+                            timestamp(a.finished),
+                            b.id,
+                            timestamp(b.finished)
+                        ))
+                        .unwrap_or_else(|| "needs two scans".into())
                 ))
                 .borders(Borders::ALL),
         );
         let mut state = TableState::default().with_selected(Some(self.history_index));
         frame.render_stateful_widget(table, area, &mut state);
         if self.history.is_empty() {
-            frame.render_widget(Paragraph::new("History begins with a measured baseline. Later changes appear here; earlier disk usage cannot be reconstructed from FSEvents alone.").wrap(Wrap{trim:false}),Rect::new(area.x+2,area.y+3,area.width.saturating_sub(4),area.height.saturating_sub(4)));
+            frame.render_widget(Paragraph::new("Complete two scans of the same root to compare sizes. No directory size changes appear for an unchanged pair. Press s to choose saved scan IDs.").wrap(Wrap{trim:false}),Rect::new(area.x+2,area.y+3,area.width.saturating_sub(4),area.height.saturating_sub(4)));
         }
     }
     fn draw_journals(&self, frame: &mut Frame, area: Rect) {
@@ -1321,7 +1410,17 @@ pub fn run(state: PathBuf, root: PathBuf, terminate: Arc<AtomicBool>) -> Result<
     let _restore = RestoreTerminal;
     execute!(std::io::stdout(), event::EnableMouseCapture)?;
     let (tx, rx) = mpsc::channel();
+    let session = Session::new(state.clone(), root.clone());
+    struct CloseSession(Arc<Session>);
+    impl Drop for CloseSession {
+        fn drop(&mut self) {
+            self.0.close();
+        }
+    }
+    let _close = CloseSession(session.clone());
+    session.start_scan()?;
     let mut app = App::new(state, root, tx);
+    app.session = Some(session.clone());
     loop {
         if terminate.load(Ordering::Relaxed) {
             break;
@@ -1329,6 +1428,7 @@ pub fn run(state: PathBuf, root: PathBuf, terminate: Arc<AtomicBool>) -> Result<
         while let Ok(message) = rx.try_recv() {
             app.accept(message);
         }
+        app.status = session.status();
         app.poll();
         terminal.draw(|f| app.draw(f))?;
         if event::poll(Duration::from_millis(75))?
@@ -1337,6 +1437,8 @@ pub fn run(state: PathBuf, root: PathBuf, terminate: Arc<AtomicBool>) -> Result<
             break;
         }
     }
+    app.cleanup_cancel.store(true, Ordering::Relaxed);
+    session.close();
     Ok(())
 }
 
@@ -1417,6 +1519,54 @@ mod tests {
             KeyModifiers::NONE,
         )));
         assert!(app.prompt.is_none());
+    }
+    #[test]
+    fn quitting_an_active_scan_requires_confirmation_and_escape_keeps_it_running() {
+        let (tx, _) = mpsc::channel();
+        let mut app = App::new("/state".into(), "/fixture".into(), tx);
+        app.status.running = true;
+        assert!(!app.input(Event::Key(event::KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE
+        ))));
+        assert!(matches!(
+            app.prompt.as_ref().map(|p| &p.kind),
+            Some(Confirm::Quit)
+        ));
+        assert!(!app.input(Event::Key(event::KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE
+        ))));
+        assert!(app.status.running);
+        assert!(app.prompt.is_none());
+        assert!(!app.input(Event::Key(event::KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE
+        ))));
+        assert!(app.input(Event::Key(event::KeyEvent::new(
+            KeyCode::Char('Y'),
+            KeyModifiers::NONE
+        ))));
+    }
+    #[test]
+    fn scan_cancellation_confirmation_does_not_accept_bare_escape_or_n() {
+        let (tx, _) = mpsc::channel();
+        let mut app = App::new("/state".into(), "/fixture".into(), tx);
+        app.status.running = true;
+        assert!(!app.input(Event::Key(event::KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::CONTROL
+        ))));
+        assert!(matches!(
+            app.prompt.as_ref().map(|p| &p.kind),
+            Some(Confirm::CancelScan)
+        ));
+        assert!(!app.input(Event::Key(event::KeyEvent::new(
+            KeyCode::Char('n'),
+            KeyModifiers::NONE
+        ))));
+        assert!(app.prompt.is_none());
+        assert!(app.status.running);
     }
     #[test]
     fn all_views_render_in_the_library_test_backend() {

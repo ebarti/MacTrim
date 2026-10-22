@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 
 pub const POLICY: &str = "storage.rust.v1";
 pub const LINKED: u32 = 1;
-pub const REUSED: u32 = 2;
 pub const COLLAPSED: u32 = 4;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -43,7 +42,6 @@ pub struct Index {
     pub root: PathBuf,
     pub nodes: im::OrdMap<PathBuf, Node>,
     pub children: im::OrdMap<PathBuf, im::Vector<PathBuf>>,
-    pub linked: im::OrdSet<PathBuf>,
     pub visited: u64,
     pub reused: u64,
     pub full_scan: bool,
@@ -66,11 +64,6 @@ impl Index {
                 .or_default()
                 .push_back(path.clone());
         }
-        if node.flags & LINKED != 0 {
-            self.linked.insert(path.clone());
-        } else {
-            self.linked.remove(&path);
-        }
         self.nodes.insert(path, node);
     }
     pub fn remove_subtree(&mut self, root: &Path) {
@@ -82,7 +75,6 @@ impl Index {
             .collect();
         for path in paths {
             self.nodes.remove(&path);
-            self.linked.remove(&path);
             self.children.remove(&path);
         }
         if let Some(parent) = root.parent()
@@ -90,14 +82,6 @@ impl Index {
         {
             children.retain(|p| p != root);
         }
-    }
-    pub fn linked_intersects(&self, path: &Path) -> bool {
-        path.ancestors().any(|p| self.linked.contains(p))
-            || self
-                .linked
-                .range(path.to_owned()..)
-                .next()
-                .is_some_and(|p| p.starts_with(path))
     }
     pub fn root_node(&self) -> Option<&Node> {
         self.nodes.get(&self.root)
@@ -116,15 +100,6 @@ impl Index {
         });
         rows
     }
-    pub fn copy_subtree(&mut self, old: &Index, root: &Path) {
-        let mut pending = vec![root.to_owned()];
-        while let Some(path) = pending.pop() {
-            if let Some(node) = old.nodes.get(&path) {
-                self.insert(path.clone(), node.clone());
-            }
-            pending.extend(old.children.get(&path).into_iter().flatten().cloned());
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -137,64 +112,4 @@ pub struct Progress {
     pub allocated: u64,
     pub view: PathBuf,
     pub rows: Vec<(PathBuf, Node)>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Identity {
-    #[serde(default)]
-    pub volume_uuid: Option<String>,
-    pub namespace_device: u64,
-    pub namespace_inode: u64,
-    pub namespace_uuid: String,
-    pub device: u64,
-    pub uuid: String,
-    #[serde(with = "crate::paths")]
-    pub mount: PathBuf,
-    #[serde(with = "crate::paths")]
-    pub relative: PathBuf,
-}
-
-impl Identity {
-    pub fn same_filesystem(&self, other: &Self) -> bool {
-        let physical = match (&self.volume_uuid, &other.volume_uuid) {
-            (Some(a), Some(b)) => a == b && self.namespace_uuid == other.namespace_uuid,
-            _ => self.namespace_device == other.namespace_device && self.device == other.device,
-        };
-        physical
-            && self.namespace_inode == other.namespace_inode
-            && self.mount == other.mount
-            && self.relative == other.relative
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ScanPolicy {
-    pub cpu_percent: u8,
-}
-impl Default for ScanPolicy {
-    fn default() -> Self {
-        Self { cpu_percent: 10 }
-    }
-}
-impl ScanPolicy {
-    pub fn validate(&self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            (1..=100).contains(&self.cpu_percent),
-            "CPU budget must be 1..100 percent of one core"
-        );
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Verification {
-    pub reason: String,
-    pub requested_at: u64,
-    pub revision: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Interruption {
-    pub at: u64,
-    pub reason: String,
 }
