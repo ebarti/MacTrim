@@ -132,6 +132,12 @@ enum Service {
         #[arg(default_value = "/")]
         root: PathBuf,
     },
+    /// Gracefully stop and start again, reusing the configured root by default.
+    Restart {
+        root: Option<PathBuf>,
+    },
+    /// Show service status, including when the service is stopped.
+    Status,
     Stop,
     Pause,
 }
@@ -154,12 +160,23 @@ fn signal_flag() -> Result<Arc<AtomicBool>> {
     Ok(flag)
 }
 pub fn start(state: &Path, root: &Path) -> Result<()> {
-    if let Ok(reply) = service::request(state, &Request::Status) {
+    let root = fs::canonicalize(root).context("Cannot access scan root")?;
+    match service::request(state, &Request::Status) {
+        Ok(reply) => {
+            ensure!(
+                reply.status.root == root,
+                "Running service belongs to another root; use a separate --state directory"
+            );
+            return Ok(());
+        }
+        Err(e) if e.is::<service::ServiceUnavailable>() => {}
+        Err(e) => return Err(e),
+    }
+    if let Some(saved) = store::Store::configured_root(state)? {
         ensure!(
-            reply.status.root == fs::canonicalize(root)?,
-            "Running service belongs to another root; use a separate --state directory"
+            saved == root,
+            "This state belongs to another root; use a separate --state directory"
         );
-        return Ok(());
     }
     store::prepare_private(state)?;
     let managed = mactrim_rs::agent::start_managed(state)?;
@@ -175,7 +192,7 @@ pub fn start(state: &Path, root: &Path) -> Result<()> {
         .args(["--state"])
         .arg(state)
         .args(["service", "run"])
-        .arg(root)
+        .arg(&root)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log))
@@ -195,8 +212,16 @@ pub fn start(state: &Path, root: &Path) -> Result<()> {
     };
     let started = Instant::now();
     loop {
-        if service::request(state, &Request::Status).is_ok() {
-            return Ok(());
+        match service::request(state, &Request::Status) {
+            Ok(reply) => {
+                ensure!(
+                    reply.status.root == root,
+                    "Running service belongs to another root"
+                );
+                return Ok(());
+            }
+            Err(e) if e.is::<service::ServiceUnavailable>() => {}
+            Err(e) => return Err(e),
         }
         if let Some(code) = child.as_mut().map(|c| c.try_wait()).transpose()?.flatten() {
             anyhow::bail!(
@@ -211,6 +236,28 @@ pub fn start(state: &Path, root: &Path) -> Result<()> {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+fn restart(state: &Path, root: Option<PathBuf>) -> Result<()> {
+    let running = match service::request(state, &Request::Status) {
+        Ok(reply) => Some(reply.status.root),
+        Err(e) if e.is::<service::ServiceUnavailable>() => None,
+        Err(e) => return Err(e),
+    };
+    let configured = store::Store::configured_root(state)?;
+    let root = fs::canonicalize(
+        root.or_else(|| running.clone())
+            .or_else(|| configured.clone())
+            .unwrap_or_else(|| "/".into()),
+    )
+    .context("Cannot access scan root")?;
+    for existing in running.iter().chain(configured.iter()) {
+        ensure!(
+            existing == &root,
+            "This service belongs to another root; use a separate --state directory"
+        );
+    }
+    service::stop(state)?;
+    start(state, &root)
 }
 fn print<T: serde::Serialize>(value: T) -> Result<()> {
     let mut out = io::stdout().lock();
@@ -268,7 +315,7 @@ fn run() -> Result<()> {
                 mactrim_rs::ui::run(state, root, signal_flag()?)
             }
         }
-        Commands::Status => print(service::request(&state, &Request::Status)?),
+        Commands::Status => print(service::status(&state)?),
         Commands::History {
             path,
             days,
@@ -326,7 +373,12 @@ fn run() -> Result<()> {
                 start(&state, &root)?;
                 print(service::request(&state, &Request::Status)?)
             }
-            Service::Stop => print(service::request(&state, &Request::Stop)?),
+            Service::Restart { root } => {
+                restart(&state, root)?;
+                print(service::request(&state, &Request::Status)?)
+            }
+            Service::Status => print(service::status(&state)?),
+            Service::Stop => print(service::stop(&state)?),
             Service::Pause => print(service::request(&state, &Request::Pause)?),
         },
     }

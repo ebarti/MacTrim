@@ -159,11 +159,21 @@ has no deletion API.
 ```sh
 ./dist/mactrim service pause       # retain pending work, stop measurement
 ./dist/mactrim refresh             # resume and process changes
-./dist/mactrim service stop        # stop the service; keep saved state
-./dist/mactrim service start /     # restart and replay offline changes
+./dist/mactrim service status      # also succeeds when stopped; same as mactrim status
+./dist/mactrim service stop        # wait for shutdown; succeeds if already stopped
+./dist/mactrim service start /     # start and replay offline changes
+./dist/mactrim service restart     # stop, wait, start; reuse the configured scan root
 ./dist/mactrim service plist /     # inspect the generated XML without installing
 ./dist/mactrim service uninstall   # remove login registration; keep all state/data
 ```
+
+Stop waits until the service releases its state writer lock, so `service stop &&
+service start /` can run without a manual delay. Restart preserves committed
+measurements and pending work; an interrupted first baseline can need measuring
+again. Missing or stale owned sockets report a stopped service, while access,
+unsafe-socket and protocol failures remain visible. Offline status and repeated
+Stop do not create or clear an index. Restart accepts an optional root; a root
+that conflicts with the saved or running service is rejected before stopping it.
 
 **Use it as your regular user, without sudo.** Full Disk Access is a macOS privacy
 permission, separate from Unix privileges. Grant access to the launching terminal
