@@ -5,7 +5,7 @@ use crate::{
     scan,
     store::{self, Generation, Store, Work},
 };
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -88,6 +88,8 @@ pub struct Status {
     #[serde(with = "crate::paths")]
     pub current_path: PathBuf,
     pub error: Option<String>,
+    #[serde(default)]
+    pub last_interruption: Option<Interruption>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Row {
@@ -134,6 +136,7 @@ struct Public {
     detail: Option<Arc<Index>>,
 }
 type Command = (Request, mpsc::SyncSender<Result<Reply, String>>);
+const USER_PAUSE: &str = "User requested Pause";
 
 #[derive(Debug)]
 pub struct ServiceUnavailable(io::Error);
@@ -542,6 +545,75 @@ fn serve(
     Ok(())
 }
 
+fn measurement_failed(
+    store: &mut Store,
+    paused: &mut bool,
+    error: &mut Option<String>,
+    phase: &mut String,
+    failure: anyhow::Error,
+) -> Result<()> {
+    if failure.is::<scan::Cancelled>() {
+        // Pause/Refresh already persisted the latest user intent. A late
+        // cancellation must neither overwrite it nor become an error.
+        *phase = if *paused {
+            "Measurement paused; previous index preserved"
+        } else {
+            "Measurement interrupted; retrying pending work"
+        }
+        .into();
+        return Ok(());
+    }
+    *error = Some(format!("{failure:#}"));
+    *paused = true;
+    store.set_paused(true)?;
+    *phase = "Measurement paused after failure".into();
+    Ok(())
+}
+
+fn interrupt_measurement(
+    store: &mut Store,
+    cancel: &AtomicBool,
+    last: &mut Option<Interruption>,
+    reason: &str,
+) -> Result<()> {
+    let already_interrupted = cancel.swap(true, Ordering::Relaxed);
+    if !already_interrupted
+        || (reason == USER_PAUSE && last.as_ref().is_none_or(|last| last.reason != reason))
+    {
+        let interruption = Interruption {
+            at: store::now(),
+            reason: reason.into(),
+        };
+        store.record_interruption(&interruption)?;
+        *last = Some(interruption);
+    }
+    Ok(())
+}
+
+fn detail_finished(
+    path: PathBuf,
+    result: Result<Arc<Index>>,
+    interrupted: bool,
+    pending: &mut Option<PathBuf>,
+    error: &mut Option<String>,
+) -> Option<Arc<Index>> {
+    match result {
+        Ok(detail) if !interrupted => Some(detail),
+        Ok(_) => {
+            pending.get_or_insert(path);
+            None
+        }
+        Err(e) if e.is::<scan::Cancelled>() => {
+            pending.get_or_insert(path);
+            None
+        }
+        Err(e) => {
+            *error = Some(format!("{e:#}"));
+            None
+        }
+    }
+}
+
 pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<()> {
     let root = fs::canonicalize(root)?;
     let state = state_path(&state)?;
@@ -595,13 +667,14 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
     let clients = Arc::new(AtomicUsize::new(0));
     let (finished_tx, finished_rx) =
         mpsc::channel::<Result<(Arc<Index>, Generation, Work, Vec<crate::history::Change>)>>();
-    let (details_tx, details_rx) = mpsc::channel::<Result<Arc<Index>>>();
-    let cancel = Arc::new(AtomicBool::new(false));
+    let (details_tx, details_rx) = mpsc::channel::<(PathBuf, Identity, Result<Arc<Index>>)>();
+    let mut cancel = Arc::new(AtomicBool::new(false));
     let mut running = false;
     let mut detail_running = false;
     let mut detail_pending: Option<PathBuf> = None;
     let mut paused: bool = store.get("paused")?.unwrap_or(false);
     let mut error = None;
+    let mut last_interruption = store.get("last_interruption")?;
     let mut phase = "Replaying filesystem journal".to_string();
     let mut identity_check = Instant::now();
     let mut last_event = Instant::now();
@@ -614,7 +687,14 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
     store.record_capacity(store::now(), current_capacity.0, current_capacity.1)?;
     loop {
         if terminate.load(Ordering::Relaxed) {
-            cancel.store(true, Ordering::Relaxed);
+            if running || detail_running {
+                interrupt_measurement(
+                    &mut store,
+                    &cancel,
+                    &mut last_interruption,
+                    "Service stopped",
+                )?;
+            }
             break;
         }
         if let Ok(loaded) = loaded_rx.try_recv() {
@@ -673,7 +753,12 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
                     let anchor = events::current_id();
                     let current = events::identity(&root)?;
                     if current != identity || store.cursor()? > anchor {
-                        cancel.store(true, Ordering::Relaxed);
+                        let reason = if current != identity {
+                            "Filesystem history changed; automatic reconciliation queued"
+                        } else {
+                            "Filesystem event cursor reset; automatic reconciliation queued"
+                        };
+                        interrupt_measurement(&mut store, &cancel, &mut last_interruption, reason)?;
                         identity = current;
                         store.bind(&root, &identity, anchor)?;
                     }
@@ -732,7 +817,12 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
         if identity_check.elapsed() > Duration::from_secs(10) {
             let current = events::identity(&root)?;
             if current != identity {
-                cancel.store(true, Ordering::Relaxed);
+                interrupt_measurement(
+                    &mut store,
+                    &cancel,
+                    &mut last_interruption,
+                    "Filesystem history changed; automatic reconciliation queued",
+                )?;
                 identity = current;
                 store.bind(&root, &identity, events::current_id())?;
                 ready = false;
@@ -751,12 +841,20 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
                 }
                 Request::Stop => {
                     terminate.store(true, Ordering::Relaxed);
+                    if running || detail_running {
+                        interrupt_measurement(
+                            &mut store,
+                            &cancel,
+                            &mut last_interruption,
+                            "Service stopped",
+                        )?;
+                    }
                     "Service stopping; committed index and pending work preserved"
                 }
                 Request::Pause => {
                     paused = true;
                     store.set_paused(true)?;
-                    cancel.store(true, Ordering::Relaxed);
+                    interrupt_measurement(&mut store, &cancel, &mut last_interruption, USER_PAUSE)?;
                     "Scan paused; Refresh resumes it"
                 }
                 Request::Refresh { full } => {
@@ -791,11 +889,24 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
         }
         if let Ok(result) = finished_rx.try_recv() {
             running = false;
+            if let Ok((_, _, work, _)) = &result {
+                let current = events::identity(&root)?;
+                if current != work.identity && !cancel.load(Ordering::Relaxed) {
+                    interrupt_measurement(
+                        &mut store,
+                        &cancel,
+                        &mut last_interruption,
+                        "Filesystem history changed before commit; automatic reconciliation queued",
+                    )?;
+                    identity = current;
+                    store.bind(&root, &identity, events::current_id())?;
+                    ready = false;
+                    drop(watch);
+                    watch = events::watch(identity.clone(), store.cursor()?)?;
+                }
+            }
             match result {
-                Ok((candidate, generation, work, changes))
-                    if !cancel.load(Ordering::Relaxed)
-                        && events::identity(&root)? == work.identity =>
-                {
+                Ok((candidate, generation, work, changes)) if !cancel.load(Ordering::Relaxed) => {
                     store.commit_changes(&generation, &work, &candidate, &changes)?;
                     last_saved = generation.created;
                     if work.paths.iter().any(|p| p == &root) {
@@ -822,22 +933,23 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
                     error = None;
                 }
                 Ok(_) => {
-                    phase = "Candidate interrupted; previous index preserved".into();
+                    phase = "Candidate interrupted; pending work preserved for retry".into();
+                    store.reap_orphans()?;
                 }
                 Err(e) => {
-                    error = Some(format!("{e:#}"));
-                    paused = true;
-                    store.set_paused(true)?;
-                    phase = "Measurement paused after failure".into();
+                    measurement_failed(&mut store, &mut paused, &mut error, &mut phase, e)?;
                 }
             }
             last_retry = Instant::now();
         }
-        if let Ok(result) = details_rx.try_recv() {
+        if let Ok((path, measured_identity, result)) = details_rx.try_recv() {
             detail_running = false;
-            match result {
-                Ok(d) => public.write().unwrap().detail = Some(d),
-                Err(e) => error = Some(e.to_string()),
+            let interrupted = cancel.load(Ordering::Relaxed)
+                || (result.is_ok() && measured_identity != events::identity(&root)?);
+            if let Some(detail) =
+                detail_finished(path, result, interrupted, &mut detail_pending, &mut error)
+            {
+                public.write().unwrap().detail = Some(detail);
             }
         }
         let work = store.work()?;
@@ -847,6 +959,7 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
         if ready
             && !loading
             && !paused
+            && !terminate.load(Ordering::Relaxed)
             && !running
             && !detail_running
             && (last_event.elapsed() >= Duration::from_millis(750)
@@ -856,7 +969,7 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
             let work = store.claim()?;
             queued_at = Instant::now();
             running = true;
-            cancel.store(false, Ordering::Relaxed);
+            cancel = Arc::new(AtomicBool::new(false));
             phase = work.reason.clone();
             {
                 let mut live = progress.lock().unwrap();
@@ -887,9 +1000,7 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
                             &cancel,
                             Some(&progress),
                         )?);
-                        if cancel.load(Ordering::Relaxed) {
-                            bail!("Scan paused; previous index preserved");
-                        }
+                        scan::check_cancelled(&cancel)?;
                         progress.lock().unwrap().phase = "Saving compressed directory index".into();
                         let generation = Generation::update(
                             &state,
@@ -908,20 +1019,22 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
         } else if ready
             && !loading
             && !paused
+            && !terminate.load(Ordering::Relaxed)
             && !running
             && !detail_running
             && let Some(path) = detail_pending.take()
         {
             detail_running = true;
-            cancel.store(false, Ordering::Relaxed);
+            cancel = Arc::new(AtomicBool::new(false));
             let cancel = cancel.clone();
             let tx = details_tx.clone();
             let state = state.clone();
+            let measured_identity = identity.clone();
             thread::spawn(move || {
                 let result =
                     scan::measure(&path, &[state], None, &Regions::default(), &cancel, None)
                         .map(Arc::new);
-                let _ = tx.send(result);
+                let _ = tx.send((path, measured_identity, result));
             });
         }
         // A periodic audit covers advisory-event blind spots, not ordinary Refresh.
@@ -951,7 +1064,16 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
                 phase: if loading {
                     "Loading saved directory tree; event ingestion active".into()
                 } else if paused {
-                    "Paused; Refresh resumes measurement".into()
+                    if error.is_some() {
+                        "Paused after measurement failure; Refresh retries".into()
+                    } else if last_interruption
+                        .as_ref()
+                        .is_some_and(|i| i.reason == USER_PAUSE)
+                    {
+                        "Paused by user; Refresh resumes measurement".into()
+                    } else {
+                        "Paused; Refresh resumes measurement".into()
+                    }
                 } else if !ready {
                     "Replaying filesystem journal; event continuity is not settled yet".into()
                 } else if running && !live.phase.is_empty() {
@@ -982,6 +1104,7 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
                 observed_logical: live.logical,
                 current_path: live.current.clone(),
                 error: error.clone(),
+                last_interruption: last_interruption.clone(),
             };
         }
         while let Ok((stream, _)) = listener.accept() {
@@ -1053,6 +1176,224 @@ pub fn retry_regions(index: &Index) -> Vec<PathBuf> {
 #[cfg(test)]
 mod retry_tests {
     use super::*;
+    #[test]
+    fn interrupted_worker_preserves_latest_pause_or_resume_intent() {
+        for user_paused in [false, true] {
+            let fixture = tempfile::tempdir().unwrap();
+            let root = fs::canonicalize(fixture.path()).unwrap();
+            let mut store = Store::open(&root.join("state")).unwrap();
+            store.set_paused(user_paused).unwrap();
+            let failure = scan::measure(
+                &root,
+                &[],
+                None,
+                &Regions::default(),
+                &AtomicBool::new(true),
+                None,
+            )
+            .expect_err("The interrupted scanner must reject its candidate");
+            let mut paused = user_paused;
+            let mut error = None;
+            let mut phase = String::new();
+            measurement_failed(&mut store, &mut paused, &mut error, &mut phase, failure).unwrap();
+            assert_eq!(
+                paused, user_paused,
+                "Interruption changed the latest intent"
+            );
+            assert_eq!(store.get::<bool>("paused").unwrap(), Some(user_paused));
+            assert!(
+                error.is_none(),
+                "Expected interruption became a failure: {error:?}"
+            );
+        }
+    }
+    #[test]
+    fn refresh_before_cancelled_worker_finishes_is_not_undone() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(fixture.path()).unwrap();
+        let mut store = Store::open(&root.join("state")).unwrap();
+        let progress = Arc::new(Mutex::new(Progress::default()));
+        let gate = progress.lock().unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let worker = {
+            let (root, cancel, progress) = (root.clone(), cancel.clone(), progress.clone());
+            thread::spawn(move || {
+                let result = scan::measure(
+                    &root,
+                    &[],
+                    None,
+                    &Regions::default(),
+                    &cancel,
+                    Some(&progress),
+                );
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                tx.send(result).unwrap();
+            })
+        };
+        let mut last = None;
+        store.set_paused(true).unwrap();
+        interrupt_measurement(&mut store, &cancel, &mut last, USER_PAUSE).unwrap();
+        // Refresh is handled while the old worker is still unable to finish.
+        store.set_paused(false).unwrap();
+        let mut paused = false;
+        let mut error = None;
+        let mut phase = String::new();
+        drop(gate);
+        release_tx.send(()).unwrap();
+        let failure = rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap_err();
+        worker.join().unwrap();
+        measurement_failed(
+            &mut store,
+            &mut paused,
+            &mut error,
+            &mut phase,
+            failure.context("Worker completion"),
+        )
+        .unwrap();
+        assert!(!paused);
+        assert_eq!(store.get::<bool>("paused").unwrap(), Some(false));
+        assert!(error.is_none());
+    }
+
+    #[test]
+    fn automatic_history_interruption_preserves_index_and_can_commit_retry() {
+        let fixture = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(fixture.path()).unwrap();
+        let root = base.join("files");
+        let state = base.join("state");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("data"), b"saved observation").unwrap();
+        let mut identity = Identity {
+            namespace_device: 1,
+            namespace_inode: 2,
+            namespace_uuid: "initial".into(),
+            device: 1,
+            uuid: "initial".into(),
+            mount: "/".into(),
+            relative: "fixture".into(),
+        };
+        let mut store = Store::open(&state).unwrap();
+        store.bind(&root, &identity, 100).unwrap();
+        store.set_paused(false).unwrap();
+        let saved = scan::measure(
+            &root,
+            &[],
+            None,
+            &Regions::default(),
+            &AtomicBool::new(false),
+            None,
+        )
+        .unwrap();
+        let generation = Generation::write(&state, &saved).unwrap();
+        let baseline = store.claim().unwrap();
+        store.commit(&generation, &baseline, &saved).unwrap();
+        store.ingest(120, [root.clone()], "New work").unwrap();
+        let old_work = store.claim().unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut last = None;
+        interrupt_measurement(
+            &mut store,
+            &cancel,
+            &mut last,
+            "Filesystem history changed; automatic reconciliation queued",
+        )
+        .unwrap();
+        identity.uuid = "replacement".into();
+        store.bind(&root, &identity, 30).unwrap();
+        let failure = scan::measure(&root, &[], Some(&saved), &Regions::default(), &cancel, None)
+            .unwrap_err();
+        let mut paused = false;
+        let mut error = None;
+        let mut phase = String::new();
+        measurement_failed(&mut store, &mut paused, &mut error, &mut phase, failure).unwrap();
+        assert!(!paused);
+        assert!(error.is_none());
+        assert_eq!(
+            store.generation().unwrap().unwrap().digest,
+            generation.digest
+        );
+        assert_eq!(store.load().unwrap().unwrap().nodes, saved.nodes);
+        assert!(
+            store.commit(&generation, &old_work, &saved).is_err(),
+            "Stale identity committed"
+        );
+        assert_eq!(store.work().unwrap().paths, vec![root.clone()]);
+        let retry = store.claim().unwrap();
+        let next_cancel = AtomicBool::new(false);
+        fs::write(root.join("data"), vec![1; 8192]).unwrap();
+        let measured = scan::measure(
+            &root,
+            &[],
+            Some(&saved),
+            &retry.paths.iter().cloned().collect(),
+            &next_cancel,
+            None,
+        )
+        .unwrap();
+        let next_generation = Generation::write(&state, &measured).unwrap();
+        store.commit(&next_generation, &retry, &measured).unwrap();
+        assert!(store.work().unwrap().paths.is_empty());
+        assert_eq!(store.applied().unwrap(), 30);
+        drop(store);
+        let store = Store::open(&state).unwrap();
+        assert_eq!(store.get::<bool>("paused").unwrap(), Some(false));
+        assert_eq!(
+            store
+                .get::<Interruption>("last_interruption")
+                .unwrap()
+                .unwrap()
+                .reason,
+            last.unwrap().reason
+        );
+    }
+
+    #[test]
+    fn genuine_worker_failure_still_pauses_and_reports_problem() {
+        let fixture = tempfile::tempdir().unwrap();
+        let state = fs::canonicalize(fixture.path()).unwrap().join("state");
+        let mut store = Store::open(&state).unwrap();
+        let mut paused = false;
+        let mut error = None;
+        let mut phase = String::new();
+        let failure = io::Error::new(io::ErrorKind::StorageFull, "fixture save failed");
+        measurement_failed(
+            &mut store,
+            &mut paused,
+            &mut error,
+            &mut phase,
+            failure.into(),
+        )
+        .unwrap();
+        assert!(paused);
+        assert_eq!(store.get::<bool>("paused").unwrap(), Some(true));
+        assert!(error.unwrap().contains("fixture save failed"));
+    }
+
+    #[test]
+    fn cancelled_detail_is_requeued_without_replacing_newer_navigation() {
+        let path = PathBuf::from("/fixture/old");
+        for newer in [None, Some(PathBuf::from("/fixture/new"))] {
+            for completed in [false, true] {
+                let mut pending = newer.clone();
+                let mut error = None;
+                let result = if completed {
+                    Ok(Arc::new(Index::new(path.clone())))
+                } else {
+                    Err(scan::Cancelled.into())
+                };
+                assert!(
+                    detail_finished(path.clone(), result, true, &mut pending, &mut error).is_none()
+                );
+                assert_eq!(pending, newer.clone().or_else(|| Some(path.clone())));
+                assert!(error.is_none());
+            }
+        }
+    }
     #[test]
     fn global_ranking_and_anchor_follow_a_directory_across_pages() {
         let fixture = tempfile::tempdir().unwrap();

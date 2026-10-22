@@ -29,6 +29,7 @@ fn spawn(root: &Path, state: &Path) -> Daemon {
         .unwrap(),
     )
 }
+#[track_caller]
 fn wait(state: &Path, predicate: impl Fn(&Status) -> bool) -> Status {
     let started = Instant::now();
     let mut last = None;
@@ -73,7 +74,7 @@ fn real_daemon_tracks_edits_and_recovers_changes_made_while_stopped() {
     request(&state, &Request::Stop).unwrap();
     assert!(daemon.0.wait().unwrap().success());
     fs::write(root.join("a/data"), vec![3; 256 * 1024]).unwrap();
-    let _daemon = spawn(&root, &state);
+    let mut restarted = spawn(&root, &state);
     let third = wait(&state, |s| {
         s.root_node
             .as_ref()
@@ -95,11 +96,40 @@ fn real_daemon_tracks_edits_and_recovers_changes_made_while_stopped() {
     .unwrap();
     assert_eq!(reply.rows[0].path, root.join("a"));
     request(&state, &Request::Pause).unwrap();
-    wait(&state, |s| s.paused);
+    let paused = wait(&state, |s| s.paused);
+    assert!(paused.error.is_none());
+    assert_eq!(
+        paused.last_interruption.unwrap().reason,
+        "User requested Pause"
+    );
     fs::write(root.join("a/new"), vec![4; 4096]).unwrap();
     wait(&state, |s| s.paused && s.pending_regions > 0);
+    request(&state, &Request::Stop).unwrap();
+    assert!(restarted.0.wait().unwrap().success());
+    let _daemon = spawn(&root, &state);
+    let paused = wait(&state, |s| s.paused && !s.loading && s.history_ready);
+    assert!(
+        paused.error.is_none(),
+        "User pause became a failure on restart"
+    );
+    assert_eq!(paused.last_saved, third.last_saved);
+    assert!(paused.pending_regions > 0);
     request(&state, &Request::Refresh { full: false }).unwrap();
-    wait(&state, |s| {
+    let resumed = wait(&state, |s| {
         !s.paused && !s.running && s.pending_regions == 0
     });
+    assert!(resumed.error.is_none());
+    for _ in 0..3 {
+        request(&state, &Request::Refresh { full: true }).unwrap();
+        request(&state, &Request::Pause).unwrap();
+        request(&state, &Request::Refresh { full: false }).unwrap();
+        let settled = wait(&state, |s| {
+            !s.running && !s.paused && s.pending_regions == 0
+        });
+        assert!(
+            settled.error.is_none(),
+            "Late cancellation became a failure: {:?}",
+            settled.error
+        );
+    }
 }

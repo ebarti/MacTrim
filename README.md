@@ -55,6 +55,10 @@ revision and source checksum. `dist/build.json` records the packaged artifact.
   a path when incoming sizes reorder rows, including across page boundaries.
 - **Ctrl+X** opens a **Y/N** pause confirmation. **Esc alone never cancels a scan.**
   A pause survives a service restart; Refresh resumes pending measurement.
+  Automatic interruptions for changed filesystem history retry pending work
+  without pausing the service. A cancelled worker finishing after Refresh
+  cannot undo the resume. `status` records the latest interruption reason and
+  time across restarts; actual measurement or save failures remain errors.
 - **Tab / F1–F4** switches Storage, Cleanup, History/Growth and Quarantine/Recovery.
 
 Sizes include accessible descendants at every depth. Dependency folders such as
