@@ -39,8 +39,23 @@ pub enum Request {
     Scan,
     Cancel,
 }
+/// Current work, independent of a previous saved scan and its coverage.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanState {
+    #[default]
+    Ready,
+    Loading,
+    Scanning,
+    Saving,
+    Completed,
+    Cancelled,
+    Failed,
+}
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Status {
+    #[serde(default)]
+    pub scan_state: ScanState,
     #[serde(with = "crate::paths")]
     pub root: PathBuf,
     pub phase: String,
@@ -193,6 +208,7 @@ impl Session {
                 ..Progress::default()
             };
             let mut public = self.public.write().unwrap();
+            public.status.scan_state = ScanState::Loading;
             public.status.running = true;
             public.status.loading = true;
             public.status.error = None;
@@ -205,8 +221,7 @@ impl Session {
             self.public.clone(),
             self.progress.clone(),
         );
-        worker.handle = Some(
-            thread::Builder::new()
+        let spawned = thread::Builder::new()
                 .name("mactrim-terminal-scan".into())
                 .spawn(move || {
                     let result = (|| -> Result<()> {
@@ -244,6 +259,7 @@ impl Session {
                         }
                         progress.lock().unwrap().phase =
                             "Full scan: measuring metadata at every depth".into();
+                        public.write().unwrap().status.scan_state = ScanState::Scanning;
                         let index = Arc::new(scan::full(
                             &root,
                             std::slice::from_ref(&state),
@@ -252,6 +268,7 @@ impl Session {
                         )?);
                         scan::check_cancelled(&cancel)?;
                         progress.lock().unwrap().phase = "Saving completed scan".into();
+                        public.write().unwrap().status.scan_state = ScanState::Saving;
                         let saved = catalog.save(&index, &capture, &cancel)?;
                         let mut p = public.write().unwrap();
                         apply_snapshot(&mut p.status, &saved, index.root_node().cloned());
@@ -267,14 +284,27 @@ impl Session {
                     p.status.loading = false;
                     if let Err(error) = result {
                         if error.is::<scan::Cancelled>() {
+                            p.status.scan_state = ScanState::Cancelled;
                             p.status.phase = "Scan cancelled; completed scans preserved".into();
                         } else {
+                            p.status.scan_state = ScanState::Failed;
                             p.status.phase = "Scan failed; completed scans preserved".into();
                             p.status.error = Some(format!("{error:#}"));
                         }
-                    }
-                })?,
-        );
+                    } else {p.status.scan_state = ScanState::Completed;}
+                });
+        match spawned {
+            Ok(handle) => worker.handle = Some(handle),
+            Err(error) => {
+                let mut public = self.public.write().unwrap();
+                public.status.scan_state = ScanState::Failed;
+                public.status.running = false;
+                public.status.loading = false;
+                public.status.phase = "Scan could not start; completed scans preserved".into();
+                public.status.error = Some(error.to_string());
+                return Err(error.into());
+            }
+        }
         Ok(true)
     }
     pub fn cancel(&self) {

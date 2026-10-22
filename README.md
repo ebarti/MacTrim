@@ -47,6 +47,11 @@ No service start, install, restart, pause or event-refresh commands are availabl
 
 ## Terminal controls
 
+A dedicated status panel stays at the top: **SCANNING**, **SAVING SCAN**, then
+**SCAN COMPLETE · SAVED #ID** after persistence succeeds. Coverage is shown on a
+separate line, so **PARTIAL** cannot be mistaken for an unfinished scan. Cancelled
+and failed scans have their own headings. The state is also readable without color.
+
 - **q** exits. During a scan, it asks **Y/N** before stopping work and exiting.
   Completed scans remain saved. An unfinished pass is discarded.
 - **r** starts a new full pass. Pressing it while a scan runs keeps that pass.

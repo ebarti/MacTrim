@@ -1,7 +1,7 @@
 use mactrim_rs::{
     model::{Index, Node},
     scan,
-    session::{self, Request, Session},
+    session::{self, Request, ScanState, Session},
     snapshots::{Capture, Snapshots},
     store,
 };
@@ -47,6 +47,7 @@ fn edits_do_nothing_until_requested_full_scan_and_navigation_does_not_start_work
     session.start_scan().unwrap();
     settled(&session);
     let first = session.status();
+    assert_eq!(first.scan_state, ScanState::Completed);
     let a = listing(&session, &root)
         .rows
         .into_iter()
@@ -125,6 +126,7 @@ fn cancelling_an_active_pass_preserves_last_scan_and_never_restarts() {
     session.cancel();
     settled(&session);
     assert_eq!(session.status().snapshot_id, saved);
+    assert_eq!(session.status().scan_state, ScanState::Cancelled);
     assert!(session.status().phase.contains("cancelled"));
     for _ in 0..5 {
         listing(&session, &root);
@@ -340,5 +342,31 @@ fn unreadable_previous_tree_does_not_prevent_a_new_independent_full_scan() {
             .unwrap()
             .len(),
         2
+    );
+}
+
+#[test]
+fn a_failed_scan_reports_failed_instead_of_completed_when_no_snapshot_was_saved() {
+    let (_temp, root, state) = fixture();
+    let session = Session::new(state.clone(), root.join("missing"));
+    assert_eq!(session.status().scan_state, ScanState::Ready);
+    session.start_scan().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while session.status().running {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(5));
+    }
+    let status = session.status();
+    assert_eq!(status.scan_state, ScanState::Failed);
+    assert!(status.error.is_some());
+    assert!(status.snapshot_id.is_none());
+    session.close();
+    assert!(
+        Snapshots::read_only(&state)
+            .unwrap()
+            .unwrap()
+            .list(None)
+            .unwrap()
+            .is_empty()
     );
 }
