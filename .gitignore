@@ -8,3 +8,4 @@ dist/
 /demo*/
 /.mactrim*/
 /verification-fixture*/
+/target/

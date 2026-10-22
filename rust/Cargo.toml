@@ -1,0 +1,21 @@
+[package]
+name = "mactrim-rs"
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Persistent, read-only MacTrim storage service"
+
+[dependencies]
+anyhow = "1"
+flate2 = "1"
+fs2 = "0.4"
+libc = "0.2"
+rusqlite = { version = "0.38", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3"
