@@ -911,7 +911,15 @@ impl App {
                 self.status.pending_regions
             )),
             Line::raw(self.reply.scope.as_ref().map(|n|format!("This folder: {} logical / {} allocated estimate · {}",size(n.logical),size(n.allocated),n.status_name())).unwrap_or_else(||"This folder: measurement pending; accessible descendants are measured at every depth".into())),
-            Line::raw(if self.status.running {
+            Line::styled(if self.status.finish_then_idle {
+                if self.status.running || self.status.detail_running {
+                    "History changed: finishing and saving this scan, then idle; Refresh resumes measurement".into()
+                } else {
+                    "Measurement idle; saved observations retained. Press r to resume, or R for Full rescan".into()
+                }
+            } else if self.status.verification.is_some() {
+                "Saved observations retained; some changes need verification. Full rescan requires R".into()
+            } else if self.status.running {
                 format!(
                     "Measuring {}",
                     visible(self.status.current_path.to_string_lossy())
@@ -920,7 +928,7 @@ impl App {
                 "Loading browsing detail; the saved index remains available".into()
             } else {
                 "Completed observations save automatically; q leaves the service running".into()
-            }),
+            }, if self.status.verification.is_some() { self.warning() } else { Style::default() }),
         ];
         frame.render_widget(Paragraph::new(header).wrap(Wrap { trim: false }), chunks[1]);
         match self.tab {

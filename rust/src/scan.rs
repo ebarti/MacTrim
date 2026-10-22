@@ -25,6 +25,35 @@ impl std::fmt::Display for Cancelled {
 }
 impl std::error::Error for Cancelled {}
 
+#[derive(Debug)]
+pub struct NeedsFullReconciliation(pub &'static str);
+impl std::fmt::Display for NeedsFullReconciliation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for NeedsFullReconciliation {}
+
+pub struct Options<'a> {
+    pub budget: Option<&'a crate::budget::Budget>,
+    pub allow_full: bool,
+}
+impl Default for Options<'_> {
+    fn default() -> Self {
+        Self {
+            budget: None,
+            allow_full: true,
+        }
+    }
+}
+pub fn checkpoint(cancel: &AtomicBool, budget: Option<&crate::budget::Budget>) -> Result<()> {
+    check_cancelled(cancel)?;
+    if let Some(budget) = budget {
+        budget.checkpoint(cancel)?;
+    }
+    Ok(())
+}
+
 pub fn check_cancelled(cancel: &AtomicBool) -> Result<()> {
     if cancel.load(Ordering::Relaxed) {
         return Err(Cancelled.into());
@@ -204,6 +233,7 @@ fn walk(
     exclusions: &[PathBuf],
     cancel: &AtomicBool,
     progress: Option<&Arc<Mutex<Progress>>>,
+    budget: Option<&crate::budget::Budget>,
 ) -> Result<Index> {
     let meta = fs::symlink_metadata(root)?;
     if !meta.is_dir() || meta.file_type().is_symlink() {
@@ -222,7 +252,7 @@ fn walk(
         .max_open(32)
         .into_iter();
     while let Some(entry) = walker.next() {
-        check_cancelled(cancel)?;
+        checkpoint(cancel, budget)?;
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
@@ -354,12 +384,35 @@ pub fn measure(
     cancel: &AtomicBool,
     progress: Option<&Arc<Mutex<Progress>>>,
 ) -> Result<Index> {
+    measure_with_options(
+        root,
+        exclusions,
+        previous,
+        dirty,
+        cancel,
+        progress,
+        Options::default(),
+    )
+}
+
+pub fn measure_with_options(
+    root: &Path,
+    exclusions: &[PathBuf],
+    previous: Option<&Index>,
+    dirty: &Regions,
+    cancel: &AtomicBool,
+    progress: Option<&Arc<Mutex<Progress>>>,
+    options: Options<'_>,
+) -> Result<Index> {
     check_cancelled(cancel)?;
-    let full = |why: &str| -> Result<Index> {
+    let full = |why: &'static str| -> Result<Index> {
+        if !options.allow_full {
+            return Err(NeedsFullReconciliation(why).into());
+        }
         if let Some(progress) = progress {
             progress.lock().unwrap().phase = why.into();
         }
-        walk(root, root, exclusions, cancel, progress)
+        walk(root, root, exclusions, cancel, progress, options.budget)
     };
     let Some(old) = previous.filter(|i| i.root == root && i.root_node().is_some()) else {
         return full("Measuring full baseline");
@@ -389,8 +442,8 @@ pub fn measure(
     candidate.reused = old.root_node().map_or(0, |n| n.entries);
     let mut ancestors = std::collections::BTreeSet::new();
     for scope in scopes.paths() {
-        check_cancelled(cancel)?;
-        let subtree = walk(scope, root, exclusions, cancel, progress)?;
+        checkpoint(cancel, options.budget)?;
+        let subtree = walk(scope, root, exclusions, cancel, progress, options.budget)?;
         if !subtree.linked.is_empty() {
             return full("Full reconciliation for newly shared hardlink identities");
         }
@@ -414,7 +467,7 @@ pub fn measure(
         }
     }
     for (_, path) in ancestors {
-        check_cancelled(cancel)?;
+        checkpoint(cancel, options.budget)?;
         let before = old.nodes.get(&path).context("Missing aggregate ancestor")?;
         let meta = fs::symlink_metadata(&path)?;
         if meta.dev() != before.signature[0] || meta.ino() != before.signature[1] || !meta.is_dir()

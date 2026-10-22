@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod budget;
 pub mod cleanup;
 pub mod events;
 pub mod history;

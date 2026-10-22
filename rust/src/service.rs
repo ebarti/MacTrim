@@ -56,6 +56,9 @@ pub enum Request {
     Retention {
         days: u64,
     },
+    Policy {
+        cpu_percent: Option<u8>,
+    },
     Stop,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -90,6 +93,12 @@ pub struct Status {
     pub error: Option<String>,
     #[serde(default)]
     pub last_interruption: Option<Interruption>,
+    #[serde(default)]
+    pub cpu_percent: u8,
+    #[serde(default)]
+    pub verification: Option<Verification>,
+    #[serde(default)]
+    pub finish_then_idle: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Row {
@@ -590,6 +599,41 @@ fn interrupt_measurement(
     Ok(())
 }
 
+fn observe_identity(
+    store: &mut Store,
+    root: &Path,
+    identity: &mut Identity,
+    current: Identity,
+    checkpoint: u64,
+    cancel: &AtomicBool,
+    last: &mut Option<Interruption>,
+) -> Result<bool> {
+    if current == *identity && store.cursor()? <= checkpoint {
+        return Ok(false);
+    }
+    // A replaced event journal does not replace the files being measured.
+    // Only an actual filesystem replacement invalidates the active candidate.
+    if !current.same_filesystem(identity) {
+        interrupt_measurement(
+            store,
+            cancel,
+            last,
+            "Filesystem replaced; current measurement interrupted",
+        )?;
+    }
+    store.bind(root, &current, checkpoint)?;
+    *identity = current;
+    Ok(true)
+}
+
+fn idle_after_scan(store: &mut Store, held: bool, active: bool, paused: &mut bool) -> Result<()> {
+    if held && !active && !*paused {
+        store.set_paused(true)?;
+        *paused = true;
+    }
+    Ok(())
+}
+
 fn detail_finished(
     path: PathBuf,
     result: Result<Arc<Index>>,
@@ -620,6 +664,9 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
     let mut store = Store::open(&state)?;
     let mut identity = events::identity(&root)?;
     store.bind(&root, &identity, events::current_id())?;
+    store.defer_legacy_root_work()?;
+    let mut policy = store.policy()?;
+    let budget = Arc::new(crate::budget::Budget::new(policy.cpu_percent));
     let mut index = None;
     let mut loading = true;
     let (loaded_tx, loaded_rx) = mpsc::sync_channel(1);
@@ -675,6 +722,7 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
     let mut paused: bool = store.get("paused")?.unwrap_or(false);
     let mut error = None;
     let mut last_interruption = store.get("last_interruption")?;
+    let mut finish_then_idle = store.get::<Option<String>>("finish_then_idle")?.flatten();
     let mut phase = "Replaying filesystem journal".to_string();
     let mut identity_check = Instant::now();
     let mut last_event = Instant::now();
@@ -708,13 +756,11 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
                 }
                 Err(e) => {
                     error = Some(format!(
-                        "Saved index unreadable: {e:#}; rebuilding accessible metadata"
+                        "Saved index unreadable: {e:#}; original retained; request Full rescan to rebuild"
                     ));
-                    store.ingest(
-                        store.cursor()?,
-                        [root.clone()],
-                        "Repairing unreadable saved index",
-                    )?;
+                    let reason = "Saved index unreadable; Full rescan required";
+                    store.hold_after_scan(reason)?;
+                    finish_then_idle = Some(reason.into());
                 }
             }
         }
@@ -752,24 +798,22 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
                 } else {
                     let anchor = events::current_id();
                     let current = events::identity(&root)?;
-                    if current != identity || store.cursor()? > anchor {
-                        let reason = if current != identity {
-                            "Filesystem history changed; automatic reconciliation queued"
-                        } else {
-                            "Filesystem event cursor reset; automatic reconciliation queued"
-                        };
-                        interrupt_measurement(&mut store, &cancel, &mut last_interruption, reason)?;
-                        identity = current;
-                        store.bind(&root, &identity, anchor)?;
-                    }
-                    store.ingest(
-                        anchor.max(store.cursor()?),
-                        [root.clone()],
-                        "Journal replay gap; full reconciliation",
+                    observe_identity(
+                        &mut store,
+                        &root,
+                        &mut identity,
+                        current,
+                        anchor,
+                        &cancel,
+                        &mut last_interruption,
                     )?;
-                    ready = true; // Root invalidation covers history through the new anchor.
+                    store.hold_after_scan("Journal replay gap; finish current scan then idle")?;
+                    store.ingest(anchor, [], "New journal delivery anchor")?;
+                    finish_then_idle =
+                        Some("Journal replay gap; Refresh resumes measurement".into());
+                    ready = true; // New live delivery is active; historical uncertainty remains explicit.
                     replay_failures = 0;
-                    phase = "Reconciling reported journal gap".into();
+                    phase = "Journal gap recorded; no automatic full rescan".into();
                     drop(watch);
                     watch = events::watch(identity.clone(), store.cursor()?)?;
                 }
@@ -777,7 +821,7 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
                 break;
             }
             let meaningful = !change.paths.is_empty();
-            if meaningful && store.work()?.paths.is_empty() {
+            if meaningful && store.pending_count()? == 0 {
                 queued_at = Instant::now();
             }
             // Persisting acknowledgements of our own excluded state writes
@@ -799,11 +843,23 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
         }
         if watch.overflow.swap(false, Ordering::AcqRel) {
             if replay_failures != 0 {
-                store.ingest(
-                    events::current_id().max(store.cursor()?),
-                    [root.clone()],
-                    "Receiver pressure; full reconciliation",
+                store.hold_after_scan(
+                    "Receiver history unavailable; finish current scan then idle",
                 )?;
+                let anchor = events::current_id();
+                let current = events::identity(&root)?;
+                observe_identity(
+                    &mut store,
+                    &root,
+                    &mut identity,
+                    current,
+                    anchor,
+                    &cancel,
+                    &mut last_interruption,
+                )?;
+                store.ingest(anchor, [], "New receiver delivery anchor")?;
+                finish_then_idle =
+                    Some("Receiver history unavailable; Refresh resumes measurement".into());
                 replay_failures = 0;
                 ready = true;
             } else {
@@ -816,24 +872,39 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
         }
         if identity_check.elapsed() > Duration::from_secs(10) {
             let current = events::identity(&root)?;
-            if current != identity {
-                interrupt_measurement(
-                    &mut store,
-                    &cancel,
-                    &mut last_interruption,
-                    "Filesystem history changed; automatic reconciliation queued",
-                )?;
-                identity = current;
-                store.bind(&root, &identity, events::current_id())?;
+            if observe_identity(
+                &mut store,
+                &root,
+                &mut identity,
+                current,
+                events::current_id(),
+                &cancel,
+                &mut last_interruption,
+            )? {
+                finish_then_idle =
+                    Some("Filesystem history changed; Refresh resumes measurement".into());
                 ready = false;
                 drop(watch);
                 watch = events::watch(identity.clone(), store.cursor()?)?;
-                phase = "Volume history changed; reconciling full scope".into();
+                phase = "Filesystem history changed; finish current scan then idle".into();
             }
             identity_check = Instant::now();
         }
         while let Ok((command, tx)) = commands_rx.try_recv() {
             let reply = match command {
+                Request::Policy { cpu_percent } => {
+                    let updated = ScanPolicy {
+                        cpu_percent: cpu_percent.unwrap_or(policy.cpu_percent),
+                    };
+                    let result = store.set_policy(&updated).map(|_| {
+                        policy = updated;
+                        budget.set_percent(policy.cpu_percent);
+                        Reply { status: public.read().unwrap().status.clone(),
+                            message: format!("Background scanner budget: {}% of one core; full rescans require an explicit request", policy.cpu_percent), ..Reply::default() }
+                    }).map_err(|e| format!("{e:#}"));
+                    let _ = tx.send(result);
+                    continue;
+                }
                 Request::Retention { days } => {
                     let result=store.set_history_days(days).map(|_|Reply{status:public.read().unwrap().status.clone(),message:format!("History retention set to {days} days; older records removed, reusable database pages retained"),..Reply::default()}).map_err(|e|format!("{e:#}"));
                     let _ = tx.send(result);
@@ -859,11 +930,10 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
                 }
                 Request::Refresh { full } => {
                     paused = false;
-                    store.set_paused(false)?;
+                    store.resume(full)?;
+                    finish_then_idle = None;
                     error = None;
-                    if full {
-                        store.ingest(store.cursor()?, [root.clone()], "Explicit full rescan")?;
-                    } else if !running {
+                    if !full && !running {
                         let retry = index.as_deref().map(retry_regions).unwrap_or_default();
                         store.ingest(store.cursor()?, retry, "Retrying incomplete coverage")?;
                     }
@@ -889,17 +959,19 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
         }
         if let Ok(result) = finished_rx.try_recv() {
             running = false;
-            if let Ok((_, _, work, _)) = &result {
+            if result.is_ok() {
                 let current = events::identity(&root)?;
-                if current != work.identity && !cancel.load(Ordering::Relaxed) {
-                    interrupt_measurement(
-                        &mut store,
-                        &cancel,
-                        &mut last_interruption,
-                        "Filesystem history changed before commit; automatic reconciliation queued",
-                    )?;
-                    identity = current;
-                    store.bind(&root, &identity, events::current_id())?;
+                if observe_identity(
+                    &mut store,
+                    &root,
+                    &mut identity,
+                    current,
+                    events::current_id(),
+                    &cancel,
+                    &mut last_interruption,
+                )? {
+                    finish_then_idle =
+                        Some("Filesystem history changed; Refresh resumes measurement".into());
                     ready = false;
                     drop(watch);
                     watch = events::watch(identity.clone(), store.cursor()?)?;
@@ -909,9 +981,6 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
                 Ok((candidate, generation, work, changes)) if !cancel.load(Ordering::Relaxed) => {
                     store.commit_changes(&generation, &work, &candidate, &changes)?;
                     last_saved = generation.created;
-                    if work.paths.iter().any(|p| p == &root) {
-                        store.set_full_at(last_saved)?;
-                    }
                     index = Some(candidate);
                     let mut p = public.write().unwrap();
                     let affected = p
@@ -936,6 +1005,11 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
                     phase = "Candidate interrupted; pending work preserved for retry".into();
                     store.reap_orphans()?;
                 }
+                Err(e) if e.is::<scan::NeedsFullReconciliation>() => {
+                    store.defer_active(&e.to_string())?;
+                    finish_then_idle = Some(format!("{}; Full rescan is available explicitly", e));
+                    phase = "Broader verification deferred; no automatic full rescan".into();
+                }
                 Err(e) => {
                     measurement_failed(&mut store, &mut paused, &mut error, &mut phase, e)?;
                 }
@@ -945,28 +1019,37 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
         if let Ok((path, measured_identity, result)) = details_rx.try_recv() {
             detail_running = false;
             let interrupted = cancel.load(Ordering::Relaxed)
-                || (result.is_ok() && measured_identity != events::identity(&root)?);
+                || (result.is_ok()
+                    && !measured_identity.same_filesystem(&events::identity(&root)?));
             if let Some(detail) =
                 detail_finished(path, result, interrupted, &mut detail_pending, &mut error)
             {
                 public.write().unwrap().detail = Some(detail);
             }
         }
-        let work = store.work()?;
-        if ready && !loading && !paused && !running && !detail_running && work.paths.is_empty() {
+        idle_after_scan(
+            &mut store,
+            finish_then_idle.is_some(),
+            running || detail_running,
+            &mut paused,
+        )?;
+        let pending_regions = store.pending_count()?;
+        if ready && !loading && !paused && !running && !detail_running && pending_regions == 0 {
             phase = "Index saved; incremental tracking active".into();
         }
         if ready
             && !loading
             && !paused
+            && finish_then_idle.is_none()
             && !terminate.load(Ordering::Relaxed)
             && !running
             && !detail_running
             && (last_event.elapsed() >= Duration::from_millis(750)
                 || queued_at.elapsed() >= Duration::from_secs(2))
-            && !work.paths.is_empty()
+            && pending_regions != 0
         {
             let work = store.claim()?;
+            let allow_full = work.full;
             queued_at = Instant::now();
             running = true;
             cancel = Arc::new(AtomicBool::new(false));
@@ -987,25 +1070,33 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
             let cancel = cancel.clone();
             let progress = progress.clone();
             let tx = finished_tx.clone();
+            let budget = budget.clone();
             thread::Builder::new()
                 .name("mactrim-measurement".into())
                 .spawn(move || {
+                    budget.begin();
                     let result = (|| {
                         let dirty: Regions = work.paths.iter().cloned().collect();
-                        let measured = Arc::new(scan::measure(
+                        let measured = Arc::new(scan::measure_with_options(
                             &root,
                             std::slice::from_ref(&state),
                             previous.as_deref(),
                             &dirty,
                             &cancel,
                             Some(&progress),
+                            scan::Options {
+                                budget: Some(&budget),
+                                allow_full,
+                            },
                         )?);
                         scan::check_cancelled(&cancel)?;
                         progress.lock().unwrap().phase = "Saving compressed directory index".into();
-                        let generation = Generation::update(
+                        let generation = Generation::update_controlled(
                             &state,
                             &measured,
                             previous_generation.as_ref().zip(previous.as_deref()),
+                            Some(&budget),
+                            &cancel,
                         )?;
                         let changes = crate::history::changes(
                             previous.as_deref(),
@@ -1019,6 +1110,7 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
         } else if ready
             && !loading
             && !paused
+            && finish_then_idle.is_none()
             && !terminate.load(Ordering::Relaxed)
             && !running
             && !detail_running
@@ -1030,10 +1122,22 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
             let tx = details_tx.clone();
             let state = state.clone();
             let measured_identity = identity.clone();
+            let budget = budget.clone();
             thread::spawn(move || {
-                let result =
-                    scan::measure(&path, &[state], None, &Regions::default(), &cancel, None)
-                        .map(Arc::new);
+                budget.begin();
+                let result = scan::measure_with_options(
+                    &path,
+                    &[state],
+                    None,
+                    &Regions::default(),
+                    &cancel,
+                    None,
+                    scan::Options {
+                        budget: Some(&budget),
+                        allow_full: true,
+                    },
+                )
+                .map(Arc::new);
                 let _ = tx.send((path, measured_identity, result));
             });
         }
@@ -1041,14 +1145,16 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
         if ready
             && !paused
             && !running
-            && work.paths.is_empty()
+            && pending_regions == 0
             && last_retry.elapsed() > Duration::from_secs(3600)
         {
-            if store::now().saturating_sub(store.full_at()?) >= 7 * 86400 {
+            if store.verification()?.is_none()
+                && store::now().saturating_sub(store.full_at()?) >= 7 * 86400
+            {
                 store.ingest(
                     store.cursor()?,
                     [root.clone()],
-                    "Periodic reconciliation due",
+                    "Periodic verification is due; Full rescan is available explicitly",
                 )?;
             }
             last_retry = Instant::now();
@@ -1064,7 +1170,9 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
                 phase: if loading {
                     "Loading saved directory tree; event ingestion active".into()
                 } else if paused {
-                    if error.is_some() {
+                    if let Some(reason) = &finish_then_idle {
+                        format!("Idle after current scan; {reason}")
+                    } else if error.is_some() {
                         "Paused after measurement failure; Refresh retries".into()
                     } else if last_interruption
                         .as_ref()
@@ -1089,7 +1197,7 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
                 history_days: store.history_days()?,
                 received_cursor: store.cursor()?,
                 applied_cursor: store.applied()?,
-                pending_regions: work.paths.len(),
+                pending_regions,
                 directories: index.as_ref().map(|i| i.nodes.len()).unwrap_or(0),
                 index_bytes: store.footprint()?,
                 visited: live.visited,
@@ -1105,6 +1213,9 @@ pub fn run(root: PathBuf, state: PathBuf, terminate: Arc<AtomicBool>) -> Result<
                 current_path: live.current.clone(),
                 error: error.clone(),
                 last_interruption: last_interruption.clone(),
+                cpu_percent: policy.cpu_percent,
+                verification: store.verification()?,
+                finish_then_idle: finish_then_idle.is_some(),
             };
         }
         while let Ok((stream, _)) = listener.accept() {
@@ -1261,7 +1372,7 @@ mod retry_tests {
     }
 
     #[test]
-    fn automatic_history_interruption_preserves_index_and_can_commit_retry() {
+    fn history_change_finishes_active_scan_saves_then_idles_across_restart() {
         let fixture = tempfile::tempdir().unwrap();
         let base = fs::canonicalize(fixture.path()).unwrap();
         let root = base.join("files");
@@ -1269,6 +1380,7 @@ mod retry_tests {
         fs::create_dir(&root).unwrap();
         fs::write(root.join("data"), b"saved observation").unwrap();
         let mut identity = Identity {
+            volume_uuid: None,
             namespace_device: 1,
             namespace_inode: 2,
             namespace_uuid: "initial".into(),
@@ -1292,63 +1404,227 @@ mod retry_tests {
         let generation = Generation::write(&state, &saved).unwrap();
         let baseline = store.claim().unwrap();
         store.commit(&generation, &baseline, &saved).unwrap();
-        store.ingest(120, [root.clone()], "New work").unwrap();
-        let old_work = store.claim().unwrap();
-        let cancel = AtomicBool::new(false);
-        let mut last = None;
-        interrupt_measurement(
-            &mut store,
-            &cancel,
-            &mut last,
-            "Filesystem history changed; automatic reconciliation queued",
-        )
-        .unwrap();
+        store.resume(true).unwrap();
+        let work = store.claim().unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(Mutex::new(Progress::default()));
+        let gate = progress.lock().unwrap();
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let worker = {
+            let (root, cancel, progress) = (root.clone(), cancel.clone(), progress.clone());
+            thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                scan::measure(
+                    &root,
+                    &[],
+                    None,
+                    &Regions::default(),
+                    &cancel,
+                    Some(&progress),
+                )
+            })
+        };
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut current = identity.clone();
         identity.uuid = "replacement".into();
-        store.bind(&root, &identity, 30).unwrap();
-        let failure = scan::measure(&root, &[], Some(&saved), &Regions::default(), &cancel, None)
-            .unwrap_err();
+        let mut last = None;
+        assert!(
+            observe_identity(
+                &mut store,
+                &root,
+                &mut current,
+                identity.clone(),
+                30,
+                &cancel,
+                &mut last
+            )
+            .unwrap()
+        );
+        identity.uuid = "replacement-again".into();
+        assert!(
+            observe_identity(
+                &mut store,
+                &root,
+                &mut current,
+                identity.clone(),
+                20,
+                &cancel,
+                &mut last
+            )
+            .unwrap()
+        );
+        assert!(
+            !cancel.load(Ordering::Relaxed),
+            "Journal UUID cancelled active work"
+        );
+        assert!(
+            last.is_none(),
+            "Journal change was reported as scan cancellation"
+        );
         let mut paused = false;
-        let mut error = None;
-        let mut phase = String::new();
-        measurement_failed(&mut store, &mut paused, &mut error, &mut phase, failure).unwrap();
+        idle_after_scan(&mut store, true, true, &mut paused).unwrap();
         assert!(!paused);
-        assert!(error.is_none());
+        fs::write(root.join("data"), vec![1; 8192]).unwrap();
+        store
+            .ingest(25, [root.join("later")], "Arrived after history reset")
+            .unwrap();
+        drop(gate);
+        let measured = worker.join().unwrap().unwrap();
+        let next_generation = Generation::write(&state, &measured).unwrap();
+        let changes = crate::history::changes(Some(&saved), &measured, store::now());
+        store
+            .commit_changes(&next_generation, &work, &measured, &changes)
+            .unwrap();
+        idle_after_scan(&mut store, true, false, &mut paused).unwrap();
+        assert!(paused);
+        assert_eq!(store.load().unwrap().unwrap().nodes, measured.nodes);
+        assert_ne!(generation.digest, next_generation.digest);
+        assert_eq!(store.work().unwrap().paths, vec![root.join("later")]);
+        assert_eq!(
+            store.applied().unwrap(),
+            0,
+            "Acknowledged an obsolete journal epoch"
+        );
+        assert_eq!(store.cursor().unwrap(), 25);
+        assert!(store.verification().unwrap().is_some());
+        assert!(
+            store
+                .history(&root, 0)
+                .unwrap()
+                .iter()
+                .all(|c| c.after.as_ref().is_none_or(|n| !n.complete))
+        );
+        drop(store);
+        let mut store = Store::open(&state).unwrap();
+        assert_eq!(store.get::<bool>("paused").unwrap(), Some(true));
+        assert!(
+            store
+                .get::<Option<String>>("finish_then_idle")
+                .unwrap()
+                .flatten()
+                .is_some()
+        );
         assert_eq!(
             store.generation().unwrap().unwrap().digest,
-            generation.digest
+            next_generation.digest
         );
-        assert_eq!(store.load().unwrap().unwrap().nodes, saved.nodes);
-        assert!(
-            store.commit(&generation, &old_work, &saved).is_err(),
-            "Stale identity committed"
-        );
-        assert_eq!(store.work().unwrap().paths, vec![root.clone()]);
-        let retry = store.claim().unwrap();
-        let next_cancel = AtomicBool::new(false);
-        fs::write(root.join("data"), vec![1; 8192]).unwrap();
+        store.resume(true).unwrap();
+        let explicit = store.claim().unwrap();
+        assert!(explicit.full);
+        store
+            .commit(&next_generation, &explicit, &measured)
+            .unwrap();
+        assert!(store.verification().unwrap().is_none());
+        assert_eq!(store.applied().unwrap(), 25);
+        assert_eq!(store.get::<bool>("paused").unwrap(), Some(false));
+    }
+
+    #[test]
+    fn history_change_without_active_scan_stays_idle_and_keeps_saved_index() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(fixture.path()).unwrap();
+        let state = root.join("state");
+        let mut store = Store::open(&state).unwrap();
+        let mut identity = Identity {
+            volume_uuid: Some("fixture-volume".into()),
+            namespace_device: 1,
+            namespace_inode: 2,
+            namespace_uuid: "fixture-volume".into(),
+            device: 1,
+            uuid: "fixture-history".into(),
+            mount: "/".into(),
+            relative: "fixture".into(),
+        };
+        store.bind(&root, &identity, 100).unwrap();
         let measured = scan::measure(
             &root,
-            &[],
-            Some(&saved),
-            &retry.paths.iter().cloned().collect(),
-            &next_cancel,
+            std::slice::from_ref(&state),
+            None,
+            &Regions::default(),
+            &AtomicBool::new(false),
             None,
         )
         .unwrap();
-        let next_generation = Generation::write(&state, &measured).unwrap();
-        store.commit(&next_generation, &retry, &measured).unwrap();
-        assert!(store.work().unwrap().paths.is_empty());
-        assert_eq!(store.applied().unwrap(), 30);
-        drop(store);
-        let store = Store::open(&state).unwrap();
+        let saved = Generation::write(&state, &measured).unwrap();
+        let work = store.claim().unwrap();
+        store.commit(&saved, &work, &measured).unwrap();
+        let mut changed = identity.clone();
+        changed.uuid = "new-journal".into();
+        let cancel = AtomicBool::new(false);
+        assert!(
+            observe_identity(
+                &mut store,
+                &root,
+                &mut identity,
+                changed,
+                50,
+                &cancel,
+                &mut None
+            )
+            .unwrap()
+        );
+        let mut paused = false;
+        idle_after_scan(&mut store, true, false, &mut paused).unwrap();
+        assert!(paused);
+        assert!(!cancel.load(Ordering::Relaxed));
+        assert!(
+            store.work().unwrap().paths.is_empty(),
+            "History reset queued a root scan"
+        );
+        store
+            .ingest(60, [root.join("changed")], "New live change")
+            .unwrap();
+        idle_after_scan(&mut store, true, false, &mut paused).unwrap();
+        assert!(paused, "New notifications resumed measurement");
+        assert_eq!(store.generation().unwrap().unwrap().digest, saved.digest);
+        store.resume(false).unwrap();
         assert_eq!(store.get::<bool>("paused").unwrap(), Some(false));
-        assert_eq!(
+        assert!(
+            !store.claim().unwrap().full,
+            "Refresh became an implicit full rescan"
+        );
+        assert!(store.verification().unwrap().is_some());
+    }
+
+    #[test]
+    fn physical_filesystem_replacement_still_cancels_the_wrong_candidate() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(fixture.path()).unwrap();
+        let mut store = Store::open(&root.join("state")).unwrap();
+        let mut identity = Identity {
+            volume_uuid: Some("volume-a".into()),
+            namespace_device: 1,
+            namespace_inode: 2,
+            namespace_uuid: "namespace".into(),
+            device: 1,
+            uuid: "history-a".into(),
+            mount: "/".into(),
+            relative: "fixture".into(),
+        };
+        store.bind(&root, &identity, 100).unwrap();
+        store.claim().unwrap();
+        let mut changed = identity.clone();
+        changed.volume_uuid = Some("volume-b".into());
+        let cancel = AtomicBool::new(false);
+        let mut last = None;
+        observe_identity(
+            &mut store,
+            &root,
+            &mut identity,
+            changed,
+            30,
+            &cancel,
+            &mut last,
+        )
+        .unwrap();
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(last.unwrap().reason.contains("Filesystem replaced"));
+        assert!(
             store
-                .get::<Interruption>("last_interruption")
+                .get::<Option<Work>>("active")
                 .unwrap()
-                .unwrap()
-                .reason,
-            last.unwrap().reason
+                .flatten()
+                .is_none()
         );
     }
 

@@ -55,10 +55,12 @@ revision and source checksum. `dist/build.json` records the packaged artifact.
   a path when incoming sizes reorder rows, including across page boundaries.
 - **Ctrl+X** opens a **Y/N** pause confirmation. **Esc alone never cancels a scan.**
   A pause survives a service restart; Refresh resumes pending measurement.
-  Automatic interruptions for changed filesystem history retry pending work
-  without pausing the service. A cancelled worker finishing after Refresh
-  cannot undo the resume. `status` records the latest interruption reason and
-  time across restarts; actual measurement or save failures remain errors.
+  If filesystem history changes, an active scan finishes and saves, then
+  measurement stays idle. An idle service stays idle. The receiver continues
+  collecting changes; Refresh explicitly resumes measurement. A cancelled worker
+  finishing after Refresh cannot undo the resume. `status` records the latest
+  interruption reason and time across restarts; actual measurement or save
+  failures remain errors.
 - **Tab / F1–F4** switches Storage, Cleanup, History/Growth and Quarantine/Recovery.
 
 Sizes include accessible descendants at every depth. Dependency folders such as
@@ -92,8 +94,10 @@ physical bytes.
 ## Event tracking, persistence and History
 
 The native receiver runs separately from traversal, file-list queries and the UI.
-It does no disk I/O inside the FSEvents callback. A durable received cursor covers
-either committed measurements or pending invalidated regions in SQLite.
+It does no disk I/O inside the FSEvents callback. A durable received cursor records
+delivery progress alongside pending invalidated regions in SQLite. A separate
+applied cursor records measurement progress. When history is missing, a durable
+uncertainty marker prevents that delivery anchor from claiming verified totals.
 
 Changes invalidate cached directory totals. They are not byte deltas. The service
 remeasures affected retained subtrees and updates their ancestors using persistent
@@ -102,11 +106,20 @@ It does not depend on directory modification timestamps to detect in-place file
 edits. Hardlinks or namespace changes can require a global reconciliation.
 
 Reported delivery gaps trigger replay from the durable checkpoint. A repeated
-gap or changed history identity records a full-scope invalidation before moving
-the receiver to a fresh anchor. Queue pressure broadens pending work rather than
-dropping affected paths. Nonconsecutive event IDs alone are not counted as drops.
-An idle periodic reconciliation every seven days covers advisory-event blind
-spots. **No filesystem notification API makes a mutable filesystem a perfect
+gap or changed event-history UUID records uncertainty, preserves the active scan
+and its eventual saved result, and stops further measurement until Refresh. The
+receiver moves to a fresh delivery anchor without acknowledging the missing
+history. A physical filesystem replacement still interrupts a candidate that
+belongs to a different filesystem. Nonconsecutive event IDs alone are not drops.
+
+File notifications invalidate their containing directories. Pending regions are
+coalesced with indexed ancestor and descendant queries in SQLite; a large intake
+queue does not collapse into a root rescan. Broad uncertainty is stored separately
+from precise pending regions. An incremental update that needs global hardlink
+accounting is deferred, retaining its pending scopes and previous measurements.
+Only an explicit Full rescan (or the first baseline) may scan the entire scope.
+Periodic verification can be reported as due; it does not start a scan.
+**No filesystem notification API makes a mutable filesystem a perfect
 snapshot or guarantees that every possible omission can be detected.**
 
 The saved index is a compressed directory tree with parent/name links, plus
@@ -162,6 +175,7 @@ has no deletion API.
 
 ```sh
 ./dist/mactrim service pause       # retain pending work, stop measurement
+./dist/mactrim service policy --cpu-percent 10 # cooperative background work budget
 ./dist/mactrim refresh             # resume and process changes
 ./dist/mactrim service status      # also succeeds when stopped; same as mactrim status
 ./dist/mactrim service stop        # wait for shutdown; succeeds if already stopped
@@ -177,6 +191,12 @@ scan progress and whether an index has been saved. For scripts, request the
 complete JSON response explicitly with `mactrim service status --json` or
 `mactrim --json service status`. `storage --json` continues to return JSON;
 `service plist` intentionally prints the LaunchAgent XML.
+
+Traversal and saving use a cooperative work budget of 10% of one core by default.
+`service policy --cpu-percent N` persists a budget from 1 through 100; this paces
+the measurement worker, while the receiver and queries remain responsive. It is
+a duty-cycle limit, not a guarantee about instantaneous CPU usage or I/O latency.
+Reading an existing index at startup is separate from measurement pacing.
 
 Stop waits until the service releases its state writer lock, so `service stop &&
 service start /` can run without a manual delay. Restart preserves committed

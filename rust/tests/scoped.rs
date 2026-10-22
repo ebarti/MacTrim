@@ -18,6 +18,7 @@ fn scan(root: &Path, old: Option<&Index>, changed: &Path) -> Index {
 }
 fn identity() -> Identity {
     Identity {
+        volume_uuid: None,
         namespace_device: 1,
         namespace_inode: 2,
         namespace_uuid: "fixture".into(),

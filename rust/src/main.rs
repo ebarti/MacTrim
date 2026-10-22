@@ -112,6 +112,11 @@ enum Cleanup {
 }
 #[derive(Subcommand)]
 enum Service {
+    /// Inspect or change the background scanner's share of one CPU core.
+    Policy {
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=100))]
+        cpu_percent: Option<u8>,
+    },
     Retention {
         #[arg(long)]
         days: u64,
@@ -319,6 +324,26 @@ fn print_service_status(reply: &service::Reply, json: bool, heading: &str) -> Re
         )?;
     }
     writeln!(out, "Pending regions: {}", s.pending_regions)?;
+    if s.cpu_percent != 0 {
+        writeln!(
+            out,
+            "Background scanner budget: {}% of one core",
+            s.cpu_percent
+        )?;
+    }
+    if let Some(verification) = &s.verification {
+        writeln!(
+            out,
+            "Verification needed: {}; full rescans require an explicit request",
+            verification.reason
+        )?;
+    }
+    if s.finish_then_idle && (s.running || s.detail_running) {
+        writeln!(
+            out,
+            "After this scan: save and become idle; Refresh resumes measurement"
+        )?;
+    }
     if let Some(interruption) = &s.last_interruption {
         let at = chrono::DateTime::from_timestamp(interruption.at as i64, 0)
             .map(|at| at.format("%Y-%m-%d %H:%M:%S UTC").to_string())
@@ -426,6 +451,10 @@ fn run() -> Result<()> {
             },
         )?),
         Commands::Service { action } => match action {
+            Service::Policy { cpu_percent } => {
+                let reply = service::request(&state, &Request::Policy { cpu_percent })?;
+                print_or_text(json, &reply, &reply.message)
+            }
             Service::Retention { days } => print_or_text(
                 json,
                 &service::request(&state, &Request::Retention { days })?,

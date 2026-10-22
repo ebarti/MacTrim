@@ -23,6 +23,7 @@ pub const WRAPPED: u32 = 8;
 pub const HISTORY_DONE: u32 = 16;
 pub const ROOT_CHANGED: u32 = 32;
 pub const GAP_FLAGS: u32 = USER_DROPPED | KERNEL_DROPPED | WRAPPED | ROOT_CHANGED;
+pub const ITEM_IS_FILE: u32 = 0x10000;
 
 #[derive(Clone, Debug)]
 pub struct Event {
@@ -51,6 +52,14 @@ pub fn changes(
     cursor: u64,
 ) -> Changes {
     let mut regions = Regions::default();
+    let mut broad_root = false;
+    let mut invalidate = |path: PathBuf| {
+        if path == root {
+            broad_root = true;
+        } else {
+            regions.insert(path);
+        }
+    };
     let mut latest = cursor;
     let mut gap = 0;
     let mut history_done = false;
@@ -77,21 +86,33 @@ pub fn changes(
         }
         if !path.starts_with(root) {
             if event.flags & (64 | 128) != 0 && root.starts_with(&path) {
-                regions.insert(root.to_owned());
+                invalidate(root.to_owned());
             } else if event.flags & (64 | 128) == 0 {
                 gap |= ROOT_CHANGED;
             }
             continue;
         }
-        regions.insert(path.clone());
+        if event.flags & ITEM_IS_FILE != 0 {
+            if let Some(parent) = path.parent().filter(|p| p.starts_with(root)) {
+                invalidate(parent.to_owned());
+            }
+        } else {
+            invalidate(path.clone());
+        }
         if event.flags & (0x100 | 0x200 | 0x800 | 64 | 128) != 0
             && let Some(p) = path.parent().filter(|p| p.starts_with(root))
         {
-            regions.insert(p.to_owned());
+            invalidate(p.to_owned());
         }
     }
+    // Keep broad uncertainty alongside precise hints, through to durable
+    // ingestion. A root row in this antichain would swallow the precise rows.
+    let mut paths: Vec<_> = regions.paths().cloned().collect();
+    if broad_root {
+        paths.insert(0, root.to_owned());
+    }
     Changes {
-        paths: regions.paths().cloned().collect(),
+        paths,
         latest,
         gap,
         history_done,
@@ -177,6 +198,31 @@ mod native {
         }
         Ok(uuid::Uuid::from_bytes(bytes).to_string())
     }
+    fn volume_uuid(path: &Path) -> Result<String> {
+        let name = CString::new(path.as_os_str().as_bytes())?;
+        let mut attrs: libc::attrlist = unsafe { std::mem::zeroed() };
+        attrs.bitmapcount = 5;
+        attrs.volattr = libc::ATTR_VOL_INFO | libc::ATTR_VOL_UUID;
+        let mut data = [0u8; 20];
+        ensure!(
+            unsafe {
+                libc::getattrlist(
+                    name.as_ptr(),
+                    (&mut attrs as *mut libc::attrlist).cast(),
+                    data.as_mut_ptr().cast(),
+                    data.len(),
+                    0,
+                )
+            } == 0,
+            "Cannot read filesystem volume identity: {}",
+            std::io::Error::last_os_error()
+        );
+        ensure!(
+            u32::from_ne_bytes(data[..4].try_into()?) == 20,
+            "Unexpected volume identity response"
+        );
+        Ok(uuid::Uuid::from_bytes(data[4..].try_into()?).to_string())
+    }
     pub fn identity(root: &Path) -> Result<Identity> {
         let ns = fs::symlink_metadata(root)?;
         let (device, mount, relative) = if root == Path::new("/")
@@ -213,9 +259,16 @@ mod native {
             )
         };
         Ok(Identity {
+            volume_uuid: Some(volume_uuid(
+                if root == Path::new("/") && device != ns.dev() {
+                    Path::new("/System/Volumes/Data")
+                } else {
+                    root
+                },
+            )?),
             namespace_device: ns.dev(),
             namespace_inode: ns.ino(),
-            namespace_uuid: uuid(ns.dev())?,
+            namespace_uuid: volume_uuid(root)?,
             device,
             uuid: uuid(device)?,
             mount,
@@ -323,7 +376,7 @@ mod native {
                         array.cast(),
                         since,
                         0.5,
-                        4,
+                        4 | 16, // WatchRoot + FileEvents: keep invalidations at file/parent scope.
                     );
                     CFRelease(array.cast());
                     CFRelease(path.cast());
