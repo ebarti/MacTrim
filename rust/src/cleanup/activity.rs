@@ -205,6 +205,9 @@ impl ActivityProvider for NativeActivity {
                     _ => result.issues.push("Unexpected lsof field".into()),
                 }
             }
+            if !named && ["REG", "DIR", ""].contains(&kind.as_str()) {
+                result.issues.push(format!("PID {pid}, fd {descriptor} ({kind}): lsof omitted the final file name; active-use coverage is incomplete"));
+            }
             for (pid, argv) in &after {
                 if !seen.contains(pid) || !cwd.contains(pid) || before.get(pid) != Some(argv) {
                     result.issues.push(format!(

@@ -3,6 +3,13 @@ use crate::model::{Index, Node};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CapacityPoint {
+    pub at: u64,
+    pub used: u64,
+    pub available: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Counts {
     pub logical: u64,

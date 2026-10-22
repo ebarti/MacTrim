@@ -13,8 +13,8 @@ use crossterm::{
 use ratatui::{
     prelude::*,
     widgets::{
-        Bar, BarChart, BarGroup, Block, Borders, Cell, Clear, Paragraph, Row as TableRow, Table,
-        TableState, Tabs, Wrap,
+        Axis, Bar, BarChart, BarGroup, Block, Borders, Cell, Chart, Clear, Dataset, GraphType,
+        Paragraph, Row as TableRow, Table, TableState, Tabs, Wrap,
     },
 };
 use std::{
@@ -149,6 +149,7 @@ struct App {
     cleanup_loaded: bool,
     filter: String,
     history: Vec<Change>,
+    capacity_history: Vec<crate::history::CapacityPoint>,
     history_index: usize,
     history_offset: usize,
     history_more: bool,
@@ -190,6 +191,7 @@ impl App {
             cleanup_loaded: false,
             filter: String::new(),
             history: vec![],
+            capacity_history: vec![],
             history_index: 0,
             history_offset: 0,
             history_more: false,
@@ -273,6 +275,11 @@ impl App {
         let anchor = self.selected.clone();
         let tab = self.tab;
         let history_offset = self.history_offset;
+        let history_days = if self.status.history_days == 0 {
+            60
+        } else {
+            self.status.history_days
+        };
         thread::spawn(move || {
             let request = if tab == Tab::Storage {
                 Request::List {
@@ -285,7 +292,7 @@ impl App {
             } else {
                 Request::History {
                     path: view,
-                    since: crate::store::now().saturating_sub(60 * 86400),
+                    since: crate::store::now().saturating_sub(history_days.saturating_mul(86400)),
                     offset: history_offset,
                     limit: 200,
                 }
@@ -433,9 +440,9 @@ impl App {
                             .as_ref()
                             .and_then(|p| reply.rows.iter().position(|r| &r.path == p));
                         let chosen = identity.or_else(|| {
-                            (!reply.rows.is_empty()).then_some(
-                                self.table.selected().unwrap_or(0).min(reply.rows.len() - 1),
-                            )
+                            (!reply.rows.is_empty()).then(|| {
+                                self.table.selected().unwrap_or(0).min(reply.rows.len() - 1)
+                            })
                         });
                         if self.message.starts_with("Connecting")
                             || self.message.starts_with("Service:")
@@ -465,6 +472,7 @@ impl App {
                     Ok(reply) => {
                         self.status = reply.status;
                         self.history = reply.history;
+                        self.capacity_history = reply.capacity_history;
                         self.history_more = reply.more;
                         self.history_index =
                             self.history_index.min(self.history.len().saturating_sub(1));
@@ -855,7 +863,7 @@ impl App {
         }
         let chunks = Layout::vertical([
             Constraint::Length(2),
-            Constraint::Length(5),
+            Constraint::Length(6),
             Constraint::Min(5),
             Constraint::Length(6),
         ])
@@ -902,6 +910,7 @@ impl App {
                 timestamp(self.status.last_saved),
                 self.status.pending_regions
             )),
+            Line::raw(self.reply.scope.as_ref().map(|n|format!("This folder: {} logical / {} allocated estimate · {}",size(n.logical),size(n.allocated),n.status_name())).unwrap_or_else(||"This folder: measurement pending; accessible descendants are measured at every depth".into())),
             Line::raw(if self.status.running {
                 format!(
                     "Measuring {}",
@@ -1058,7 +1067,11 @@ impl App {
                         } else {
                             r.node.allocated
                         }))
-                        .style(self.status_style(r.node.status))
+                        .style(if self.selected.as_ref() == Some(&r.path) {
+                            self.highlight()
+                        } else {
+                            self.status_style(r.node.status)
+                        })
                 })
                 .collect();
             let chart = BarChart::default()
@@ -1163,6 +1176,45 @@ impl App {
         );
     }
     fn draw_history(&self, frame: &mut Frame, area: Rect) {
+        let split = Layout::vertical([Constraint::Length(8), Constraint::Min(4)]).split(area);
+        let points: Vec<_> = self
+            .capacity_history
+            .iter()
+            .map(|p| (p.at as f64, p.used as f64 / 1073741824.0))
+            .collect();
+        let first = points.first().map_or(0.0, |p| p.0);
+        let last = points.last().map_or(first + 1.0, |p| p.0).max(first + 1.0);
+        let low = points.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+        let high = points.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
+        let (low, high) = if low.is_finite() {
+            (low - 0.5, high + 0.5)
+        } else {
+            (0.0, 1.0)
+        };
+        let series = Dataset::default()
+            .name("Filesystem used")
+            .marker(ratatui::symbols::Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(self.primary())
+            .data(&points);
+        let chart = Chart::new(vec![series])
+            .block(
+                Block::default()
+                    .title(" Filesystem used · GiB · hourly observations ")
+                    .borders(Borders::ALL),
+            )
+            .x_axis(
+                Axis::default()
+                    .bounds([first, last])
+                    .labels([timestamp(first as u64), timestamp(last as u64)]),
+            )
+            .y_axis(
+                Axis::default()
+                    .bounds([low, high])
+                    .labels([format!("{low:.1}"), format!("{high:.1}")]),
+            );
+        frame.render_widget(chart, split[0]);
+        let area = split[1];
         let rows = self.history.iter().map(|c| {
             let growth = c
                 .growth()
@@ -1200,7 +1252,14 @@ impl App {
         .row_highlight_style(self.highlight())
         .block(
             Block::default()
-                .title(" Directory deltas · 60 days · hourly coalescing ")
+                .title(format!(
+                    " Directory deltas · {} days · hourly coalescing · [ ] pages ",
+                    if self.status.history_days == 0 {
+                        60
+                    } else {
+                        self.status.history_days
+                    }
+                ))
                 .borders(Borders::ALL),
         );
         let mut state = TableState::default().with_selected(Some(self.history_index));
@@ -1321,6 +1380,14 @@ mod tests {
             }),
         ));
         assert!(app.rows.is_empty());
+    }
+    #[test]
+    fn an_empty_first_reply_keeps_the_loading_screen_usable() {
+        let (tx, _) = mpsc::channel();
+        let mut app = App::new("/state".into(), "/fixture".into(), tx);
+        app.accept(Message::Storage(0, Ok(Reply::default())));
+        assert!(app.rows.is_empty());
+        assert!(app.table.selected().is_none());
     }
     #[test]
     fn escape_does_not_cancel_storage() {

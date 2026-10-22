@@ -375,6 +375,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS observations(at INTEGER NOT NULL, logical INTEGER NOT NULL, allocated INTEGER NOT NULL, status INTEGER NOT NULL);")?;
         db.execute_batch("CREATE TABLE IF NOT EXISTS directory_history(bucket INTEGER NOT NULL,path BLOB NOT NULL,before_json TEXT NOT NULL,after_json TEXT NOT NULL,at INTEGER NOT NULL,PRIMARY KEY(bucket,path));")?;
         db.execute_batch("CREATE TABLE IF NOT EXISTS tree_deltas(base TEXT NOT NULL,ordinal INTEGER NOT NULL,digest TEXT NOT NULL,compressed BLOB NOT NULL,PRIMARY KEY(base,ordinal));")?;
+        db.execute_batch("CREATE TABLE IF NOT EXISTS capacity_history(bucket INTEGER PRIMARY KEY,at INTEGER NOT NULL,used INTEGER NOT NULL,available INTEGER NOT NULL);")?;
         Ok(Self {
             db,
             path: path.to_owned(),
@@ -425,12 +426,58 @@ impl Store {
     pub fn generation(&self) -> Result<Option<Generation>> {
         self.get("generation")
     }
+    pub fn configured_root(state: &Path) -> Result<Option<PathBuf>> {
+        let database = state.join("service.sqlite3");
+        if !database.exists() {
+            return Ok(None);
+        }
+        let held = private_file(&database, false)?;
+        let db =
+            Connection::open_with_flags(&database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        ensure!(
+            held.metadata()?.ino() == fs::symlink_metadata(database)?.ino(),
+            "Database replaced while checking root"
+        );
+        let raw: Option<String> = db
+            .query_row("SELECT value FROM meta WHERE key='root'", [], |r| r.get(0))
+            .optional()?;
+        raw.map(|s| {
+            serde_json::from_str::<Vec<u8>>(&s)
+                .map(from_bytes)
+                .map_err(Into::into)
+        })
+        .transpose()
+    }
     pub fn load(&self) -> Result<Option<Index>> {
-        let Some(generation) = self.generation()? else {
+        Self::load_database(&self.path, &self.db)
+    }
+    pub fn load_readonly(state: &Path) -> Result<Option<Index>> {
+        let held = private_file(&state.join("service.sqlite3"), false)?;
+        let db = Connection::open_with_flags(
+            state.join("service.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        db.busy_timeout(std::time::Duration::from_secs(2))?;
+        ensure!(
+            held.metadata()?.ino() == fs::symlink_metadata(state.join("service.sqlite3"))?.ino(),
+            "Database replaced while opening saved tree"
+        );
+        Self::load_database(state, &db)
+    }
+    fn load_database(state: &Path, db: &Connection) -> Result<Option<Index>> {
+        let raw: Option<String> = db
+            .query_row("SELECT value FROM meta WHERE key='generation'", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        let Some(generation) = raw
+            .map(|s| serde_json::from_str::<Generation>(&s))
+            .transpose()?
+        else {
             return Ok(None);
         };
-        let mut index = generation.read_checkpoint(&self.path)?;
-        let mut query = self.db.prepare("SELECT ordinal,digest,compressed FROM tree_deltas WHERE base=? AND ordinal<=? ORDER BY ordinal")?;
+        let mut index = generation.read_checkpoint(state)?;
+        let mut query = db.prepare("SELECT ordinal,digest,compressed FROM tree_deltas WHERE base=? AND ordinal<=? ORDER BY ordinal")?;
         let mut rows = query.query(params![generation.name, sql_int(generation.patches)?])?;
         let mut expected = 1;
         while let Some(row) = rows.next()? {
@@ -507,6 +554,29 @@ impl Store {
     }
     pub fn full_at(&self) -> Result<u64> {
         Ok(self.get("full_at")?.unwrap_or(0))
+    }
+    pub fn history_days(&self) -> Result<u64> {
+        Ok(self.get("history_days")?.unwrap_or(60))
+    }
+    pub fn set_history_days(&mut self, days: u64) -> Result<()> {
+        ensure!(
+            days > 0 && days.checked_mul(86400).is_some(),
+            "Retention must be a positive number of days within the timestamp range"
+        );
+        let cutoff = now().saturating_sub(days * 86400);
+        let tx = self.db.transaction()?;
+        set(&tx, "history_days", &days)?;
+        tx.execute(
+            "DELETE FROM directory_history WHERE bucket<?",
+            [sql_int(cutoff / 3600)?],
+        )?;
+        tx.execute("DELETE FROM observations WHERE at<?", [sql_int(cutoff)?])?;
+        tx.execute(
+            "DELETE FROM capacity_history WHERE at<?",
+            [sql_int(cutoff)?],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
     pub fn ingest(
         &mut self,
@@ -720,7 +790,7 @@ impl Store {
                 )?;
                 tx.execute(
                     "DELETE FROM observations WHERE at<?",
-                    [sql_int(generation.created.saturating_sub(60 * 86400))?],
+                    [sql_int(generation.created.saturating_sub(days * 86400))?],
                 )?;
             }
         }
@@ -829,6 +899,51 @@ impl Store {
         let more = changes.len() > limit;
         changes.truncate(limit);
         Ok((changes, more))
+    }
+    pub fn record_capacity(&mut self, at: u64, used: u64, available: u64) -> Result<()> {
+        let days = self.history_days()?;
+        let tx = self.db.transaction()?;
+        tx.execute("INSERT INTO capacity_history VALUES(?,?,?,?) ON CONFLICT(bucket) DO UPDATE SET at=excluded.at,used=excluded.used,available=excluded.available",params![sql_int(at/3600)?,sql_int(at)?,sql_int(used)?,sql_int(available)?])?;
+        tx.execute(
+            "DELETE FROM capacity_history WHERE at<?",
+            [sql_int(at.saturating_sub(days.saturating_mul(86400)))?],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn capacity_history(
+        state: &Path,
+        since: u64,
+    ) -> Result<Vec<crate::history::CapacityPoint>> {
+        let database = state.join("service.sqlite3");
+        let held = private_file(&database, false)?;
+        let db =
+            Connection::open_with_flags(&database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        db.busy_timeout(std::time::Duration::from_secs(2))?;
+        ensure!(
+            held.metadata()?.ino() == fs::symlink_metadata(database)?.ino(),
+            "Capacity database replaced while opening"
+        );
+        let (first, last): (Option<i64>, Option<i64>) = db.query_row(
+            "SELECT MIN(at),MAX(at) FROM capacity_history WHERE at>=?",
+            [sql_int(since)?],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let (Some(first), Some(last)) = (first, last) else {
+            return Ok(vec![]);
+        };
+        // At most one point per chart bin. The full hourly series remains in
+        // SQLite; this is display downsampling, not a retention ceiling.
+        let stride = ((last - first) / 120).max(3600);
+        let mut query=db.prepare("SELECT at,used,available FROM capacity_history WHERE at IN (SELECT MAX(at) FROM capacity_history WHERE at>=?1 GROUP BY (at-?2)/?3 UNION SELECT MIN(at) FROM capacity_history WHERE at>=?1) ORDER BY at")?;
+        let rows = query.query_map(params![sql_int(since)?, first, stride], |r| {
+            Ok(crate::history::CapacityPoint {
+                at: r.get::<_, i64>(0)? as u64,
+                used: r.get::<_, i64>(1)? as u64,
+                available: r.get::<_, i64>(2)? as u64,
+            })
+        })?;
+        rows.collect::<Result<_, _>>().map_err(Into::into)
     }
     pub fn footprint(&self) -> Result<u64> {
         let mut size = fs::metadata(&self.path)?.blocks() * 512;

@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod cleanup;
 pub mod events;
 pub mod history;

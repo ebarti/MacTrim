@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$repo"
+revision=$(git rev-parse HEAD)
+source_hash=$(git ls-files --cached --others --exclude-standard -z -- Cargo.toml Cargo.lock rust-toolchain.toml rust scripts/build-binary mactrim-launch | xargs -0 shasum -a 256 | LC_ALL=C sort | shasum -a 256 | awk '{print $1}')
+if test -z "$(git status --porcelain --untracked-files=normal -- Cargo.toml Cargo.lock rust-toolchain.toml rust scripts/build-binary mactrim-launch)"; then dirty=false; else dirty=true; fi
+MACTRIM_REVISION="$revision" MACTRIM_SOURCE_SHA256="$source_hash" MACTRIM_DIRTY="$dirty" cargo build --locked --release --bin mactrim
+mkdir -p dist
+pending=$(mktemp "$repo/dist/.mactrim.XXXXXX")
+trap 'rm -f "$pending"' EXIT HUP INT TERM
+cp target/release/mactrim "$pending"
+chmod 755 "$pending"
+if test "$(uname -s)" = Darwin; then
+    /usr/bin/codesign --force --sign - --identifier io.github.ebarti.mactrim "$pending"
+    /usr/bin/codesign --verify --strict "$pending"
+fi
+mv -f "$pending" dist/mactrim
+./dist/mactrim build-info > dist/build.json
+cat dist/build.json

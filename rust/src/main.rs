@@ -10,7 +10,7 @@ use mactrim_rs::{
 use std::{
     fs,
     io::{self, Write},
-    os::unix::{fs::OpenOptionsExt, process::CommandExt},
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{Arc, Mutex, atomic::AtomicBool},
@@ -31,6 +31,11 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Commands {
+    BuildInfo,
+    Doctor {
+        #[arg(default_value = "/")]
+        root: PathBuf,
+    },
     Scan {
         #[arg(default_value = "/")]
         root: PathBuf,
@@ -106,6 +111,19 @@ enum Cleanup {
 }
 #[derive(Subcommand)]
 enum Service {
+    Retention {
+        #[arg(long)]
+        days: u64,
+    },
+    Install {
+        #[arg(default_value = "/")]
+        root: PathBuf,
+    },
+    Uninstall,
+    Plist {
+        #[arg(default_value = "/")]
+        root: PathBuf,
+    },
     Run {
         #[arg(default_value = "/")]
         root: PathBuf,
@@ -144,12 +162,14 @@ pub fn start(state: &Path, root: &Path) -> Result<()> {
         return Ok(());
     }
     store::prepare_private(state)?;
-    let log = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(state.join("service.log"))?;
+    let managed = mactrim_rs::agent::start_managed(state)?;
+    let log = store::private_file(&state.join("service.log"), true)?;
+    // Append inherited child output without reopening an unchecked pathname.
+    use std::os::fd::AsRawFd;
+    ensure!(
+        unsafe { libc::fcntl(log.as_raw_fd(), libc::F_SETFL, libc::O_APPEND) } >= 0,
+        "Cannot open service log for append"
+    );
     let mut command = Command::new(std::env::current_exe()?);
     command
         .args(["--state"])
@@ -168,13 +188,17 @@ pub fn start(state: &Path, root: &Path) -> Result<()> {
             Ok(())
         });
     }
-    let mut child = command.spawn()?;
+    let mut child = if managed {
+        None
+    } else {
+        Some(command.spawn()?)
+    };
     let started = Instant::now();
     loop {
         if service::request(state, &Request::Status).is_ok() {
             return Ok(());
         }
-        if let Some(code) = child.try_wait()? {
+        if let Some(code) = child.as_mut().map(|c| c.try_wait()).transpose()?.flatten() {
             anyhow::bail!(
                 "Service exited ({code}); inspect {}",
                 state.join("service.log").display()
@@ -207,6 +231,8 @@ fn run() -> Result<()> {
         root: "/".into(),
         json: false,
     }) {
+        Commands::BuildInfo => build_info(),
+        Commands::Doctor { root } => doctor(&state, &root),
         Commands::Cleanup { action } => cleanup_command(&state, action),
         Commands::Scan { root } => {
             let root = fs::canonicalize(root)?;
@@ -274,6 +300,27 @@ fn run() -> Result<()> {
             },
         )?),
         Commands::Service { action } => match action {
+            Service::Retention { days } => {
+                print(service::request(&state, &Request::Retention { days })?)
+            }
+            Service::Install { root } => {
+                let root = fs::canonicalize(root)?;
+                let app = mactrim_rs::agent::install(&state, &root)?;
+                print(
+                    serde_json::json!({"installed":app,"state":state,"root":root,"label":mactrim_rs::agent::LABEL,"note":"Per-user storage service installed. Privacy permissions are controlled by macOS."}),
+                )
+            }
+            Service::Uninstall => {
+                mactrim_rs::agent::uninstall(&state)?;
+                print(
+                    serde_json::json!({"uninstalled":mactrim_rs::agent::LABEL,"state_preserved":state}),
+                )
+            }
+            Service::Plist { root } => {
+                mactrim_rs::agent::plist_value(&state, &fs::canonicalize(root)?)?
+                    .to_writer_xml(io::stdout().lock())
+                    .map_err(Into::into)
+            }
             Service::Run { root } => service::run(root, state, signal_flag()?),
             Service::Start { root } => {
                 start(&state, &root)?;
@@ -283,6 +330,52 @@ fn run() -> Result<()> {
             Service::Pause => print(service::request(&state, &Request::Pause)?),
         },
     }
+}
+fn build_info() -> Result<()> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let executable = std::env::current_exe()?;
+    let mut f = fs::File::open(&executable)?;
+    let mut hash = Sha256::new();
+    let mut buf = [0; 65536];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buf[..n]);
+    }
+    print(
+        serde_json::json!({"version":env!("CARGO_PKG_VERSION"),"revision":option_env!("MACTRIM_REVISION").unwrap_or("development"),"source_sha256":option_env!("MACTRIM_SOURCE_SHA256").unwrap_or("development"),"dirty":option_env!("MACTRIM_DIRTY").map(|s|s=="true"),"architecture":std::env::consts::ARCH,"os":std::env::consts::OS,"binary_bytes":f.metadata()?.len(),"binary_sha256":format!("{:x}",hash.finalize()),"runtime":"Rust; no Python interpreter","executable":executable}),
+    )
+}
+fn doctor(state: &Path, root: &Path) -> Result<()> {
+    use mactrim_rs::events;
+    let root = fs::canonicalize(root)?;
+    let (used, available) = service::capacity(&root)?;
+    let home = PathBuf::from(std::env::var_os("HOME").context("HOME unavailable")?);
+    let probes = [
+        home.join("Library/Mail"),
+        home.join("Library/Messages"),
+        home.join("Library/Containers"),
+        home.join("Library/Group Containers"),
+    ]
+    .into_iter()
+    .map(|p| {
+        let status = match fs::read_dir(&p) {
+            Ok(_) => "directory enumeration allowed".to_owned(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => "not present".into(),
+            Err(e) => format!("{e}"),
+        };
+        serde_json::json!({"path":p,"status":status})
+    })
+    .collect::<Vec<_>>();
+    let service = service::request(state, &Request::Status)
+        .map(|r| r.status)
+        .ok();
+    print(
+        serde_json::json!({"root":root,"state":state,"uid":unsafe{libc::geteuid()},"volume":events::identity(&root)?,"filesystem_used":used,"filesystem_available":available,"access_probes":probes,"service":service,"note":"Access is reported per scope. Full Disk Access does not override Unix permissions, SIP, unavailable mounts or changing entries. No file contents were read."}),
+    )
 }
 fn approval(provided: Option<String>, expected: &str) -> Result<String> {
     if let Some(text) = provided {

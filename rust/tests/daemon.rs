@@ -15,15 +15,18 @@ impl Drop for Daemon {
 }
 fn spawn(root: &Path, state: &Path) -> Daemon {
     Daemon(
-        Command::new(env!("CARGO_BIN_EXE_mactrim"))
-            .arg("--state")
-            .arg(state)
-            .args(["service", "run"])
-            .arg(root)
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap(),
+        Command::new(
+            std::env::var_os("MACTRIM_TEST_BINARY")
+                .unwrap_or_else(|| env!("CARGO_BIN_EXE_mactrim").into()),
+        )
+        .arg("--state")
+        .arg(state)
+        .args(["service", "run"])
+        .arg(root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap(),
     )
 }
 fn wait(state: &Path, predicate: impl Fn(&Status) -> bool) -> Status {
