@@ -349,6 +349,21 @@ impl Store {
     pub fn applied(&self) -> Result<u64> {
         Ok(self.get("applied")?.unwrap_or(0))
     }
+    pub fn set_paused(&mut self, paused: bool) -> Result<()> {
+        let tx = self.db.transaction()?;
+        set(&tx, "paused", &paused)?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn set_full_at(&mut self, at: u64) -> Result<()> {
+        let tx = self.db.transaction()?;
+        set(&tx, "full_at", &at)?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn full_at(&self) -> Result<u64> {
+        Ok(self.get("full_at")?.unwrap_or(0))
+    }
     pub fn ingest(
         &mut self,
         cursor: u64,

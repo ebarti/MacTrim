@@ -5,6 +5,10 @@ edition = "2024"
 rust-version = "1.95"
 description = "Persistent, read-only MacTrim storage service"
 
+[[bin]]
+name = "mactrim"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1"
 flate2 = "1"
@@ -16,6 +20,11 @@ serde_json = "1"
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
+clap = { version = "4", features = ["derive"] }
+signal-hook = "0.3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation-sys = "0.8"
 
 [dev-dependencies]
 tempfile = "3"
